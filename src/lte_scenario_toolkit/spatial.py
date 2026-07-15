@@ -8,14 +8,12 @@ from typing import Any
 import geopandas as gpd
 import numpy as np
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-
 
 def resolve_root_dir(root_dir: str | Path, repo_root: str | Path | None = None) -> Path:
     """Resolve a data path against the repository instead of the current directory."""
 
     root = Path(root_dir)
-    base = Path(repo_root).resolve() if repo_root is not None else REPOSITORY_ROOT
+    base = Path(repo_root).resolve() if repo_root is not None else Path.cwd().resolve()
     return root.resolve() if root.is_absolute() else (base / root).resolve()
 
 

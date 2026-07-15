@@ -8,7 +8,6 @@ from typing import Any
 
 import yaml
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 VALID_SCAN_STRATEGIES = {"sequential", "uniform"}
 
 
@@ -22,6 +21,11 @@ def _required(mapping: Mapping[str, Any], key: str, section: str) -> Any:
 def _resolve_path(value: str | Path, root: Path) -> Path:
     path = Path(value)
     return path.resolve() if path.is_absolute() else (root / path).resolve()
+
+
+def _infer_project_root(config_path: Path) -> Path:
+    parent = config_path.parent
+    return parent.parent if parent.name.casefold() == "configs" else parent
 
 
 def load_experiment_config(
@@ -48,7 +52,11 @@ def load_experiment_config(
     spatial = document.get("spatial", {})
     scan = document.get("scan", {})
     outputs = document.get("outputs", {})
-    root = Path(repo_root).resolve() if repo_root is not None else REPOSITORY_ROOT
+    root = (
+        Path(repo_root).resolve()
+        if repo_root is not None
+        else _infer_project_root(path)
+    )
 
     strategy = str(_required(scan, "strategy", "scan"))
     if strategy not in VALID_SCAN_STRATEGIES:

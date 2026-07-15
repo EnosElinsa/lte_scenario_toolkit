@@ -4,6 +4,8 @@ import pytest
 
 from lte_scenario_toolkit.config import load_experiment_config
 
+ROOT = Path(__file__).resolve().parents[1]
+
 
 def write_config(path: Path, *, strategy: str = "uniform") -> None:
     path.write_text(
@@ -66,3 +68,24 @@ def test_load_experiment_config_rejects_unknown_scan_strategy(tmp_path):
 
     with pytest.raises(ValueError, match="strategy"):
         load_experiment_config(config_path, repo_root=tmp_path)
+
+
+def test_repository_config_resolves_inputs_from_repository_root():
+    config = load_experiment_config(ROOT / "configs" / "example.yaml")
+
+    assert config["repo_root"] == ROOT
+    assert config["points_root"] == ROOT / "points_shp"
+    assert config["boundary_root"] == ROOT / "boundary_shp"
+
+
+def test_config_in_configs_directory_infers_external_project_root(tmp_path):
+    project = tmp_path / "external-study"
+    config_dir = project / "configs"
+    config_dir.mkdir(parents=True)
+    config_path = config_dir / "experiment.yaml"
+    write_config(config_path)
+
+    config = load_experiment_config(config_path)
+
+    assert config["repo_root"] == project
+    assert config["points_root"] == project / "points"

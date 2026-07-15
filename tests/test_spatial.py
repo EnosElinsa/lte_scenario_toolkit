@@ -8,9 +8,21 @@ from lte_scenario_toolkit.spatial import (
     discover_boundary_layers,
     prepare_spatial_data,
     resolve_io_paths,
+    resolve_root_dir,
 )
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_default_relative_paths_resolve_from_repository_root():
+    assert resolve_root_dir("points_shp") == ROOT / "points_shp"
+
+
+def test_default_relative_paths_follow_current_working_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    assert resolve_root_dir("points_shp") == tmp_path / "points_shp"
 
 
 def test_resolve_io_paths_selects_city_by_name(tmp_path):
