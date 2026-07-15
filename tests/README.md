@@ -1,10 +1,31 @@
 # Tests
 
-The test suite covers the named package and CLI, YAML configuration, city-boundary discovery, CRS conversion, point-in-boundary filtering, deterministic rectangle scanning, spacing and point-count constraints, DEM sampling, NoData and missing-file errors, CSV fields, the data manifest, run records, 2D and 3D outputs, and workflow orchestration.
+The suite exercises the installed package and thin CLI wrappers without live
+network services or full private/local data.
 
-`fixtures/` contains only two small public GeoJSON files. Raster tests use in-memory GeoTIFFs created with Rasterio. Tests do not read the complete LTE dataset or 1 m DEMs and do not access Earth Engine.
+Coverage includes:
+
+- schema-v2 catalog validation, scenario links, atomic updates, and incremental
+  manifests;
+- boundary registration from local files and mocked HTTP(S) downloads,
+  including safe archive extraction, layer selection, rollback, and source
+  checksums;
+- mocked Earth Engine initialization, export preflight, explicit task start,
+  and reproducible run records;
+- disk-backed DEM shard inspection and merge, NoData/mask preservation,
+  metadata checks, and boundary coverage;
+- fast and full scenario validation for boundary geometry, sidecars, manifest
+  containment/size/checksum drift, pending DEMs, and linked configs;
+- deterministic scanning, elevation sampling, CSV/run records, and 2D/3D
+  visualization using small fixtures.
+
+Vector fixtures are small public GeoJSON or temporary Shapefiles. Raster tests
+create tiny temporary GeoTIFFs with Rasterio. Earth Engine calls are mocked;
+CI does not authenticate, submit exports, download Drive files, read the full
+LTE point dataset, or load full-resolution city DEMs.
 
 ```powershell
 python -m ruff check src scripts tests
 python -m pytest -q
+python -m compileall -q src/lte_scenario_toolkit scripts
 ```

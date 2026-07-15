@@ -1,37 +1,39 @@
 # lte_scenario_toolkit
 
-A reproducible research toolkit for selecting LTE base-station scenarios within U.S. city boundaries, sampling elevations from 1 m DEMs, and producing CSV data, 2D previews, 3D terrain figures, and machine-readable run records.
+A reproducible research toolkit for registering U.S. city study boundaries,
+preparing 1 m elevation data, selecting LTE base-station scenarios, and
+producing traceable CSV, figure, and run artifacts.
 
-The project exposes a configuration-driven workflow through the `lte_scenario_toolkit` Python package. Researchers can use the installed command-line tools or the thin entry points in `scripts/`.
-
-## Workflow
-
-```text
-Prepare the public base-station points and administrative boundaries
-→ Download or place the local DEM
-→ Validate the data manifest, CRS, and spatial resolution
-→ Load a YAML experiment configuration
-→ Scan candidate rectangles that satisfy count and spacing constraints
-→ Select interactively or reproduce a selection with a fixed candidate index
-→ Sample base-station elevations
-→ Write CSV, PNG/EPS/HTML, and run JSON outputs
-```
+The installed package exposes one generic data lifecycle command, `lte-data`,
+plus experiment commands for scenario selection and figure generation. A
+registered boundary is the sole region of interest used for a scenario's DEM
+export and local coverage checks.
 
 ## Repository layout
 
 ```text
-boundary_shp/                 # Boundary Shapefiles approved for public redistribution
-points_shp/                   # Public LTE base stations; large components use Git LFS
-dem/                          # Local DEMs; excluded from Git and Git LFS
-configs/                      # Chicago and New York City experiment configurations
-data/datasets.yaml            # Dataset provenance, licensing, and spatial metadata
-data/manifest.json            # File sizes and SHA256 checksums
-src/lte_scenario_toolkit/     # The single Python implementation package
-scripts/                      # Thin CLI entry points and manifest generator
-gee/newyork_1m_dem.js         # GEE Code Editor export script
-tests/fixtures/               # Small public fixtures that do not require full datasets
-runs/                         # Only reusable templates and concise summaries are tracked
+boundary_shp/                 # Registered boundary bundles and import guidance
+points_shp/                   # Public LTE base stations; large files use Git LFS
+dem/                          # External local DEMs; ignored by Git
+configs/                      # Experiment parameters, separate from provenance
+data/datasets.yaml            # Schema-v2 dataset and scenario catalog
+data/manifest.json            # Generated file sizes and SHA256 values
+src/lte_scenario_toolkit/     # Installed implementation package
+scripts/                      # Thin source-tree wrappers
+runs/                         # Export records, templates, and concise summaries
+tests/                        # Offline fixtures and regression suite
 ```
+
+The public contracts are documented in:
+
+- [boundary_shp/README.md](boundary_shp/README.md) for supported boundary
+  sources and atomic registration;
+- [data/README.md](data/README.md) for the schema-v2 catalog, manifest, and
+  readiness states;
+- [dem/README.md](dem/README.md) for generic Earth Engine export and shard
+  ingest;
+- [configs/README.md](configs/README.md) for experiment YAML;
+- [runs/README.md](runs/README.md) for reproducibility artifacts.
 
 ## Installation
 
@@ -47,109 +49,122 @@ python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
 ```
 
-The installation provides `lte-select-sites`, `lte-generate-figures`, and `lte-download-newyork-dem`. Equivalent `python scripts/...` commands are also available.
+Installation provides `lte-data`, `lte-select-sites`, and
+`lte-generate-figures`. `lte-data` is the public extension point for scenario
+data; `scripts/manage_data.py` is its thin source-tree wrapper.
 
-The distribution name and Python import name are both `lte_scenario_toolkit`:
+## Generic data lifecycle
 
-```python
-from lte_scenario_toolkit.config import load_experiment_config
-from lte_scenario_toolkit.scenario import scan_rectangles
-```
+### 1. Register a boundary
 
-## Data preparation
-
-The base-station points and boundary data are distributed with the repository. DEM rasters are much larger and remain local; see [dem/README.md](dem/README.md) for the required paths and download workflow. Dataset provenance and terms are documented in [data/README.md](data/README.md).
-
-Check or export the New York City 1 m DEM with Earth Engine:
+Register a local or HTTP(S) boundary source with explicit provenance and
+redistribution terms:
 
 ```powershell
-python scripts/download_newyork_1m_dem.py `
-  --project YOUR_EARTH_ENGINE_PROJECT_ID `
-  --dry-run
+lte-data scenario add boston `
+  --boundary-source data/boston-boundary.zip `
+  --provider "U.S. Census Bureau" `
+  --license "Public domain; source attribution retained" `
+  --redistribution-confirmed
 
-python scripts/download_newyork_1m_dem.py `
-  --project YOUR_EARTH_ENGINE_PROJECT_ID `
-  --export
+lte-data scenario list
+lte-data scenario show boston
 ```
 
-After downloading the exported tiles, merge them into the single GeoTIFF referenced by the configuration:
+The registration pipeline validates and normalizes the polygon, installs its
+Shapefile components atomically, declares a pending external DEM, and updates
+the catalog and manifest. Use `--layer` for a multi-layer GeoPackage or
+archive.
 
-```text
-dem/USGS_1M_DEM_NewYorkState_NewYork/USGS_1M_DEM_NewYorkState_NewYork.tif
-```
-
-Regenerate the complete checksum manifest after preparing or changing any input:
+### 2. Plan or submit a DEM export
 
 ```powershell
-python scripts/create_data_manifest.py
+$env:EE_PROJECT = "YOUR_EARTH_ENGINE_PROJECT_ID"
+lte-data dem export chicago --dry-run
+lte-data dem export chicago
+lte-data dem export chicago --export
 ```
 
-## Reproducible scenario selection
+`--dry-run` resolves and prints the plan without Earth Engine access. The
+default command performs authenticated preflight and writes a run record
+without starting a task. `--export` explicitly submits the Drive export. The
+registered boundary entrypoint is always the exact export ROI; there is no
+second city-specific ROI definition.
+
+### 3. Download and ingest shards
+
+Download the recorded Drive shards manually, then merge and register them:
+
+```powershell
+lte-data dem ingest chicago --tiles-dir downloads/chicago-dem
+```
+
+Ingest validates the tile grid, CRS, scale, mask, and boundary coverage before
+atomically publishing the registered GeoTIFF and refreshing its manifest
+record. It does not delete the downloaded shards.
+
+### 4. Validate scenario data
+
+```powershell
+lte-data validate chicago
+lte-data validate chicago --full-checksum
+lte-data validate --all
+```
+
+Fast validation checks catalog links, the exact boundary and Shapefile
+sidecars, geometry metadata, manifest structure/containment/sizes, an available
+DEM, and any linked configuration. Full mode additionally streams SHA256 for
+the selected files. A missing declared external DEM is a valid `dem-pending`
+warning; boundary or manifest drift fails validation.
+
+Chicago and `new-york-city` use the same export, ingest, and validation
+commands. See [dem/README.md](dem/README.md) for complete examples.
+
+## Run an experiment
 
 Chicago example:
 
 ```powershell
-python scripts/select_sites.py --config configs/example.yaml
+python scripts/select_sites.py --config configs/example.yaml --select-index 1
+python scripts/generate_scenario_figures.py --config configs/example.yaml
 ```
 
-The first run can use the desktop window to choose a candidate rectangle. Record its index and use `--select-index` for formal experiments so that the selection is reproducible:
+New York City example:
 
 ```powershell
-python scripts/select_sites.py `
-  --config configs/example.yaml `
-  --select-index 1
+python scripts/select_sites.py --config configs/newyork.yaml --select-index 1
+python scripts/generate_scenario_figures.py --config configs/newyork.yaml
 ```
 
-New York City example, after preparing and merging the DEM:
-
-```powershell
-python scripts/select_sites.py `
-  --config configs/newyork.yaml `
-  --select-index 1
-```
-
-Common command-line overrides:
-
-```powershell
-python scripts/select_sites.py `
-  --config configs/example.yaml `
-  --city Chicago `
-  --output-dir results/custom-run `
-  --size 3000 `
-  --target 30
-```
-
-Each successful run writes `run-select-sites.json` to the output directory. It records the resolved configuration, Git commit, input SHA256 checksums, software versions, and output inventory.
-
-## Generate figures from an existing CSV
-
-```powershell
-python scripts/generate_scenario_figures.py `
-  --config configs/example.yaml
-```
-
-This command reads the CSV resolved from the configuration, produces publication-style PNG/EPS figures and an interactive HTML view, and writes `run-generate-figures.json`.
+`--select-index` records a stable one-based candidate choice. Without it, the
+selector opens an interactive desktop window. Successful commands write
+machine-readable run JSON files beside their outputs.
 
 ## Tests and CI
-
-Run the local checks with:
 
 ```powershell
 python -m ruff check src scripts tests
 python -m pytest -q
 python -m compileall -q src/lte_scenario_toolkit scripts
-node --check gee/newyork_1m_dem.js
 ```
 
-GitHub Actions uses small vector fixtures and in-memory DEM rasters. It does not download the full datasets or access Earth Engine.
+CI uses small vector fixtures, temporary disk-backed rasters, and mocked Earth
+Engine clients. It does not authenticate, submit exports, download Drive data,
+or read full local DEMs.
 
 ## Licensing and attribution
 
-The source code is released under the [MIT License](LICENSE). Data does not automatically inherit the software license. The base-station and boundary datasets are published under redistribution permissions confirmed by the repository owner, and USGS 3DEP data retains its USGS attribution. Unknown original source URLs and acquisition dates remain explicitly `null` in `data/datasets.yaml` rather than being inferred.
+Source code is released under the [MIT License](LICENSE). Data does not inherit
+that license automatically. Preserve each catalog record's provider, license,
+and required attribution. Unknown source URLs and acquisition dates remain
+`null`; they are never inferred.
 
 ## Known limitations
 
-- Initial interactive candidate selection requires a desktop graphical environment; reproducible runs can use `--select-index`.
-- Local scenario processing expects one GeoTIFF, so Earth Engine output tiles must be merged first.
-- EPSG:3857 provides metre-based scanning at the city scale used here, but it is not an equal-area projection.
-- The project currently supports source installation and GitHub distribution and is not yet published on PyPI.
+- Interactive candidate selection requires a desktop environment; fixed
+  candidate indexes support headless reproducibility.
+- Earth Engine exports are sharded and require a manual Drive download before
+  local ingest.
+- `EPSG:3857` supports metre-based city-scale operations but is not an
+  equal-area projection.
+- The project supports source installation and is not yet published on PyPI.

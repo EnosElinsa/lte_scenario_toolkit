@@ -1,56 +1,71 @@
 # DEM data
 
-Complete DEM rasters are not committed to Git. This directory is reserved for locally downloaded raster files, and `.gitignore` excludes the large data products.
+DEM rasters are external inputs. The repository's `.gitignore` excludes them,
+so they are not committed to Git or Git LFS; the catalog records their
+provenance and the expected local entrypoint. A scenario is still useful while
+its external DEM is pending: boundary checks and catalog validation can run
+before the raster is downloaded.
 
-The data registry treats the Chicago and New York City DEMs as two independent external datasets:
+## Export and ingest Chicago
 
-- `usgs_3dep_1m_dem_chicago`
-- `usgs_3dep_1m_dem_new_york_city`
-
-## Chicago
-
-The existing Chicago raster uses the USGS National Map 3DEP 1 m DEM collection and currently occupies approximately 10.96 GiB locally. Place it at:
-
-```text
-dem/USGS_1M_DEM_Chicago/USGS_1M_DEM_Chicago.tif
-```
-
-## New York City
-
-Dataset: `USGS/3DEP/1m`
-
-- Band: `elevation`
-- Units: metres
-- Vertical datum: NAVD88
-- Source imagery: USGS 3DEP 1 m ImageCollection
-- Output CRS: `EPSG:3857`
-- Export destination: tiled GeoTIFF files in Google Drive
-
-Export with Python:
+Set an Earth Engine Cloud Project that you control, then use the registered
+scenario ID. The first command prints a plan without contacting Earth Engine;
+the second performs preflight work and writes a run record; `--export` is the
+explicit opt-in that starts the Earth Engine task.
 
 ```powershell
-python scripts/download_newyork_1m_dem.py `
-  --project YOUR_EARTH_ENGINE_PROJECT_ID `
-  --dry-run
-
-python scripts/download_newyork_1m_dem.py `
-  --project YOUR_EARTH_ENGINE_PROJECT_ID `
-  --export
+$env:EE_PROJECT = "YOUR_EARTH_ENGINE_PROJECT_ID"
+lte-data dem export chicago --dry-run
+lte-data dem export chicago
+lte-data dem export chicago --export
+# manual Drive download
+lte-data dem ingest chicago --tiles-dir D:\downloads\chicago-dem
+lte-data validate chicago --full-checksum
 ```
 
-Alternatively, paste `gee/newyork_1m_dem.js` into the Earth Engine Code Editor and start the export from the `Tasks` panel.
+Download the sharded GeoTIFF files from the recorded Drive folder, then run
+`dem ingest` against that directory. Ingest verifies the shard grid, merges a
+single raster at the registered entrypoint, validates coverage, and refreshes
+the manifest. It does not delete the downloaded tiles automatically; retain
+them until the run has been checked and clean them up deliberately if desired.
 
-The default region is the union of New York City's five counties: Bronx, Kings, New York, Queens, and Richmond. To export Manhattan/New York County only, pass `--boundary-mode county --county-geoid 36061` to the Python command or set `boundaryMode` to `'county'` in the JavaScript file.
+## Export and ingest New York City
 
-A city-scale 1 m export normally produces multiple tiles. Download and merge them with QGIS, Rasterio, or another geospatial tool into:
+The New York City scenario uses the identical registered-boundary and Earth
+Engine flow:
 
-```text
-dem/USGS_1M_DEM_NewYorkState_NewYork/USGS_1M_DEM_NewYorkState_NewYork.tif
+```powershell
+lte-data dem export new-york-city --dry-run
+lte-data dem export new-york-city
+lte-data dem export new-york-city --export
+# manual Drive download
+lte-data dem ingest new-york-city --tiles-dir D:\downloads\new-york-city-dem
+lte-data validate new-york-city --full-checksum
 ```
 
-Do not commit the tiles or merged raster to GitHub.
+The registered boundary is the sole region of interest. The exporter derives
+its geometry from the catalog entrypoint; there is no separate county or
+hand-written ROI switch to keep in sync.
 
-## Official sources
+## Raster contract
 
-- [USGS 3DEP 1 m Earth Engine catalog](https://developers.google.com/earth-engine/datasets/catalog/USGS_3DEP_1m)
-- [Earth Engine `Export.image.toDrive`](https://developers.google.com/earth-engine/apidocs/export-image-todrive)
+The workflow uses the USGS 3DEP 1 m elevation collection (`USGS/3DEP/1m`),
+the `elevation` band, a 1 m nominal scale, and `EPSG:3857` export metadata.
+Earth Engine may produce multiple Cloud Optimized GeoTIFF shards because of
+file-dimension and pixel limits. The Drive download is manual, and `dem ingest`
+is the reproducible local merge step. It checks the registered CRS, resolution,
+bounds, and finite coverage inside the boundary without loading a whole raster
+into memory.
+
+The catalog marks these rasters as external. A missing declared entrypoint is
+reported as `dem-pending` by `lte-data validate`; it is not treated as a
+repository source failure. Once the raster exists, validation checks coverage
+and the manifest file sizes (and SHA256 values when `--full-checksum` is used).
+
+## Sources and run records
+
+The public source description is the
+[USGS 3DEP 1 m Earth Engine catalog](https://developers.google.com/earth-engine/datasets/catalog/USGS_3DEP_1m).
+Each export writes a timestamped directory under `runs/` containing the plan,
+boundary checksum, task metadata, and source notes. See
+[runs/README.md](../runs/README.md).

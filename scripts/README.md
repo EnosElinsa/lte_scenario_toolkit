@@ -1,8 +1,26 @@
-# Command-line entry points
+# Command-line wrappers
 
-- `select_sites.py`: forwards to the configuration-driven scenario selector.
-- `generate_scenario_figures.py`: forwards to publication-figure generation for an existing CSV.
-- `download_newyork_1m_dem.py`: forwards to the Earth Engine DEM exporter.
-- `create_data_manifest.py`: generates file sizes and SHA256 checksums from `data/datasets.yaml`.
+The supported data lifecycle command is the installed `lte-data` entrypoint.
+It manages scenario registration, DEM export planning/submission, shard
+ingest, and validation:
 
-These files only add the repository's `src/` directory to the module search path and call the corresponding `main()` function in `lte_scenario_toolkit`. Business logic belongs in the installed package.
+```powershell
+lte-data scenario add <scenario-id> --boundary-source <path-or-url> --provider <name> --license <terms>
+lte-data scenario list
+lte-data dem export <scenario-id> --dry-run
+lte-data dem ingest <scenario-id> --tiles-dir <download-directory>
+lte-data validate <scenario-id>
+```
+
+`manage_data.py` is the thin source-tree wrapper for `lte-data`; it adds
+`src/` to `sys.path` and delegates to `lte_scenario_toolkit.data_cli.main`.
+The other wrappers serve the reproducible research workflow:
+
+- `select_sites.py` delegates to the package scenario selector;
+- `generate_scenario_figures.py` delegates to figure generation;
+- `create_data_manifest.py` delegates to schema-v2 manifest generation.
+
+Wrappers contain no business logic and should remain small. Add reusable
+behavior to the installed package first, then expose it through a wrapper only
+when a source-tree invocation is useful. The package console scripts in
+`pyproject.toml` are the public interface for installed environments.

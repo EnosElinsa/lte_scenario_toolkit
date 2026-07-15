@@ -10,6 +10,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_READMES = (
     "README.md",
+    "boundary_shp/README.md",
     "configs/README.md",
     "data/README.md",
     "dem/README.md",
@@ -18,6 +19,19 @@ PUBLIC_READMES = (
     "src/README.md",
     "tests/README.md",
 )
+PUBLIC_SURFACES = (
+    ROOT / "README.md",
+    ROOT / "pyproject.toml",
+    ROOT / "boundary_shp",
+    ROOT / "configs",
+    ROOT / "data",
+    ROOT / "dem",
+    ROOT / "gee",
+    ROOT / "runs",
+    ROOT / "scripts",
+    ROOT / "src",
+)
+TEXT_SUFFIXES = {"", ".md", ".py", ".js", ".yaml", ".yml", ".json", ".toml", ".txt"}
 CJK_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 SCENARIOS = {
     "phoenix": ("Phoenix", "boundary_phoenix", "usgs_3dep_1m_dem_phoenix", None),
@@ -113,8 +127,45 @@ DEMS = {
 
 
 def test_repository_metadata_files_exist():
-    for relative_path in ("README.md", "LICENSE", "pyproject.toml", ".gitignore", ".gitattributes"):
+    for relative_path in (
+        "README.md",
+        "LICENSE",
+        "pyproject.toml",
+        ".gitignore",
+        ".gitattributes",
+        "data/datasets.yaml",
+        "data/manifest.json",
+        *PUBLIC_READMES,
+    ):
         assert (ROOT / relative_path).is_file(), relative_path
+
+
+def test_public_surfaces_have_no_legacy_city_exporter_or_project_id():
+    legacy_terms = (
+        "lte-" + "download-newyork-dem",
+        "download_newyork_" + "1m_dem.py",
+        "newyork_" + "dem.py",
+        "gee/" + "newyork_1m_dem.js",
+    )
+    project_id_pattern = re.compile(r"gen-lang-client-\d+")
+    paths = []
+    for surface in PUBLIC_SURFACES:
+        if surface.is_file():
+            if surface.suffix.casefold() in TEXT_SUFFIXES:
+                paths.append(surface)
+        elif surface.is_dir():
+            paths.extend(
+                path
+                for path in surface.rglob("*")
+                if path.is_file() and path.suffix.casefold() in TEXT_SUFFIXES
+            )
+
+    offenders: list[str] = []
+    for path in sorted(set(paths)):
+        text = path.read_text(encoding="utf-8")
+        if any(term in text for term in legacy_terms) or project_id_pattern.search(text):
+            offenders.append(path.relative_to(ROOT).as_posix())
+    assert not offenders, f"stale city-specific or project-secret references: {offenders}"
 
 
 def test_example_configuration_declares_epsg3857():

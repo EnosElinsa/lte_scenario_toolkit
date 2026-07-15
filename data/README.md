@@ -1,58 +1,70 @@
 # Data contract
 
-## Tracked inputs
+The data lifecycle has two layers:
 
-### `boundary_shp/`
+- `datasets.yaml` is the schema-v2 catalog. It contains independent dataset
+  records for points, boundaries, and DEMs, plus scenario records that link a
+  boundary dataset, an optional DEM dataset, and an experiment configuration.
+- `manifest.json` is generated integrity metadata. It expands the catalog into
+  relative file paths, byte sizes, and SHA256 values without replacing the
+  catalog's provenance fields.
 
-The boundary data currently occupies approximately 0.8 MiB. The repository owner has confirmed public redistribution permission, so these files are stored directly in Git. Keep each Shapefile's `.shp`, `.shx`, `.dbf`, `.prj`, `.cpg`, and any available index or metadata files together.
+## Schema-v2 catalog
 
-The current workflow standardises inputs to `EPSG:3857`, WGS 84 / Pseudo-Mercator. Before using another boundary, verify its CRS, geometry type, feature count, and boundary name.
+Every dataset record declares a stable `dataset_id`, role, repository-relative
+`path`, exact `entrypoint`, provider, license, acquisition date, CRS, spatial
+resolution, and notes. Boundary records additionally declare geometry type,
+feature count, and redistribution confirmation. DEM records declare the
+Earth Engine collection, band, units, vertical datum, native scale, export CRS,
+prefix, and Drive folder.
 
-### `points_shp/`
+Each scenario has a stable ID, display name, `boundary_dataset_id`, optional
+`dem_dataset_id`, and optional `config_path`. Dataset records are reusable;
+scenario links decide which boundary and DEM belong together. The catalog
+loader rejects duplicate IDs, unknown links, unsafe paths, and schema versions
+other than 2.
 
-The complete LTE base-station dataset occupies approximately 77 MiB and is approved for public release by the repository owner. Large binary components are managed with Git LFS. After cloning, run:
+Unknown source URLs and acquisition dates stay explicit `null` values. Do not
+invent provenance from filenames, search results, or local timestamps.
+
+## Readiness and validation
+
+`lte-data scenario list` reports a catalog-derived readiness status:
+
+- `boundary-ready`: the registered boundary exists and no DEM is declared;
+- `dem-pending`: the boundary exists but the declared external DEM entrypoint
+  is not present locally;
+- `ready`: both registered entrypoints exist;
+- `invalid`: the registered boundary entrypoint is missing.
+
+Run structured checks with:
 
 ```powershell
-git lfs pull
+lte-data validate chicago
+lte-data validate chicago --full-checksum
+lte-data validate --all
 ```
 
-All Shapefile components must remain together. Dataset fields, provenance, and permissions follow the directory metadata and project release notes.
+Fast validation reads the exact boundary entrypoint, required Shapefile
+sidecars, catalog CRS/count/geometry contract, manifest structure, file
+containment, and file sizes. `--full-checksum` additionally streams SHA256 for
+the selected scenario files. A pending external DEM is a warning; a boundary
+or manifest drift is an error.
 
-## External inputs
+If a scenario links an experiment YAML, validation loads it relative to the
+repository and cross-checks the resolved boundary and DEM paths without
+creating output directories.
 
-### `dem/`
+## Manifest generation
 
-Complete DEM rasters are excluded from both Git and Git LFS. Chicago and New York City are registered as separate external USGS 3DEP 1 m datasets. Each raster must be obtained from the public source or the documented Earth Engine workflow and placed in its registered local directory.
-
-See [dem/README.md](../dem/README.md) for download, projection, and path requirements.
-
-## Dataset terms
-
-The MIT License applies only to repository source code and documentation. Each dataset remains subject to its original provenance, metadata, and redistribution terms. Preserve dataset attribution in papers, reports, and redistributed products.
-
-## Reproducibility manifest
-
-`datasets.yaml` stores dataset-level provenance, provider, licensing, acquisition date, CRS, spatial resolution, and notes. Unknown source URLs or dates are explicitly represented as `null`. Chicago and New York City have distinct DEM dataset IDs and paths.
-
-`manifest.json` expands those declarations into local file records containing:
-
-```text
-dataset_id
-source_url
-provider
-license
-download_date
-size_bytes
-sha256
-crs
-spatial_resolution
-notes
-```
-
-Regenerate it with:
+Regenerate the manifest after adding or changing data:
 
 ```powershell
 python scripts/create_data_manifest.py
+python scripts/create_data_manifest.py --dataset-id boundary_chicago
 ```
 
-The command streams SHA256 calculations, so it can take time when the approximately 11 GiB Chicago DEM and the New York City DEM are present locally. The rasters remain protected by `.gitignore`; only relative paths, sizes, and checksums are stored in the manifest.
+Repeat `--dataset-id` to rehash several changed datasets while reusing valid
+records for the rest. A full regeneration or full-checksum validation can be
+expensive when large DEMs are available locally. DEM files remain external and
+ignored by Git; only the relative file metadata and checksums are stored.

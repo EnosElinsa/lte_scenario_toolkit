@@ -1,33 +1,39 @@
 # Experiment configurations
 
-YAML files are the canonical configuration interface for local scenario experiments:
+Files in `configs/` describe experiment parameters, not data acquisition
+provenance. The schema-v2 catalog in `data/datasets.yaml` owns provider,
+license, source URL, acquisition date, CRS, and registered entrypoints. Keep
+those concerns separate: changing a scan size does not rewrite dataset
+metadata, and registering a new source does not silently change an experiment.
 
-- `example.yaml`: Chicago example.
-- `newyork.yaml`: New York City's five-county boundary; requires a prepared and merged local DEM.
+## Existing configurations
+
+- `example.yaml` runs the Chicago scenario.
+- `newyork.yaml` runs the New York City scenario.
+
+Use them with the package entrypoints or their thin script wrappers:
 
 ```powershell
 python scripts/select_sites.py --config configs/example.yaml
 python scripts/generate_scenario_figures.py --config configs/example.yaml
 ```
 
-Field mapping:
+Each YAML file contains `experiment`, `inputs`, `spatial`, `scan`, and
+`outputs` sections. Input paths are resolved against the repository root;
+outputs are resolved only when a run actually writes them. The important input
+fields are `points_root`, `points_layer`, `boundary_root`, `city`, and
+`dem_path`. Spatial and scan fields define the target CRS, rectangle size,
+point-count tolerance, search strategy, step, candidate limit, and minimum
+spacing.
 
-| YAML field | Runtime field | Purpose |
-|---|---|---|
-| `experiment.name` | `experiment_name` | Run name |
-| `experiment.random_seed` | `random_seed` | Deterministic random seed for `uniform` scanning |
-| `inputs.points_root` | `points_root` | Base-station point root directory |
-| `inputs.points_layer` | `points_layer` | Shapefile directory and layer name |
-| `inputs.boundary_root` | `boundary_root` | Boundary root directory |
-| `inputs.city` | `city_name` | Case-insensitive boundary directory or layer name |
-| `inputs.dem_path` | `dem_path` | Path to one GeoTIFF |
-| `spatial.target_crs` | `target_crs` | Analysis CRS; `EPSG:3857` is currently recommended |
-| `spatial.rectangle_size_m` | `rect_size` | Candidate rectangle side length |
-| `spatial.target_base_station_count` | `target_count` | Target number of base stations |
-| `spatial.count_tolerance` | `tolerance` | Allowed point-count deviation |
-| `scan.*` | Scan control fields | Strategy, step size, candidate limit, and centre spacing |
-| `outputs.root` | `output_root` | Final output directory for the run |
+## Cross-checking links
 
-`--config` is required for scenario selection and figure generation. The `--city`, `--output-dir`, `--size`, and `--target` command-line options override their YAML values.
+When a catalog scenario has a `config_path`, `lte-data validate` loads that
+YAML and calls the same input-path resolver used by the experiment scripts with
+output creation disabled. It compares the selected boundary and DEM paths to
+the catalog's exact entrypoints. A malformed YAML is `config.invalid`; a
+boundary or DEM mismatch is reported separately. This catches a stale city
+name or moved raster before an experiment writes results.
 
-`--select-index N` deterministically chooses the one-based candidate `N` for reproducible experiments. If omitted, the program opens the interactive selection window.
+Command-line overrides remain local to a run. They do not modify the YAML,
+catalog, or generated manifest.
