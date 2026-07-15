@@ -1,0 +1,24 @@
+* text=auto
+*.md text eol=lf
+*.py text eol=lf
+*.js text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+*.prj text eol=lf
+*.cpg text eol=lf
+*.tfw text eol=lf
+
+*.shp binary
+*.shx binary
+*.dbf binary
+*.sbn binary
+*.sbx binary
+*.tif binary
+*.ovr binary
+
+points_shp/**/*.shp filter=lfs diff=lfs merge=lfs -text
+points_shp/**/*.shx filter=lfs diff=lfs merge=lfs -text
+points_shp/**/*.dbf filter=lfs diff=lfs merge=lfs -text
+points_shp/**/*.sbn filter=lfs diff=lfs merge=lfs -text
+points_shp/**/*.sbx filter=lfs diff=lfs merge=lfs -text

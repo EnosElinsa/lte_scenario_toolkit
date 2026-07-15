@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.credentials
+
+# Large DEM inputs remain external
+dem/**
+!dem/README.md
+
+# Generated outputs
+results/**
+*.png
+*.eps
+*.html
+
+# Generated GEEMu runs; keep only reusable artifacts
+runs/**
+!runs/README.md
+!runs/templates/
+!runs/templates/**
+!runs/summaries/
+!runs/summaries/**
