@@ -217,7 +217,7 @@ def test_pending_dem_is_warning_and_report_is_ok(tmp_path):
     # A previously-ready external DEM can leave stale metadata and file
     # records behind after the local raster is removed.  Pending validation
     # must not turn those cached records into missing-file failures.
-    dem_record["path"] = "dem/stale-cache"
+    dem_record["provider"] = "cached provider"
     manifest_path.write_text(json.dumps(payload), encoding="utf-8")
     report = validate_scenario_data(catalog, "city")
 
@@ -302,6 +302,24 @@ def test_unrelated_manifest_files_are_not_stat_or_hashed(tmp_path, monkeypatch):
     assert report.ok
     assert not any(message.code.startswith("manifest.missing") for message in report.messages)
     assert all(path.name != "not-local.shp" for path in hashed_paths)
+
+
+def test_unrelated_known_record_cannot_substitute_another_dataset_file(tmp_path):
+    _, catalog = _write_catalog(tmp_path, second_city=True)
+    manifest_path = tmp_path / "data" / "manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    city_record = next(item for item in payload["datasets"] if item["dataset_id"] == "boundary_city")
+    other = next(item for item in payload["datasets"] if item["dataset_id"] == "boundary_other")
+    substituted = next(
+        item for item in city_record["files"] if item["path"].endswith(".shp")
+    )
+    other["files"] = [dict(substituted)]
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = validate_scenario_data(catalog, "city")
+
+    assert not report.ok
+    assert any(message.code == "manifest.traversal" for message in report.messages)
 
 
 def test_unrelated_manifest_structure_is_still_checked(tmp_path):

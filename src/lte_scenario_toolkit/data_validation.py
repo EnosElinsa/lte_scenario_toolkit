@@ -330,6 +330,8 @@ def _manifest_file_shape(
     item: Any,
     index: int,
     report: ValidationReport,
+    *,
+    dataset_root: Path | None = None,
 ) -> bool:
     """Check one file record's structure without touching the target file."""
 
@@ -337,7 +339,11 @@ def _manifest_file_shape(
         _error(report, "manifest.file.malformed", f"Manifest file entry {index} is not a mapping")
         return False
     raw_path = item.get("path")
-    path, path_error = _safe_manifest_path(root, raw_path)
+    path, path_error = _safe_manifest_path(
+        root,
+        raw_path,
+        dataset_root=dataset_root,
+    )
     if path_error:
         code = (
             "manifest.traversal"
@@ -361,6 +367,7 @@ def _manifest_file_shape(
 
 def _manifest_record_shape(
     catalog: DataCatalog,
+    dataset: dict[str, Any] | None,
     record: Any,
     report: ValidationReport,
 ) -> bool:
@@ -385,6 +392,13 @@ def _manifest_record_shape(
     if not isinstance(files, list):
         _error(report, "manifest.files", "Manifest dataset files must be a list")
         return False
+    dataset_root: Path | None = None
+    if dataset is not None:
+        try:
+            dataset_root = catalog.resolve(dataset.get("path", ""))
+        except Exception as exc:
+            _error(report, "manifest.metadata", f"Cannot resolve dataset root: {exc}")
+            return False
     seen_paths: set[str] = set()
     for index, item in enumerate(files):
         if isinstance(item, dict) and isinstance(item.get("path"), str):
@@ -393,7 +407,13 @@ def _manifest_record_shape(
                 _error(report, "manifest.duplicate_file", f"Manifest repeats file path: {key}")
                 valid = False
             seen_paths.add(key)
-        if not _manifest_file_shape(catalog.root, item, index, report):
+        if not _manifest_file_shape(
+            catalog.root,
+            item,
+            index,
+            report,
+            dataset_root=dataset_root,
+        ):
             valid = False
     return valid
 
@@ -504,8 +524,9 @@ def _validate_manifest(
             _error(report, "manifest.duplicate", f"Manifest has duplicate dataset ID: {dataset_id}")
             continue
         records[dataset_id] = raw_record
-        shape_valid[dataset_id] = _manifest_record_shape(catalog, raw_record, report)
-        if dataset_id not in catalog.datasets_by_id:
+        dataset = catalog.datasets_by_id.get(dataset_id)
+        shape_valid[dataset_id] = _manifest_record_shape(catalog, dataset, raw_record, report)
+        if dataset is None:
             _error(report, "manifest.unknown", f"Manifest references unknown dataset: {dataset_id}")
 
     boundary_id = boundary.get("dataset_id")
