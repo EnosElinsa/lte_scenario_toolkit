@@ -28,5 +28,8 @@ jobs:
       - name: Static checks
         run: python -m ruff check src scripts tests
 
+      - name: Entry-point syntax checks
+        run: python -m compileall -q src/lte_scenario_toolkit scripts && node --check gee/newyork_1m_dem.js
+
       - name: Fixture and unit tests
         run: python -m pytest -q

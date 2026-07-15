@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-15T13:50:57.822702Z",
+  "generated_at": "2026-07-15T15:48:18.653713Z",
   "datasets": [
     {
       "dataset_id": "usa_clear_lte_base_stations",
@@ -267,8 +267,8 @@
       "files": [
         {
           "path": "dem/README.md",
-          "size_bytes": 1592,
-          "sha256": "9b5738deed94d3717b3f2b7d98b9581a3d87f3dde5937ad255e65a71ae75087d"
+          "size_bytes": 1608,
+          "sha256": "b55473415ba0cd032fae415100ef789b1d2f3cf960ce4a1831dab9f98d888626"
         },
         {
           "path": "dem/USGS_1M_DEM_Chicago/README.md",
@@ -294,6 +294,21 @@
           "path": "dem/USGS_1M_DEM_Chicago/USGS_1M_DEM_Chicago.tif.ovr",
           "size_bytes": 996870295,
           "sha256": "96eeba0106f5af62278ce055a70d7bf7a779cbe2b162ba4888253f44d5260f21"
+        },
+        {
+          "path": "dem/USGS_1M_DEM_NewYorkState_NewYork/README.md",
+          "size_bytes": 804,
+          "sha256": "e7eede0e9fc9c8b46af6d1b6db77f1d70ae55afbb9a16802f5c076a288460d4b"
+        },
+        {
+          "path": "dem/USGS_1M_DEM_NewYorkState_NewYork/USGS_1M_DEM_NewYorkState_NewYork.tfw",
+          "size_bytes": 38,
+          "sha256": "ab43c3f52817997c7ab97124d6e554b01e6477d9769547664e2fa98972429b73"
+        },
+        {
+          "path": "dem/USGS_1M_DEM_NewYorkState_NewYork/USGS_1M_DEM_NewYorkState_NewYork.tif",
+          "size_bytes": 4763100737,
+          "sha256": "08566129ef66787b3b414603c74697afe38c5a71ed4603bfd87db0299cd8ba83"
         }
       ]
     }

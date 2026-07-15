@@ -28,6 +28,6 @@ python scripts/generate_scenario_figures.py --config configs/example.yaml
 | `scan.*` | 扫描控制字段 | 策略、步长、最大候选数和中心间距 |
 | `outputs.root` | `output_root` | 本次运行的最终输出目录 |
 
-命令行中的 `--city`、`--output-dir`、`--size` 和 `--target` 优先于 YAML。未提供 `--config` 时，根目录脚本顶部的历史 `CONFIG` 仍作为兼容默认值。
+`--config` 是场景选择和图形生成的必需参数。命令行中的 `--city`、`--output-dir`、`--size` 和 `--target` 优先于 YAML。
 
 `--select-index N` 使用一基编号固定选择第 N 个候选矩形，适合正式复现实验；未提供时打开交互选择窗口。

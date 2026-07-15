@@ -72,7 +72,7 @@ def test_write_run_record_captures_config_inputs_outputs_and_versions(tmp_path):
         config={"experiment_name": "fixture", "repo_root": tmp_path},
         inputs=[{"name": "stations", "sha256": "123"}],
         outputs=[tmp_path / "result.csv"],
-        command=["python", "select_sites.py"],
+        command=["lte-select-sites"],
         timestamp="2026-07-15T12:00:00Z",
         filename="run-select-sites.json",
     )

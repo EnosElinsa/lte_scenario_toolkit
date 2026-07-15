@@ -24,16 +24,16 @@ dem/USGS_1M_DEM_Chicago/USGS_1M_DEM_Chicago.tif
 使用 Python 导出：
 
 ```powershell
-python download_newyork_1m_dem.py `
+python scripts/download_newyork_1m_dem.py `
   --project gen-lang-client-0153149292 `
   --dry-run
 
-python download_newyork_1m_dem.py `
+python scripts/download_newyork_1m_dem.py `
   --project gen-lang-client-0153149292 `
   --export
 ```
 
-也可以把 `gee_newyork_1m_dem.js` 粘贴到 GEE Code Editor，在 `Tasks` 面板中启动导出。
+也可以把 `gee/newyork_1m_dem.js` 粘贴到 GEE Code Editor，在 `Tasks` 面板中启动导出。
 
 默认范围是纽约市五县联合边界：Bronx、Kings、New York、Queens、Richmond。只导出 Manhattan/纽约县时，Python 使用 `--boundary-mode county --county-geoid 36061`，JavaScript 将 `boundaryMode` 改为 `'county'`。
 
