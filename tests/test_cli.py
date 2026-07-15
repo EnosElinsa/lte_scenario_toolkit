@@ -27,11 +27,12 @@ def test_select_sites_exposes_reproducible_configuration_arguments():
 
 
 def test_figure_generator_exposes_reproducible_configuration_arguments():
-    help_text = command_help("generate_scenario_figures.py")
+    help_text = command_help("scripts/generate_scenario_figures.py")
 
     assert "--config" in help_text
     assert "--city" in help_text
     assert "--output-dir" in help_text
+    assert not (ROOT / "generate_scenario_figures.py").exists()
 
 
 def test_data_manifest_generator_exposes_metadata_and_output_arguments():
