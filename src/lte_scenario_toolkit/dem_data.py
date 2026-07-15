@@ -19,7 +19,7 @@ import numpy as np
 import rasterio
 import yaml
 from rasterio.crs import CRS
-from rasterio.enums import Resampling
+from rasterio.enums import MaskFlags, Resampling
 from rasterio.features import geometry_mask
 from rasterio.merge import merge as rasterio_merge
 from rasterio.windows import bounds as window_bounds
@@ -574,6 +574,25 @@ def _footprint(dataset: rasterio.io.DatasetReader):
     return box(left, bottom, right, top)
 
 
+def _reject_unrepresentable_mask(
+    dataset: rasterio.io.DatasetReader, *, path: Path, nodata: float | None
+) -> None:
+    """Reject invalid internal masks that a nodata-less merge would erase."""
+
+    if nodata is not None:
+        return
+    flags = dataset.mask_flag_enums[0]
+    if not flags or MaskFlags.all_valid in flags:
+        return
+    for _, window in dataset.block_windows(1):
+        mask = dataset.dataset_mask(window=window)
+        if np.any(mask == 0):
+            raise DemIngestError(
+                f"DEM shard {path.name} has invalid internal mask pixels but no nodata value; "
+                "declare an explicit nodata value before merging"
+            )
+
+
 def inspect_dem_shards(tiles_dir: str | Path, *, prefix: str) -> DemShardSet:
     """Discover and validate a manually downloaded rectangular DEM shard set.
 
@@ -632,6 +651,9 @@ def inspect_dem_shards(tiles_dir: str | Path, *, prefix: str) -> DemShardSet:
                         f"DEM shard {path.name} must use a floating-point dtype; found {shard_dtype}"
                     )
                 shard_nodata = _normalise_nodata(dataset.nodata)
+                _reject_unrepresentable_mask(
+                    dataset, path=path, nodata=shard_nodata
+                )
                 transform = dataset.transform
                 shard_origin = (float(transform.c), float(transform.f))
 

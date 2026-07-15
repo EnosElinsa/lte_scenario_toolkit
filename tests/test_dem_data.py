@@ -648,6 +648,18 @@ def test_inspect_dem_shards_distinguishes_nan_nodata_from_absent_nodata(tmp_path
         inspect_dem_shards(tiles, prefix="dem_")
 
 
+def test_inspect_dem_shards_rejects_invalid_internal_mask_without_nodata(tmp_path):
+    from lte_scenario_toolkit.dem_data import DemIngestError, inspect_dem_shards
+
+    tiles = tmp_path / "tiles"
+    path = _write_dem_tile(tiles / "dem_masked.tif", left=0, top=2, nodata=None)
+    with rasterio.open(path, "r+") as dataset:
+        dataset.write_mask(np.zeros((2, 2), dtype=np.uint8))
+
+    with pytest.raises(DemIngestError, match="mask.*nodata|nodata.*mask"):
+        inspect_dem_shards(tiles, prefix="dem_")
+
+
 def test_inspect_dem_shards_rejects_even_small_rotation(tmp_path):
     from lte_scenario_toolkit.dem_data import DemIngestError, inspect_dem_shards
 
