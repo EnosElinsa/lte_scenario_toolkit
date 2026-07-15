@@ -6,6 +6,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import geopandas as gpd
 import pandas as pd
@@ -14,6 +15,88 @@ from shapely.geometry import box
 
 from . import io, scenario, spatial, terrain, visualization
 from .config import load_experiment_config
+from .data_catalog import CatalogError, DataCatalog, load_data_catalog
+
+
+def _linked_catalog_scenario(
+    config: dict[str, Any],
+) -> tuple[DataCatalog, dict[str, Any]] | None:
+    """Return the one catalog scenario linked to this experiment config."""
+
+    repo_root = config.get("repo_root")
+    config_path = config.get("config_path")
+    if repo_root is None or config_path is None:
+        return None
+    repository = Path(repo_root).resolve()
+    catalog_path = repository / "data" / "datasets.yaml"
+    if not catalog_path.is_file():
+        return None
+
+    catalog = load_data_catalog(catalog_path, repo_root=repository)
+    experiment_path = Path(config_path)
+    if not experiment_path.is_absolute():
+        experiment_path = repository / experiment_path
+    experiment_path = experiment_path.resolve()
+    matches: list[dict[str, Any]] = []
+    for scenario_id in sorted(catalog.scenarios_by_id):
+        registered_scenario = catalog.scenario(scenario_id)
+        registered_config = registered_scenario.get("config_path")
+        if (
+            registered_config is not None
+            and catalog.resolve(registered_config) == experiment_path
+        ):
+            matches.append(registered_scenario)
+    if not matches:
+        return None
+    if len(matches) > 1:
+        scenario_ids = ", ".join(item["scenario_id"] for item in matches)
+        raise CatalogError(
+            f"Experiment config {experiment_path} is linked by multiple scenarios: "
+            f"{scenario_ids}"
+        )
+    return catalog, matches[0]
+
+
+def resolve_selection_io_paths(
+    config: dict[str, Any],
+    *,
+    create_output: bool = True,
+) -> dict[str, Any]:
+    """Resolve experiment paths and enforce linked catalog entrypoints."""
+
+    paths = spatial.resolve_io_paths(config, create_output=False)
+    linked = _linked_catalog_scenario(config)
+    if linked is not None:
+        catalog, registered_scenario = linked
+        scenario_id = registered_scenario["scenario_id"]
+        boundary = catalog.dataset(registered_scenario["boundary_dataset_id"])
+        registered_boundary = catalog.resolve(boundary["entrypoint"])
+        resolved_boundary = Path(paths["boundary_shp"]).resolve()
+        if resolved_boundary != registered_boundary:
+            raise ValueError(
+                f"Linked scenario {scenario_id!r} boundary does not match config "
+                f"({resolved_boundary} != {registered_boundary})"
+            )
+
+        dem_id = registered_scenario.get("dem_dataset_id")
+        if dem_id is None:
+            raise ValueError(f"Linked scenario {scenario_id!r} does not declare a DEM")
+        dem = catalog.dataset(dem_id)
+        registered_dem = catalog.resolve(dem["entrypoint"])
+        resolved_dem = Path(paths["dem_path"]).resolve()
+        if resolved_dem != registered_dem:
+            raise ValueError(
+                f"Linked scenario {scenario_id!r} DEM does not match config "
+                f"({resolved_dem} != {registered_dem})"
+            )
+
+        paths["boundary_shp"] = registered_boundary
+        paths["dem_path"] = registered_dem
+        paths["registered_scenario_id"] = scenario_id
+
+    if create_output:
+        Path(paths["output_dir"]).mkdir(parents=True, exist_ok=True)
+    return paths
 
 
 def process_selected_rectangles(chosen, points_gdf, dem, config):
@@ -107,7 +190,7 @@ def main(argv=None) -> int:
         config["rect_size"] = args.size
     if args.target is not None:
         config["target_count"] = args.target
-    config.update(spatial.resolve_io_paths(config))
+    config.update(resolve_selection_io_paths(config))
 
     print(f"City: {config['boundary_folder']} ({config['boundary_layer']})")
     print(f"Points: {config['points_shp']}")
