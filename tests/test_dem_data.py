@@ -3,11 +3,48 @@ import json
 from pathlib import Path
 
 import geopandas as gpd
+import numpy as np
 import pytest
+import rasterio
 import yaml
+from rasterio.transform import from_origin
 from shapely.geometry import box
 
 from lte_scenario_toolkit.data_catalog import load_data_catalog
+
+
+def _write_dem_tile(
+    path: Path,
+    *,
+    left: float,
+    top: float,
+    values: np.ndarray | None = None,
+    crs: str = "EPSG:3857",
+    resolution: tuple[float, float] = (1.0, 1.0),
+    dtype: str = "float32",
+    nodata: float | None = -9999.0,
+    count: int = 1,
+) -> Path:
+    data = np.asarray(values if values is not None else np.ones((2, 2)), dtype=dtype)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    transform = from_origin(left, top, resolution[0], resolution[1])
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        width=data.shape[-1],
+        height=data.shape[-2],
+        count=count,
+        dtype=dtype,
+        crs=crs,
+        transform=transform,
+        nodata=nodata,
+    ) as dst:
+        if count == 1:
+            dst.write(data, 1)
+        else:
+            dst.write(np.stack([data] * count), tuple(range(1, count + 1)))
+    return path
 
 
 def _write_catalog(tmp_path: Path, *, dem_dataset_id: str | None = "dem") -> Path:
@@ -533,3 +570,247 @@ def test_data_cli_dem_export_online_modes_record_results(
     assert "Image count: 5" in output
     assert "Task ID:" in output
     assert f"Run path: {run_path}" in output
+
+
+def test_inspect_dem_shards_returns_sorted_complete_grid_metadata(tmp_path):
+    from lte_scenario_toolkit.dem_data import inspect_dem_shards
+
+    tiles = tmp_path / "tiles"
+    _write_dem_tile(
+        tiles / "dem_01.tif",
+        left=0,
+        top=4,
+        values=np.full((2, 2), 1, dtype=np.float32),
+    )
+    _write_dem_tile(
+        tiles / "dem_00.tif",
+        left=0,
+        top=2,
+        values=np.full((2, 2), 2, dtype=np.float32),
+    )
+    _write_dem_tile(
+        tiles / "dem_11.tif",
+        left=2,
+        top=2,
+        values=np.full((2, 2), 3, dtype=np.float32),
+    )
+    _write_dem_tile(
+        tiles / "dem_10.tif",
+        left=2,
+        top=4,
+        values=np.full((2, 2), 4, dtype=np.float32),
+    )
+
+    shards = inspect_dem_shards(tiles, prefix="dem_")
+
+    assert tuple(path.name for path in shards.paths) == (
+        "dem_00.tif",
+        "dem_01.tif",
+        "dem_10.tif",
+        "dem_11.tif",
+    )
+    assert shards.crs == "EPSG:3857"
+    assert shards.resolution == (1.0, 1.0)
+    assert shards.dtype == "float32"
+    assert shards.nodata == -9999.0
+    assert shards.count == 1
+    assert shards.bounds == (0.0, 0.0, 4.0, 4.0)
+
+
+@pytest.mark.parametrize(
+    ("layout", "message"),
+    [
+        ("missing", "missing"),
+        ("overlap", "overlap"),
+    ],
+)
+def test_inspect_dem_shards_rejects_missing_or_overlapping_grid(tmp_path, layout, message):
+    from lte_scenario_toolkit.dem_data import DemIngestError, inspect_dem_shards
+
+    tiles = tmp_path / "tiles"
+    _write_dem_tile(tiles / "dem_0.tif", left=0, top=2)
+    _write_dem_tile(tiles / "dem_1.tif", left=2 if layout == "missing" else 1, top=2)
+    if layout == "missing":
+        _write_dem_tile(tiles / "dem_2.tif", left=0, top=0)
+
+    with pytest.raises(DemIngestError, match=message):
+        inspect_dem_shards(tiles, prefix="dem_")
+
+
+def test_merge_dem_shards_writes_tiled_compressed_raster_with_overviews(tmp_path):
+    from lte_scenario_toolkit.dem_data import inspect_dem_shards, merge_dem_shards
+
+    tiles = tmp_path / "tiles"
+    _write_dem_tile(
+        tiles / "dem_a.tif", left=0, top=2, values=np.array([[1, 2], [3, 4]], dtype=np.float32)
+    )
+    _write_dem_tile(
+        tiles / "dem_b.tif", left=2, top=2, values=np.array([[5, 6], [7, 8]], dtype=np.float32)
+    )
+    shards = inspect_dem_shards(tiles, prefix="dem_")
+    output = tmp_path / "merged" / "dem.tif"
+    output.parent.mkdir()
+    merge_dem_shards(shards, output)
+
+    with rasterio.open(output) as dataset:
+        assert dataset.shape == (2, 4)
+        assert dataset.read(1).tolist() == [[1, 2, 5, 6], [3, 4, 7, 8]]
+        assert dataset.compression.name.lower() == "lzw"
+        assert dataset.overviews(1) == [2]
+        assert dataset.tags(ns="rio_overview")["resampling"] == "average"
+
+
+def test_validate_dem_coverage_checks_only_intersecting_blocks_and_nodata(tmp_path):
+    from lte_scenario_toolkit.dem_data import validate_dem_coverage
+
+    raster = _write_dem_tile(
+        tmp_path / "dem.tif",
+        left=0,
+        top=4,
+        values=np.array(
+            [[-9999, -9999, -9999, -9999], [-9999, 2, -9999, -9999], [-9999, -9999, -9999, -9999], [-9999, -9999, -9999, -9999]],
+            dtype=np.float32,
+        ),
+    )
+    boundary = tmp_path / "boundary.geojson"
+    gpd.GeoDataFrame({"name": ["city"]}, geometry=[box(1, 1, 3, 3)], crs="EPSG:3857").to_file(boundary, driver="GeoJSON")
+
+    assert validate_dem_coverage(
+        raster, boundary, expected_crs="EPSG:3857", expected_resolution=(1.0, 1.0)
+    ) is None
+
+
+def test_ingest_dem_shards_merges_updates_catalog_and_manifest(tmp_path):
+    from lte_scenario_toolkit.dem_data import ingest_dem_shards
+
+    catalog_path = _write_catalog(tmp_path)
+    boundary_path = tmp_path / "boundary_shp" / "sample-city" / "sample-city.shp"
+    boundary_path.unlink()
+    for sidecar in boundary_path.parent.glob("sample-city.*"):
+        sidecar.unlink()
+    gpd.GeoDataFrame({"name": ["city"]}, geometry=[box(0, 0, 4, 4)], crs="EPSG:3857").to_file(boundary_path)
+    tiles = tmp_path / "downloaded"
+    _write_dem_tile(tiles / "usgs_3dep_1m_sample-city_a.tif", left=0, top=4, values=np.ones((4, 2), dtype=np.float32))
+    _write_dem_tile(tiles / "usgs_3dep_1m_sample-city_b.tif", left=2, top=4, values=np.full((4, 2), 2, dtype=np.float32))
+
+    catalog = ingest_dem_shards(load_data_catalog(catalog_path, repo_root=tmp_path), "sample-city", tiles)
+
+    dem = catalog.dataset("dem")
+    assert catalog.resolve(dem["entrypoint"]).is_file()
+    assert dem["external"] is True
+    assert dem["dtype"] == "float32"
+    assert dem["width"] == 4
+    assert dem["height"] == 4
+    assert dem["download_date"]
+    assert "pending export" in dem["notes"]
+    manifest = json.loads((tmp_path / "data" / "manifest.json").read_text(encoding="utf-8"))
+    assert {item["dataset_id"] for item in manifest["datasets"]} == {"boundary", "dem"}
+
+
+def test_data_cli_dem_ingest_prints_final_dem_and_maps_ingest_errors(tmp_path, monkeypatch, capsys):
+    import lte_scenario_toolkit.data_cli as data_cli
+    from lte_scenario_toolkit.dem_data import DemIngestError
+
+    catalog_path = _write_catalog(tmp_path)
+    calls = []
+
+    def fake_ingest(catalog, scenario_id, tiles_dir):
+        calls.append((catalog, scenario_id, tiles_dir))
+        return catalog
+
+    monkeypatch.setattr(data_cli, "ingest_dem_shards", fake_ingest)
+    assert data_cli.main(
+        [
+            "--catalog",
+            str(catalog_path),
+            "dem",
+            "ingest",
+            "sample-city",
+            "--tiles-dir",
+            str(tmp_path / "tiles"),
+        ]
+    ) == 0
+    assert calls[0][1:] == ("sample-city", tmp_path / "tiles")
+    assert "Final DEM:" in capsys.readouterr().out
+
+    def fail_ingest(*args):
+        raise DemIngestError("invalid shard set")
+
+    monkeypatch.setattr(data_cli, "ingest_dem_shards", fail_ingest)
+    assert data_cli.main(
+        [
+            "--catalog",
+            str(catalog_path),
+            "dem",
+            "ingest",
+            "sample-city",
+            "--tiles-dir",
+            str(tmp_path / "tiles"),
+        ]
+    ) == 2
+    assert "invalid shard set" in capsys.readouterr().err
+
+
+def test_ingest_dem_shards_rolls_back_owned_files_when_manifest_update_fails(
+    tmp_path, monkeypatch
+):
+    import lte_scenario_toolkit.dem_data as dem_data
+    from lte_scenario_toolkit.dem_data import ingest_dem_shards
+
+    catalog_path = _write_catalog(tmp_path)
+    boundary_path = tmp_path / "boundary_shp" / "sample-city" / "sample-city.shp"
+    for sidecar in boundary_path.parent.glob("sample-city.*"):
+        sidecar.unlink()
+    gpd.GeoDataFrame({"name": ["city"]}, geometry=[box(0, 0, 4, 4)], crs="EPSG:3857").to_file(boundary_path)
+    manifest_path = tmp_path / "data" / "manifest.json"
+    original_manifest = b'{"original": true}\n'
+    manifest_path.write_bytes(original_manifest)
+    original_catalog = catalog_path.read_bytes()
+    tiles = tmp_path / "downloaded"
+    tile_a = _write_dem_tile(tiles / "usgs_3dep_1m_sample-city_a.tif", left=0, top=4, values=np.ones((4, 2), dtype=np.float32))
+    tile_b = _write_dem_tile(tiles / "usgs_3dep_1m_sample-city_b.tif", left=2, top=4, values=np.ones((4, 2), dtype=np.float32))
+
+    def fail_manifest(*args, **kwargs):
+        manifest_path.write_text("partial", encoding="utf-8")
+        raise RuntimeError("manifest failed")
+
+    monkeypatch.setattr(dem_data, "update_data_manifest", fail_manifest)
+    with pytest.raises(dem_data.DemIngestError, match="manifest failed"):
+        ingest_dem_shards(load_data_catalog(catalog_path, repo_root=tmp_path), "sample-city", tiles)
+
+    assert catalog_path.read_bytes() == original_catalog
+    assert manifest_path.read_bytes() == original_manifest
+    assert not (tmp_path / "dem" / "sample-city" / "usgs_3dep_1m_sample-city.tif").exists()
+    assert tile_a.is_file() and tile_b.is_file()
+    assert not (tmp_path / ".lte-data" / "catalog.lock").exists()
+
+
+def test_ingest_dem_shards_reloads_catalog_only_after_lock_and_rejects_existing_symlink(
+    tmp_path, monkeypatch
+):
+    import lte_scenario_toolkit.dem_data as dem_data
+    from lte_scenario_toolkit.dem_data import DemIngestError, ingest_dem_shards
+
+    catalog_path = _write_catalog(tmp_path)
+    loaded = load_data_catalog(catalog_path, repo_root=tmp_path)
+    lock_path = tmp_path / ".lte-data" / "catalog.lock"
+    real_load = dem_data.load_data_catalog
+    calls = []
+
+    def assert_locked(path, **kwargs):
+        calls.append(path)
+        assert lock_path.is_file()
+        return real_load(path, **kwargs)
+
+    monkeypatch.setattr(dem_data, "load_data_catalog", assert_locked)
+    destination = tmp_path / "dem" / "sample-city" / "usgs_3dep_1m_sample-city.tif"
+    destination.parent.mkdir(parents=True)
+    try:
+        destination.symlink_to(tmp_path / "missing-target.tif")
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+    with pytest.raises(DemIngestError, match="already exists"):
+        ingest_dem_shards(loaded, "sample-city", tmp_path / "tiles")
+    assert calls == [catalog_path]
+    assert destination.is_symlink()
+    assert not lock_path.exists()

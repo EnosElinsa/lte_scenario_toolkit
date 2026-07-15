@@ -11,9 +11,11 @@ from pathlib import Path
 from .boundary_data import BoundaryImportError, register_scenario
 from .data_catalog import CatalogError, load_data_catalog
 from .dem_data import (
+    DemIngestError,
     EarthEngineExportError,
     build_dem_export_plan,
     execute_dem_export,
+    ingest_dem_shards,
     write_export_run,
 )
 
@@ -78,6 +80,22 @@ def _dem_export(args: argparse.Namespace) -> int:
     print(f"Image count: {result.image_count}")
     print(f"Task ID: {result.task_id or '<not started>'}")
     print(f"Run path: {run_path}")
+    return 0
+
+
+def _dem_ingest(args: argparse.Namespace) -> int:
+    catalog = load_data_catalog(args.catalog)
+    ingested = ingest_dem_shards(catalog, args.scenario_id, args.tiles_dir)
+    scenario = ingested.scenario(args.scenario_id)
+    dem_id = scenario["dem_dataset_id"]
+    if dem_id is None:
+        # The ingest function normally raises this first; retain a defensive
+        # guard for custom catalog implementations used by callers/tests.
+        raise DemIngestError(
+            f"Scenario {args.scenario_id!r} does not declare a DEM"
+        )
+    dem_path = ingested.resolve(ingested.dataset(dem_id)["entrypoint"])
+    print(f"Final DEM: {dem_path}")
     return 0
 
 
@@ -166,6 +184,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="explicitly start the Earth Engine Drive export task",
     )
     export.set_defaults(handler=_dem_export)
+    ingest = dem_commands.add_parser(
+        "ingest",
+        help="merge manually downloaded DEM shards and register the final raster",
+    )
+    ingest.add_argument("scenario_id")
+    ingest.add_argument(
+        "--tiles-dir",
+        type=Path,
+        required=True,
+        help="directory containing downloaded GeoTIFF shards",
+    )
+    ingest.set_defaults(handler=_dem_ingest)
     return parser
 
 
@@ -178,6 +208,7 @@ def main(argv: list[str] | None = None) -> int:
     except (
         BoundaryImportError,
         CatalogError,
+        DemIngestError,
         EarthEngineExportError,
         FileNotFoundError,
     ) as exc:
