@@ -140,7 +140,15 @@ def software_versions() -> dict[str, str]:
     """Return the interpreter and principal geospatial package versions."""
 
     versions = {"python": platform.python_version()}
-    for package in ("geopandas", "numpy", "pandas", "rasterio", "shapely"):
+    for package in (
+        "earthengine-api",
+        "geemap",
+        "geopandas",
+        "numpy",
+        "pandas",
+        "rasterio",
+        "shapely",
+    ):
         try:
             versions[package] = metadata.version(package)
         except metadata.PackageNotFoundError:

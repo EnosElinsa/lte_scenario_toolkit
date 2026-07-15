@@ -8,6 +8,7 @@ from lte_scenario_toolkit.io import (
     build_dataset_record,
     build_output_dataframe,
     create_data_manifest,
+    software_versions,
     write_run_record,
 )
 
@@ -127,3 +128,19 @@ scenarios: []
     assert dataset["files"][0]["path"] == "inputs/a.txt"
     assert dataset["files"][0]["size_bytes"] == 5
     assert len(dataset["files"][0]["sha256"]) == 64
+
+
+def test_software_versions_includes_earth_engine_dependencies(monkeypatch):
+    requested = []
+
+    def fake_version(package):
+        requested.append(package)
+        return f"{package}-version"
+
+    monkeypatch.setattr("lte_scenario_toolkit.io.metadata.version", fake_version)
+
+    versions = software_versions()
+
+    assert versions["earthengine-api"] == "earthengine-api-version"
+    assert versions["geemap"] == "geemap-version"
+    assert {"earthengine-api", "geemap"}.issubset(requested)

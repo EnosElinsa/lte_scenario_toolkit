@@ -157,10 +157,14 @@ def test_data_manager_help_exposes_extensible_scenario_commands():
     root_help = command_help("scripts/manage_data.py")
     scenario_help = command_help("scripts/manage_data.py", "scenario")
     add_help = command_help("scripts/manage_data.py", "scenario", "add")
+    dem_help = command_help("scripts/manage_data.py", "dem")
+    dem_export_help = command_help("scripts/manage_data.py", "dem", "export")
 
     assert "--catalog" in root_help
     assert "scenario" in root_help
+    assert "dem" in root_help
     assert all(command in scenario_help for command in ("add", "list", "show"))
+    assert "export" in dem_help
     assert all(
         option in add_help
         for option in (
@@ -172,6 +176,19 @@ def test_data_manager_help_exposes_extensible_scenario_commands():
             "--download-date",
             "--config-path",
             "--redistribution-confirmed",
+        )
+    )
+    assert all(
+        option in dem_export_help
+        for option in (
+            "--project",
+            "--scale",
+            "--file-dimensions",
+            "--shard-size",
+            "--max-pixels",
+            "--drive-folder",
+            "--dry-run",
+            "--export",
         )
     )
 
