@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import rasterio
 import yaml
-from rasterio.transform import from_origin
+from rasterio.transform import Affine, from_origin
 from shapely.geometry import box
 
 from lte_scenario_toolkit.data_catalog import load_data_catalog
@@ -637,6 +637,41 @@ def test_inspect_dem_shards_rejects_missing_or_overlapping_grid(tmp_path, layout
         inspect_dem_shards(tiles, prefix="dem_")
 
 
+def test_inspect_dem_shards_distinguishes_nan_nodata_from_absent_nodata(tmp_path):
+    from lte_scenario_toolkit.dem_data import DemIngestError, inspect_dem_shards
+
+    tiles = tmp_path / "tiles"
+    _write_dem_tile(tiles / "dem_a.tif", left=0, top=2, nodata=float("nan"))
+    _write_dem_tile(tiles / "dem_b.tif", left=2, top=2, nodata=None)
+
+    with pytest.raises(DemIngestError, match="nodata"):
+        inspect_dem_shards(tiles, prefix="dem_")
+
+
+def test_inspect_dem_shards_rejects_even_small_rotation(tmp_path):
+    from lte_scenario_toolkit.dem_data import DemIngestError, inspect_dem_shards
+
+    tiles = tmp_path / "tiles"
+    path = tiles / "dem_rotated.tif"
+    path.parent.mkdir()
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        width=2,
+        height=2,
+        count=1,
+        dtype="float32",
+        crs="EPSG:3857",
+        transform=Affine(1.0, 1e-9, 0.0, 0.0, -1.0, 2.0),
+        nodata=-9999.0,
+    ) as dataset:
+        dataset.write(np.ones((2, 2), dtype=np.float32), 1)
+
+    with pytest.raises(DemIngestError, match="north-up|rotat"):
+        inspect_dem_shards(tiles, prefix="dem_")
+
+
 def test_merge_dem_shards_writes_tiled_compressed_raster_with_overviews(tmp_path):
     from lte_scenario_toolkit.dem_data import inspect_dem_shards, merge_dem_shards
 
@@ -678,6 +713,24 @@ def test_validate_dem_coverage_checks_only_intersecting_blocks_and_nodata(tmp_pa
     assert validate_dem_coverage(
         raster, boundary, expected_crs="EPSG:3857", expected_resolution=(1.0, 1.0)
     ) is None
+
+
+def test_validate_dem_coverage_rejects_boundary_outside_raster_extent(tmp_path):
+    from lte_scenario_toolkit.dem_data import DemIngestError, validate_dem_coverage
+
+    raster = _write_dem_tile(
+        tmp_path / "dem.tif",
+        left=0,
+        top=4,
+        values=np.ones((4, 4), dtype=np.float32),
+    )
+    boundary = tmp_path / "boundary.geojson"
+    gpd.GeoDataFrame({"name": ["city"]}, geometry=[box(-0.1, 1, 1, 3)], crs="EPSG:3857").to_file(boundary, driver="GeoJSON")
+
+    with pytest.raises(DemIngestError, match="bounds|cover"):
+        validate_dem_coverage(
+            raster, boundary, expected_crs="EPSG:3857", expected_resolution=(1.0, 1.0)
+        )
 
 
 def test_ingest_dem_shards_merges_updates_catalog_and_manifest(tmp_path):

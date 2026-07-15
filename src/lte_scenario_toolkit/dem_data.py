@@ -485,6 +485,7 @@ def write_export_run(
 # Manual DEM shard ingestion
 
 _PIXEL_EPSILON = 1e-8
+_TRANSFORM_EPSILON = 1e-12
 
 
 def _canonical_crs(value: object) -> tuple[CRS, str]:
@@ -507,14 +508,17 @@ def _normalise_nodata(value: object) -> float | None:
         result = float(value)
     except (TypeError, ValueError) as exc:
         raise DemIngestError(f"Invalid DEM nodata value: {value!r}") from exc
-    # A NaN nodata marker is equivalent to an absent marker for comparison and
-    # for masked reads.  Keeping it as None also makes catalog YAML stable.
-    return None if math.isnan(result) else result
+    # Preserve NaN as a distinct metadata marker.  It behaves as invalid data
+    # during coverage checks, but it is not equivalent to an absent nodata
+    # declaration when comparing shard metadata.
+    return result
 
 
 def _same_nodata(left: float | None, right: float | None) -> bool:
     if left is None or right is None:
         return left is None and right is None
+    if math.isnan(left) or math.isnan(right):
+        return math.isnan(left) and math.isnan(right)
     return left == right
 
 
@@ -534,8 +538,8 @@ def _resolution_from_dataset(dataset: rasterio.io.DatasetReader) -> tuple[float,
         or not math.isfinite(transform.e)
         or transform.a <= 0
         or transform.e >= 0
-        or not math.isclose(transform.b, 0.0, abs_tol=_PIXEL_EPSILON)
-        or not math.isclose(transform.d, 0.0, abs_tol=_PIXEL_EPSILON)
+        or not math.isclose(transform.b, 0.0, abs_tol=_TRANSFORM_EPSILON)
+        or not math.isclose(transform.d, 0.0, abs_tol=_TRANSFORM_EPSILON)
     ):
         raise DemIngestError(
             f"DEM shard {dataset.name} must use a non-rotated north-up transform"
@@ -839,9 +843,11 @@ def validate_dem_coverage(
                 )
             geometry = _boundary_geometry(Path(boundary_path), expected_crs_obj)
             raster_bounds = box(*dataset.bounds)
-            # A one-pixel buffer accommodates boundary/raster edge rounding,
-            # while coverage still requires at least one finite pixel inside.
-            if not raster_bounds.buffer(max(actual_res) + _PIXEL_EPSILON).covers(geometry):
+            # Require the registered geometry to be covered by the raster
+            # extent.  ``covers`` includes exact edge contact while refusing a
+            # materially out-of-bounds polygon; only the tiny coordinate
+            # tolerance in the affine/geometry libraries is accepted.
+            if not raster_bounds.covers(geometry):
                 raise DemIngestError("DEM raster bounds do not cover the registered boundary")
 
             boundary_mapping = [mapping(geometry)]
