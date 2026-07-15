@@ -3,6 +3,7 @@ import py_compile
 import re
 from pathlib import Path
 
+import geopandas as gpd
 import tomllib
 import yaml
 
@@ -231,6 +232,28 @@ def test_repository_catalog_registers_every_boundary_and_scenario():
         assert scenario["boundary_dataset_id"] == boundary_id
         assert scenario["dem_dataset_id"] == dem_id
         assert scenario["config_path"] == config_path
+
+
+def test_registered_boundary_entrypoints_match_declared_geometry():
+    metadata = yaml.safe_load((ROOT / "data" / "datasets.yaml").read_text(encoding="utf-8"))
+    boundaries = {
+        item["dataset_id"]: item
+        for item in metadata["datasets"]
+        if item["role"] == "boundary"
+    }
+
+    assert set(boundaries) == set(BOUNDARIES)
+    for boundary_id, boundary in boundaries.items():
+        frame = gpd.read_file(ROOT / boundary["entrypoint"])
+
+        assert not frame.empty, boundary_id
+        assert len(frame) == boundary["feature_count"], boundary_id
+        assert frame.crs is not None, boundary_id
+        assert frame.crs.to_string() == boundary["crs"], boundary_id
+        assert frame.geometry.notna().all(), boundary_id
+        assert not frame.geometry.is_empty.any(), boundary_id
+        assert set(frame.geometry.geom_type) == {boundary["geometry_type"]}, boundary_id
+        assert frame.geometry.is_valid.all(), boundary_id
 
 
 def test_manifest_uses_schema_v2_and_preserves_scenario_links():
