@@ -27,7 +27,9 @@ PUBLIC_SURFACES = (
     ROOT / "data",
     ROOT / "dem",
     ROOT / "gee",
-    ROOT / "runs",
+    # Generated runs/** are ignored traceability artifacts and may record the
+    # user's selected Earth Engine project. Only the tracked public contract is scanned.
+    ROOT / "runs" / "README.md",
     ROOT / "scripts",
     ROOT / "src",
 )
