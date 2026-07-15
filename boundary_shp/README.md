@@ -1,17 +1,25 @@
 # Boundary data
 
-`boundary_shp/` contains the administrative or study-area boundaries used by
-registered LTE scenarios. The catalog in `data/datasets.yaml` is the source of
-truth for each boundary path, entrypoint, CRS, feature count, provider, and
-redistribution terms.
+Each registered scenario has one authoritative polygon boundary. The same exact
+registered entrypoint is used for LTE site selection and as the Earth Engine
+(GEE) DEM export region of interest. The catalog in `data/datasets.yaml` is the
+source of truth for its path, CRS, feature count, provider, and redistribution
+terms.
 
-## Add a boundary
+## Supported sources
 
 `lte-data scenario add` accepts a local path or an HTTP(S) URL for a Shapefile,
-ZIP archive, GeoJSON file, or GeoPackage. Use `--layer` when an archive or
-GeoPackage contains more than one vector layer. Always provide the provider and
-license text. Use `--redistribution-confirmed` only when the repository may
-redistribute the normalized boundary.
+ZIP archive, GeoJSON file, or GeoPackage. If a source contains multiple vector
+layers, `--layer` is required to select one unambiguously.
+
+## Licensing
+
+The provider, license, and `--redistribution-confirmed` flag are mandatory
+because `boundary_shp/` is tracked by Git. Supply the source's real terms and
+confirm redistribution only when those terms permit the normalized boundary to
+be published in this repository.
+
+## Register a scenario
 
 ```powershell
 lte-data scenario add boston `
@@ -21,22 +29,29 @@ lte-data scenario add boston `
   --redistribution-confirmed
 ```
 
-The command stages the source, records a source checksum, validates the layer,
-and installs it atomically. A source must declare a CRS, contain at least one
-feature, and contain only nonempty valid `Polygon` or `MultiPolygon` geometries.
-The selected features are dissolved into one study boundary and normalized to
-the repository's metre-based `EPSG:3857` workflow. The catalog remains the
-authority for the declared CRS of every existing entry.
+Registration creates a boundary dataset, a pending external DEM declaration,
+and a scenario link. Inspect the resulting links with:
 
-For Shapefiles, keep the `.shp`, `.shx`, `.dbf`, `.prj`, and `.cpg` components
-together; optional index and metadata files may remain beside them. The
-registration transaction updates the catalog and manifest only after the
-boundary directory is complete. A failed import leaves the previous catalog
-and installed data untouched.
+```powershell
+lte-data scenario list
+lte-data scenario show boston
+```
 
-## Registered scenarios
+## Validation performed
 
-The current catalog contains these scenario IDs:
+The command stages the source and verifies that it declares a CRS, contains at
+least one feature, and contains only nonempty valid `Polygon` or `MultiPolygon`
+geometries. It dissolves the selected features into one boundary and normalizes
+the result to `EPSG:3857`.
+
+For Shapefiles, registration installs the `.shp`, `.shx`, `.dbf`, `.prj`, and
+`.cpg` sidecars together. It records the source SHA256 and publishes the
+boundary, catalog, and manifest changes atomically. A failed import leaves the
+previous catalog and installed data untouched.
+
+## Existing data
+
+The current catalog contains these registered scenario IDs:
 
 - `phoenix`
 - `chicago`
@@ -44,12 +59,6 @@ The current catalog contains these scenario IDs:
 - `cambridge`
 - `new-york-city`
 
-Registration creates a boundary dataset, a pending external DEM declaration,
-and a scenario link. If the source URL or acquisition date is unknown, the
-catalog stores `null`; values are never inferred from a filename or a search
-result. Inspect the resulting links with:
-
-```powershell
-lte-data scenario list
-lte-data scenario show chicago
-```
+If a source URL or acquisition date is unavailable, its catalog field remains
+`null`; these values are never inferred from filenames, searches, or local
+timestamps.
