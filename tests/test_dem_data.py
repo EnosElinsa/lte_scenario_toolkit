@@ -361,6 +361,31 @@ def test_execute_dem_export_normalizes_earth_engine_errors_with_cause(tmp_path):
     assert captured.value.__cause__ is cause
 
 
+def test_execute_dem_export_rejects_changed_boundary_before_any_earth_engine_call(
+    tmp_path,
+):
+    from lte_scenario_toolkit.dem_data import EarthEngineExportError, execute_dem_export
+
+    plan = _build_plan(tmp_path)
+    plan.boundary_path.write_bytes(plan.boundary_path.read_bytes() + b"tampered")
+    ee = _FakeEE()
+    geemap = _FakeGeemap()
+
+    with pytest.raises(EarthEngineExportError, match="checksum|SHA256"):
+        execute_dem_export(
+            plan,
+            start=True,
+            ee_module=ee,
+            geemap_module=geemap,
+        )
+
+    assert ee.initialized_projects == []
+    assert ee.image_collection_ids == []
+    assert geemap.calls == []
+    assert ee.to_drive.calls == []
+    assert ee.task.start_calls == 0
+
+
 def test_write_export_run_creates_complete_unique_run_artifacts(tmp_path):
     from lte_scenario_toolkit.dem_data import DemExportResult, write_export_run
 
@@ -399,6 +424,33 @@ def test_write_export_run_creates_complete_unique_run_artifacts(tmp_path):
     assert all(value in layer_text for value in ("USGS/3DEP/1m", "elevation", "EPSG:3857"))
     assert str(plan.boundary_path) in sources_text
     assert plan.boundary_sha256 in sources_text
+
+
+def test_write_export_run_removes_staging_and_never_publishes_partial_run(
+    tmp_path, monkeypatch
+):
+    import lte_scenario_toolkit.dem_data as dem_data
+
+    plan = _build_plan(tmp_path)
+    result = dem_data.DemExportResult(image_count=7, task_id="task-123")
+    runs_root = tmp_path / "runs"
+    original_write = dem_data._atomic_write_text
+    write_calls = 0
+
+    def fail_second_write(path, text):
+        nonlocal write_calls
+        write_calls += 1
+        if write_calls == 2:
+            raise OSError("injected write failure")
+        original_write(path, text)
+
+    monkeypatch.setattr(dem_data, "_atomic_write_text", fail_second_write)
+
+    with pytest.raises(dem_data.EarthEngineExportError, match="injected write failure"):
+        dem_data.write_export_run(plan, result, runs_root=runs_root)
+
+    assert runs_root.is_dir()
+    assert list(runs_root.iterdir()) == []
 
 
 def test_data_cli_dem_export_dry_run_is_json_only_and_never_imports_gee(

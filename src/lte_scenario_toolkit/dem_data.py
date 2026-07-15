@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
 import tempfile
 import uuid
 from dataclasses import dataclass
@@ -225,8 +226,14 @@ def execute_dem_export(
             ee_module = imported_ee if ee_module is None else ee_module
             geemap_module = imported_geemap if geemap_module is None else geemap_module
 
-        ee_module.Initialize(project=plan.project)
+        current_boundary_sha256 = sha256_file(plan.boundary_path)
+        if current_boundary_sha256 != plan.boundary_sha256:
+            raise ValueError(
+                "Boundary SHA256 checksum changed after export planning: "
+                f"expected {plan.boundary_sha256}, found {current_boundary_sha256}"
+            )
         boundary = gpd.read_file(plan.boundary_path).to_crs("EPSG:4326")
+        ee_module.Initialize(project=plan.project)
         geometry_column = boundary.geometry.name
         roi = geemap_module.gdf_to_ee(
             boundary[[geometry_column]],
@@ -294,16 +301,24 @@ def _atomic_write_text(path: Path, text: str) -> None:
             temporary_path.unlink(missing_ok=True)
 
 
-def _create_run_directory(runs_root: Path, base_name: str) -> Path:
-    runs_root.mkdir(parents=True, exist_ok=True)
+def _publish_run_directory(
+    staging_path: Path,
+    runs_root: Path,
+    base_name: str,
+) -> Path:
     for attempt in range(100):
         suffix = "" if attempt == 0 else f"-{uuid.uuid4().hex[:8]}"
         run_path = runs_root / f"{base_name}{suffix}"
-        try:
-            run_path.mkdir()
-        except FileExistsError:
+        if os.path.lexists(run_path):
             continue
-        return run_path
+        try:
+            staging_path.rename(run_path)
+        except OSError:
+            if os.path.lexists(run_path):
+                continue
+            raise
+        else:
+            return run_path
     raise FileExistsError(f"Could not allocate a unique run directory under {runs_root}")
 
 
@@ -315,13 +330,15 @@ def write_export_run(
 ) -> Path:
     """Write human-readable and machine-readable records for an online run."""
 
+    staging_path: Path | None = None
     try:
         created_at = datetime.now(timezone.utc)
         timestamp = created_at.isoformat().replace("+00:00", "Z")
         base_name = (
             f"{created_at:%Y%m%d-%H%M%S}-{plan.scenario_id}-dem-export"
         )
-        run_path = _create_run_directory(Path(runs_root), base_name)
+        runs_directory = Path(runs_root)
+        runs_directory.mkdir(parents=True, exist_ok=True)
         git_commit = _git_commit(plan.repo_root)
         versions = software_versions()
         task_id = result.task_id or "<not started>"
@@ -391,13 +408,26 @@ def write_export_run(
             "",
         ]
 
-        _atomic_write_text(run_path / "RUN.md", "\n".join(run_lines))
-        _atomic_write_text(run_path / "DATA_LAYER.md", "\n".join(layer_lines))
-        _atomic_write_text(run_path / "sources.md", "\n".join(source_lines))
+        staging_path = Path(
+            tempfile.mkdtemp(
+                prefix=f".{base_name}.",
+                suffix=".tmp",
+                dir=runs_directory,
+            )
+        )
+        _atomic_write_text(staging_path / "RUN.md", "\n".join(run_lines))
+        _atomic_write_text(staging_path / "DATA_LAYER.md", "\n".join(layer_lines))
+        _atomic_write_text(staging_path / "sources.md", "\n".join(source_lines))
         _atomic_write_text(
-            run_path / "export-plan.json",
+            staging_path / "export-plan.json",
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         )
+        run_path = _publish_run_directory(
+            staging_path,
+            runs_directory,
+            base_name,
+        )
+        staging_path = None
         return run_path
     except EarthEngineExportError:
         raise
@@ -405,3 +435,6 @@ def write_export_run(
         raise EarthEngineExportError(
             f"Cannot write DEM export run artifacts: {type(exc).__name__}: {exc}"
         ) from exc
+    finally:
+        if staging_path is not None and os.path.lexists(staging_path):
+            shutil.rmtree(staging_path)
