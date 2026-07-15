@@ -130,9 +130,9 @@ def create_data_manifest(
 ) -> Path:
     """Validate a schema-v2 catalog and update its checksummed JSON manifest."""
 
-    from .data_catalog import _load_data_catalog, update_data_manifest
+    from .data_catalog import load_data_catalog, update_data_manifest
 
-    catalog = _load_data_catalog(metadata_path, repo_root)
+    catalog = load_data_catalog(metadata_path, repo_root=repo_root)
     return update_data_manifest(catalog, output_path, dataset_ids=dataset_ids)
 
 

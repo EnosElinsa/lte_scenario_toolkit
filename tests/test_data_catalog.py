@@ -202,6 +202,40 @@ def test_catalog_rejects_absolute_paths_even_when_they_are_inside_root(tmp_path)
         load_data_catalog(path)
 
 
+def test_catalog_rejects_entrypoint_outside_declared_dataset_path(tmp_path):
+    document = catalog_document()
+    document["datasets"][0]["entrypoint"] = "configs/test-city.yaml"
+    path = write_catalog(tmp_path, document)
+
+    with pytest.raises(CatalogError, match="entrypoint must be within dataset path"):
+        load_data_catalog(path)
+
+
+def test_load_data_catalog_accepts_explicit_root_for_arbitrary_catalog_location(tmp_path):
+    catalog_dir = tmp_path / "catalog"
+    catalog_dir.mkdir()
+    path = catalog_dir / "datasets.yaml"
+    path.write_text(
+        yaml.safe_dump(catalog_document(), sort_keys=False),
+        encoding="utf-8",
+    )
+
+    catalog = load_data_catalog(path, repo_root=tmp_path)
+
+    assert catalog.root == tmp_path.resolve()
+    assert catalog.resolve("inputs/boundary") == (tmp_path / "inputs" / "boundary").resolve()
+
+
+def test_load_data_catalog_normalizes_malformed_yaml_to_catalog_error(tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    path = data_dir / "datasets.yaml"
+    path.write_text("datasets: [", encoding="utf-8")
+
+    with pytest.raises(CatalogError, match=r"Cannot parse data catalog .*datasets\.yaml"):
+        load_data_catalog(path)
+
+
 @pytest.mark.parametrize(
     ("entry", "field", "message"),
     [
@@ -397,6 +431,50 @@ def test_incremental_manifest_hashes_new_datasets_even_when_not_targeted(tmp_pat
     update_data_manifest(catalog, output, dataset_ids={"boundary"})
 
     assert catalog.resolve("inputs/dem/elevation.tif") in hashed_paths
+
+
+@pytest.mark.parametrize(
+    "stale_case",
+    ["path", "entrypoint", "file-path", "size", "sha256"],
+)
+def test_incremental_manifest_recomputes_malformed_or_stale_untargeted_records(
+    tmp_path,
+    stale_case,
+):
+    create_entrypoints(tmp_path)
+    catalog = load_data_catalog(write_catalog(tmp_path))
+    output = update_data_manifest(catalog, "data/manifest.json")
+    existing = json.loads(output.read_text(encoding="utf-8"))
+    boundary = next(item for item in existing["datasets"] if item["dataset_id"] == "boundary")
+    if stale_case == "path":
+        boundary["path"] = "inputs/other-boundary"
+    elif stale_case == "entrypoint":
+        boundary["entrypoint"] = "inputs/boundary/other.geojson"
+    elif stale_case == "file-path":
+        boundary["files"][0]["path"] = "inputs/dem/elevation.tif"
+    elif stale_case == "size":
+        boundary["files"][0]["size_bytes"] = -1
+    else:
+        boundary["files"][0]["sha256"] = "not-a-sha256"
+    output.write_text(json.dumps(existing), encoding="utf-8")
+    boundary_entrypoint = catalog.resolve("inputs/boundary/boundary.geojson")
+    boundary_entrypoint.write_text("changed boundary", encoding="utf-8")
+
+    update_data_manifest(catalog, output, dataset_ids={"dem"})
+
+    updated = json.loads(output.read_text(encoding="utf-8"))
+    updated_boundary = next(
+        item for item in updated["datasets"] if item["dataset_id"] == "boundary"
+    )
+    assert updated_boundary["path"] == "inputs/boundary"
+    assert updated_boundary["entrypoint"] == "inputs/boundary/boundary.geojson"
+    assert updated_boundary["files"] == [
+        {
+            "path": "inputs/boundary/boundary.geojson",
+            "size_bytes": len(b"changed boundary"),
+            "sha256": hashlib.sha256(b"changed boundary").hexdigest(),
+        }
+    ]
 
 
 def test_manifest_allows_missing_external_data_but_rejects_missing_local_data(tmp_path):

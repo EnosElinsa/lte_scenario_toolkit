@@ -57,6 +57,7 @@ SCENARIO_FIELDS = frozenset(
     }
 )
 SCENARIO_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]*$")
+SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 class CatalogError(ValueError):
@@ -134,7 +135,7 @@ def _require_fields(
         raise CatalogError(f"{description} is missing required fields: {', '.join(missing)}")
 
 
-def _validate_catalog_path(value: Any, root: Path, *, description: str) -> None:
+def _validate_catalog_path(value: Any, root: Path, *, description: str) -> Path:
     if not isinstance(value, str) or not value:
         raise CatalogError(f"{description} must be a non-empty repository-relative path")
     path = Path(value)
@@ -145,6 +146,7 @@ def _validate_catalog_path(value: Any, root: Path, *, description: str) -> None:
         resolved.relative_to(root)
     except ValueError as exc:
         raise CatalogError(f"{description} escapes repository root: {value}") from exc
+    return resolved
 
 
 def _validate_dataset(dataset: Any, root: Path, index: int) -> tuple[str, dict[str, Any]]:
@@ -161,12 +163,22 @@ def _validate_dataset(dataset: Any, root: Path, index: int) -> tuple[str, dict[s
         raise CatalogError(
             f"Dataset {dataset_id!r} role must be one of: points, boundary, dem"
         )
-    _validate_catalog_path(dataset["path"], root, description=f"Dataset {dataset_id!r} path")
-    _validate_catalog_path(
+    dataset_path = _validate_catalog_path(
+        dataset["path"],
+        root,
+        description=f"Dataset {dataset_id!r} path",
+    )
+    entrypoint = _validate_catalog_path(
         dataset["entrypoint"],
         root,
         description=f"Dataset {dataset_id!r} entrypoint",
     )
+    try:
+        entrypoint.relative_to(dataset_path)
+    except ValueError as exc:
+        raise CatalogError(
+            f"Dataset {dataset_id!r} entrypoint must be within dataset path"
+        ) from exc
 
     if role == "boundary":
         missing = sorted(BOUNDARY_FIELDS.difference(dataset))
@@ -288,7 +300,10 @@ def validate_catalog_document(document: dict[str, Any], root: str | Path) -> Non
 
 def _load_data_catalog(path: str | Path, root: str | Path | None = None) -> DataCatalog:
     catalog_path = Path(path).resolve()
-    document = yaml.safe_load(catalog_path.read_text(encoding="utf-8")) or {}
+    try:
+        document = yaml.safe_load(catalog_path.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as exc:
+        raise CatalogError(f"Cannot parse data catalog {catalog_path}: {exc}") from exc
     if root is None:
         repository = (
             catalog_path.parent.parent
@@ -311,10 +326,14 @@ def _load_data_catalog(path: str | Path, root: str | Path | None = None) -> Data
     )
 
 
-def load_data_catalog(path: str | Path) -> DataCatalog:
+def load_data_catalog(
+    path: str | Path,
+    *,
+    repo_root: str | Path | None = None,
+) -> DataCatalog:
     """Load, validate, and index a repository data catalog."""
 
-    return _load_data_catalog(path)
+    return _load_data_catalog(path, repo_root)
 
 
 def _atomic_write_text(path: Path, text: str, *, before_replace=None) -> None:
@@ -367,7 +386,7 @@ def save_data_catalog(catalog: DataCatalog, document: dict[str, Any]) -> DataCat
         text,
         before_replace=lambda: _guard_catalog_mtime(catalog),
     )
-    return _load_data_catalog(catalog.path, catalog.root)
+    return load_data_catalog(catalog.path, repo_root=catalog.root)
 
 
 def _manifest_json_safe(value: Any) -> Any:
@@ -382,7 +401,7 @@ def _manifest_json_safe(value: Any) -> Any:
     return value
 
 
-def _existing_manifest_files(output_path: Path) -> dict[str, list[dict[str, Any]]]:
+def _existing_manifest_records(output_path: Path) -> dict[str, dict[str, Any]]:
     if not output_path.exists():
         return {}
     try:
@@ -392,16 +411,52 @@ def _existing_manifest_files(output_path: Path) -> dict[str, list[dict[str, Any]
     datasets = payload.get("datasets") if isinstance(payload, dict) else None
     if not isinstance(datasets, list):
         raise CatalogError(f"Existing data manifest has no datasets list: {output_path}")
-    files_by_id: dict[str, list[dict[str, Any]]] = {}
+    records_by_id: dict[str, dict[str, Any]] = {}
     for dataset in datasets:
         if not isinstance(dataset, dict):
             raise CatalogError("Existing data manifest contains a non-mapping dataset")
         dataset_id = dataset.get("dataset_id")
-        files = dataset.get("files")
-        if not isinstance(dataset_id, str) or not isinstance(files, list):
+        if not isinstance(dataset_id, str):
             raise CatalogError("Existing data manifest contains an invalid dataset entry")
-        files_by_id[dataset_id] = files
-    return files_by_id
+        if dataset_id in records_by_id:
+            raise CatalogError(f"Existing data manifest has duplicate dataset ID: {dataset_id}")
+        records_by_id[dataset_id] = dataset
+    return records_by_id
+
+
+def _reusable_manifest_files(
+    catalog: DataCatalog,
+    dataset: dict[str, Any],
+    previous: dict[str, Any] | None,
+) -> list[dict[str, Any]] | None:
+    if previous is None:
+        return None
+    if previous.get("path") != dataset["path"]:
+        return None
+    if previous.get("entrypoint") != dataset["entrypoint"]:
+        return None
+    files = previous.get("files")
+    if not isinstance(files, list):
+        return None
+
+    dataset_path = catalog.resolve(dataset["path"])
+    for file in files:
+        if not isinstance(file, dict):
+            return None
+        path = file.get("path")
+        size_bytes = file.get("size_bytes")
+        sha256 = file.get("sha256")
+        if not isinstance(path, str):
+            return None
+        try:
+            catalog.resolve(path).relative_to(dataset_path)
+        except (CatalogError, ValueError):
+            return None
+        if type(size_bytes) is not int or size_bytes < 0:
+            return None
+        if not isinstance(sha256, str) or not SHA256_PATTERN.fullmatch(sha256):
+            return None
+    return files
 
 
 def _dataset_files(catalog: DataCatalog, dataset: dict[str, Any]) -> list[dict[str, Any]]:
@@ -459,18 +514,19 @@ def update_data_manifest(
         if unknown:
             raise CatalogError(f"Unknown dataset IDs: {', '.join(unknown)}")
 
-    previous_files = _existing_manifest_files(output)
+    previous_records = _existing_manifest_records(output)
     datasets: list[dict[str, Any]] = []
     for raw_dataset in catalog.document["datasets"]:
         dataset_id = raw_dataset["dataset_id"]
-        recompute = (
-            targets is None or dataset_id in targets or dataset_id not in previous_files
+        reusable_files = _reusable_manifest_files(
+            catalog,
+            raw_dataset,
+            previous_records.get(dataset_id),
         )
+        recompute = targets is None or dataset_id in targets or reusable_files is None
         dataset = _manifest_json_safe(dict(raw_dataset))
         dataset["files"] = (
-            _dataset_files(catalog, raw_dataset)
-            if recompute
-            else previous_files[dataset_id]
+            _dataset_files(catalog, raw_dataset) if recompute else reusable_files
         )
         datasets.append(dataset)
 
