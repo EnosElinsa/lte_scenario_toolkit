@@ -847,7 +847,8 @@ def validate_dem_coverage(
             # extent.  ``covers`` includes exact edge contact while refusing a
             # materially out-of-bounds polygon; only the tiny coordinate
             # tolerance in the affine/geometry libraries is accepted.
-            if not raster_bounds.covers(geometry):
+            extent_epsilon = max(actual_res) * 1e-9
+            if not raster_bounds.buffer(extent_epsilon).covers(geometry):
                 raise DemIngestError("DEM raster bounds do not cover the registered boundary")
 
             boundary_mapping = [mapping(geometry)]
