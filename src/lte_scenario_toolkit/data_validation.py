@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,36 @@ from .spatial import resolve_io_paths
 _SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 _POLYGON_TYPES = frozenset({"Polygon", "MultiPolygon"})
 _SHAPEFILE_COMPONENTS = (".shp", ".shx", ".dbf", ".prj", ".cpg")
+
+
+def _canonical_value(value: Any, *, key: str | None = None) -> Any:
+    """Return a JSON-safe value with stable path/date representations."""
+
+    if isinstance(value, Path):
+        return value.as_posix()
+    if isinstance(value, datetime | date):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {
+            str(item_key): _canonical_value(item, key=str(item_key))
+            for item_key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_value(item, key=key) for item in value]
+    if isinstance(value, str) and key in {"path", "entrypoint", "config_path"}:
+        return value.replace("\\", "/")
+    return value
+
+
+def _canonical_json(value: Any) -> str:
+    """Serialize metadata for exact, order-independent comparison."""
+
+    return json.dumps(
+        _canonical_value(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 @dataclass(frozen=True)
@@ -240,9 +271,10 @@ def _manifest_file(
     """Validate one manifest file record without loading file contents."""
 
     if not isinstance(item, dict):
-        _error(report, "manifest.file.malformed", f"Manifest file entry {index} is not a mapping")
         return
     raw_path = item.get("path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return
     dataset_root: Path | None
     try:
         dataset_root = catalog.resolve(dataset.get("path", ""))
@@ -254,19 +286,20 @@ def _manifest_file(
         dataset_root=dataset_root,
     )
     if path_error:
-        code = "manifest.traversal" if "escapes" in path_error or "outside" in path_error else "manifest.file.malformed"
+        code = (
+            "manifest.traversal"
+            if "escapes" in path_error or "outside" in path_error
+            else "manifest.file.malformed"
+        )
         _error(report, code, path_error)
         return
     size = item.get("size_bytes")
     digest = item.get("sha256")
-    malformed = False
     if type(size) is not int or size < 0:
-        _error(report, "manifest.file.malformed", f"Manifest size_bytes is invalid for {raw_path!r}")
-        malformed = True
+        return
     if not isinstance(digest, str) or not _SHA256_PATTERN.fullmatch(digest):
-        _error(report, "manifest.file.malformed", f"Manifest sha256 is invalid for {raw_path!r}")
-        malformed = True
-    if path is None or malformed:
+        return
+    if path is None:
         return
     if not path.is_file():
         _error(report, "manifest.missing", f"Manifest file does not exist: {raw_path}")
@@ -292,6 +325,79 @@ def _manifest_file(
                 )
 
 
+def _manifest_file_shape(
+    root: Path,
+    item: Any,
+    index: int,
+    report: ValidationReport,
+) -> bool:
+    """Check one file record's structure without touching the target file."""
+
+    if not isinstance(item, dict):
+        _error(report, "manifest.file.malformed", f"Manifest file entry {index} is not a mapping")
+        return False
+    raw_path = item.get("path")
+    path, path_error = _safe_manifest_path(root, raw_path)
+    if path_error:
+        code = (
+            "manifest.traversal"
+            if "escapes" in path_error or "outside" in path_error
+            else "manifest.file.malformed"
+        )
+        _error(report, code, path_error)
+        return False
+    del path
+    valid = True
+    size = item.get("size_bytes")
+    if type(size) is not int or size < 0:
+        _error(report, "manifest.file.malformed", f"Manifest size_bytes is invalid for {raw_path!r}")
+        valid = False
+    digest = item.get("sha256")
+    if not isinstance(digest, str) or not _SHA256_PATTERN.fullmatch(digest):
+        _error(report, "manifest.file.malformed", f"Manifest sha256 is invalid for {raw_path!r}")
+        valid = False
+    return valid
+
+
+def _manifest_record_shape(
+    catalog: DataCatalog,
+    record: Any,
+    report: ValidationReport,
+) -> bool:
+    """Validate record structure globally without stat/hash operations."""
+
+    if not isinstance(record, dict):
+        _error(report, "manifest.dataset.malformed", "Manifest dataset entry is not a mapping")
+        return False
+    valid = True
+    for field_name in ("path", "entrypoint"):
+        value = record.get(field_name)
+        _, path_error = _safe_manifest_path(catalog.root, value)
+        if path_error:
+            code = (
+                "manifest.traversal"
+                if "escapes" in path_error or "outside" in path_error
+                else "manifest.dataset.malformed"
+            )
+            _error(report, code, f"Manifest {field_name} is invalid: {path_error}")
+            valid = False
+    files = record.get("files")
+    if not isinstance(files, list):
+        _error(report, "manifest.files", "Manifest dataset files must be a list")
+        return False
+    seen_paths: set[str] = set()
+    for index, item in enumerate(files):
+        if isinstance(item, dict) and isinstance(item.get("path"), str):
+            key = item["path"]
+            if key in seen_paths:
+                _error(report, "manifest.duplicate_file", f"Manifest repeats file path: {key}")
+                valid = False
+            seen_paths.add(key)
+        if not _manifest_file_shape(catalog.root, item, index, report):
+            valid = False
+    return valid
+
+
 def _manifest_record(
     catalog: DataCatalog,
     dataset: dict[str, Any],
@@ -299,29 +405,23 @@ def _manifest_record(
     report: ValidationReport,
     *,
     full_checksum: bool,
+    require_entrypoint: bool,
+    shape_valid: bool,
 ) -> None:
     if not isinstance(record, dict):
-        _error(report, "manifest.dataset.malformed", "Manifest dataset entry is not a mapping")
         return
-    if record.get("path") != dataset.get("path"):
+    record_metadata = {key: value for key, value in record.items() if key != "files"}
+    dataset_metadata = {key: value for key, value in dataset.items() if key != "files"}
+    if _canonical_json(record_metadata) != _canonical_json(dataset_metadata):
         _error(
             report,
             "manifest.metadata",
-            f"Manifest path for {dataset.get('dataset_id')} does not match catalog",
-        )
-    if record.get("entrypoint") != dataset.get("entrypoint"):
-        _error(
-            report,
-            "manifest.metadata",
-            f"Manifest entrypoint for {dataset.get('dataset_id')} does not match catalog",
+            f"Manifest metadata for {dataset.get('dataset_id')} does not match catalog",
         )
     files = record.get("files")
     if not isinstance(files, list):
-        _error(
-            report,
-            "manifest.files",
-            f"Manifest files for {dataset.get('dataset_id')} must be a list",
-        )
+        return
+    if not shape_valid:
         return
     seen_paths: set[str] = set()
     for index, item in enumerate(files):
@@ -338,6 +438,19 @@ def _manifest_record(
             report,
             full_checksum=full_checksum,
         )
+    if require_entrypoint:
+        expected = _canonical_value(dataset.get("entrypoint"), key="entrypoint")
+        represented = any(
+            isinstance(item, dict)
+            and _canonical_value(item.get("path"), key="entrypoint") == expected
+            for item in files
+        )
+        if not represented:
+            _error(
+                report,
+                "manifest.entrypoint",
+                f"Manifest files for {dataset.get('dataset_id')} omit the registered entrypoint",
+            )
 
 
 def _validate_manifest(
@@ -371,7 +484,14 @@ def _validate_manifest(
         _error(report, "manifest.datasets", "Manifest datasets must be a list")
         return {}
 
+    raw_scenarios = payload.get("scenarios")
+    if not isinstance(raw_scenarios, list):
+        _error(report, "manifest.scenarios", "Manifest scenarios must be a list")
+    elif _canonical_json(raw_scenarios) != _canonical_json(catalog.document.get("scenarios", [])):
+        _error(report, "manifest.scenarios", "Manifest scenarios do not match catalog")
+
     records: dict[str, dict[str, Any]] = {}
+    shape_valid: dict[str, bool] = {}
     for index, raw_record in enumerate(raw_datasets):
         if not isinstance(raw_record, dict):
             _error(report, "manifest.dataset.malformed", f"Manifest dataset entry {index} is not a mapping")
@@ -384,44 +504,46 @@ def _validate_manifest(
             _error(report, "manifest.duplicate", f"Manifest has duplicate dataset ID: {dataset_id}")
             continue
         records[dataset_id] = raw_record
+        shape_valid[dataset_id] = _manifest_record_shape(catalog, raw_record, report)
         if dataset_id not in catalog.datasets_by_id:
             _error(report, "manifest.unknown", f"Manifest references unknown dataset: {dataset_id}")
 
-    # Validate every known dataset record, not only the selected boundary/DEM.
-    # This keeps stale points or auxiliary records from silently bypassing the
-    # same containment, existence, and size checks.
-    for dataset_id, record in records.items():
-        dataset = catalog.datasets_by_id.get(dataset_id)
-        if dataset is not None:
-            _manifest_record(
-                catalog,
-                dataset,
-                record,
-                report,
-                full_checksum=full_checksum,
-            )
-        elif isinstance(record.get("files"), list):
-            # Unknown records are already an error, but still inspect their
-            # file paths so an otherwise ignored traversal cannot slip through.
-            unknown_dataset = {"dataset_id": dataset_id, "path": "."}
-            for index, item in enumerate(record["files"]):
-                _manifest_file(
+    boundary_id = boundary.get("dataset_id")
+    boundary_record = records.get(boundary_id)
+    if boundary_record is None:
+        _error(report, "manifest.boundary", f"Manifest is missing boundary dataset: {boundary_id}")
+    else:
+        boundary_path = catalog.resolve(boundary.get("entrypoint", ""))
+        _manifest_record(
+            catalog,
+            boundary,
+            boundary_record,
+            report,
+            full_checksum=full_checksum,
+            require_entrypoint=boundary_path.is_file(),
+            shape_valid=shape_valid.get(boundary_id, False),
+        )
+
+    if dem is not None:
+        dem_id = dem.get("dataset_id")
+        dem_record = records.get(dem_id)
+        if dem_record is None:
+            _error(report, "manifest.dem", f"Manifest is missing DEM dataset: {dem_id}")
+        else:
+            dem_path = catalog.resolve(dem.get("entrypoint", ""))
+            # An absent external DEM may have a cached record from a previous
+            # ingest.  Its metadata/files are intentionally not checked until
+            # the registered entrypoint exists locally.
+            if dem_path.is_file():
+                _manifest_record(
                     catalog,
-                    unknown_dataset,
-                    item,
-                    index,
+                    dem,
+                    dem_record,
                     report,
                     full_checksum=full_checksum,
+                    require_entrypoint=True,
+                    shape_valid=shape_valid.get(dem_id, False),
                 )
-        else:
-            _error(report, "manifest.files", f"Manifest files for {dataset_id} must be a list")
-
-    boundary_id = boundary.get("dataset_id")
-    if records.get(boundary_id) is None:
-        _error(report, "manifest.boundary", f"Manifest is missing boundary dataset: {boundary_id}")
-
-    if dem is not None and records.get(dem.get("dataset_id")) is None:
-        _error(report, "manifest.dem", f"Manifest is missing DEM dataset: {dem.get('dataset_id')}")
     return records
 
 

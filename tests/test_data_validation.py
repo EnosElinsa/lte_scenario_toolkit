@@ -213,13 +213,18 @@ def test_pending_dem_is_warning_and_report_is_ok(tmp_path):
     shutil.rmtree(tmp_path / "dem" / "city")
     manifest_path = tmp_path / "data" / "manifest.json"
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    next(item for item in payload["datasets"] if item["dataset_id"] == "dem_city")["files"] = []
+    dem_record = next(item for item in payload["datasets"] if item["dataset_id"] == "dem_city")
+    # A previously-ready external DEM can leave stale metadata and file
+    # records behind after the local raster is removed.  Pending validation
+    # must not turn those cached records into missing-file failures.
+    dem_record["path"] = "dem/stale-cache"
     manifest_path.write_text(json.dumps(payload), encoding="utf-8")
     report = validate_scenario_data(catalog, "city")
 
     assert report.status == "dem-pending"
     assert report.ok
     assert any(message.code == "dem.pending" for message in report.messages)
+    assert [message for message in report.messages if message.level == "error"] == []
 
 
 def test_ready_dem_passes_without_full_checksum(tmp_path):
@@ -267,6 +272,119 @@ def test_full_mode_reports_same_size_hash_drift(tmp_path):
 
     assert not report.ok
     assert any(message.code == "manifest.sha256" for message in report.messages)
+
+
+def test_unrelated_manifest_files_are_not_stat_or_hashed(tmp_path, monkeypatch):
+    _, catalog = _write_catalog(tmp_path, second_city=True)
+    manifest_path = tmp_path / "data" / "manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    other = next(item for item in payload["datasets"] if item["dataset_id"] == "boundary_other")
+    other["files"] = [
+        {"path": "boundary_shp/other/not-local.shp", "size_bytes": 1, "sha256": "0" * 64}
+    ]
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    from lte_scenario_toolkit import data_validation as validation_module
+
+    real_hash = validation_module.sha256_file
+    hashed_paths: list[Path] = []
+
+    def record_hash(path, **kwargs):
+        resolved = Path(path).resolve()
+        hashed_paths.append(resolved)
+        if resolved.name == "not-local.shp":
+            raise AssertionError("unrelated dataset must not be hashed")
+        return real_hash(resolved, **kwargs)
+
+    monkeypatch.setattr("lte_scenario_toolkit.data_validation.sha256_file", record_hash)
+    report = validate_scenario_data(catalog, "city", full_checksum=True)
+
+    assert report.ok
+    assert not any(message.code.startswith("manifest.missing") for message in report.messages)
+    assert all(path.name != "not-local.shp" for path in hashed_paths)
+
+
+def test_unrelated_manifest_structure_is_still_checked(tmp_path):
+    _, catalog = _write_catalog(tmp_path, second_city=True)
+    manifest_path = tmp_path / "data" / "manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    other = next(item for item in payload["datasets"] if item["dataset_id"] == "boundary_other")
+    other["files"] = [{"path": "boundary_shp/other/other.shp"}]
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = validate_scenario_data(catalog, "city")
+
+    assert not report.ok
+    assert any(message.code == "manifest.file.malformed" for message in report.messages)
+
+
+@pytest.mark.parametrize("dataset_id", ["boundary_city", "dem_city"])
+def test_present_selected_dataset_requires_manifest_entrypoint(tmp_path, dataset_id):
+    _, catalog = _write_catalog(tmp_path, dem=True)
+    manifest_path = tmp_path / "data" / "manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    record = next(item for item in payload["datasets"] if item["dataset_id"] == dataset_id)
+    record["files"] = []
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = validate_scenario_data(catalog, "city")
+
+    assert not report.ok
+    assert any(message.code == "manifest.entrypoint" for message in report.messages)
+
+
+def test_non_path_manifest_metadata_drift_is_reported(tmp_path):
+    _, catalog = _write_catalog(tmp_path)
+    manifest_path = tmp_path / "data" / "manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    record = next(item for item in payload["datasets"] if item["dataset_id"] == "boundary_city")
+    record["provider"] = "different provider"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = validate_scenario_data(catalog, "city")
+
+    assert not report.ok
+    assert any(message.code == "manifest.metadata" for message in report.messages)
+
+
+def test_manifest_scenario_mapping_drift_is_reported(tmp_path):
+    _, catalog = _write_catalog(tmp_path)
+    manifest_path = tmp_path / "data" / "manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["scenarios"][0]["display_name"] = "stale name"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = validate_scenario_data(catalog, "city")
+
+    assert not report.ok
+    assert any(message.code == "manifest.scenarios" for message in report.messages)
+
+
+def test_malformed_manifest_scenario_mapping_is_reported(tmp_path):
+    _, catalog = _write_catalog(tmp_path)
+    manifest_path = tmp_path / "data" / "manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["scenarios"] = {"city": "stale"}
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = validate_scenario_data(catalog, "city")
+
+    assert not report.ok
+    assert any(message.code == "manifest.scenarios" for message in report.messages)
+
+
+def test_present_dem_metadata_drift_is_still_checked(tmp_path):
+    _, catalog = _write_catalog(tmp_path, dem=True)
+    manifest_path = tmp_path / "data" / "manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    record = next(item for item in payload["datasets"] if item["dataset_id"] == "dem_city")
+    record["provider"] = "different provider"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = validate_scenario_data(catalog, "city")
+
+    assert not report.ok
+    assert any(message.code == "manifest.metadata" for message in report.messages)
 
 
 @pytest.mark.parametrize(
