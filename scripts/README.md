@@ -5,12 +5,15 @@ It manages scenario registration, DEM export planning/submission, shard
 ingest, and validation:
 
 ```powershell
-lte-data scenario add <scenario-id> --boundary-source <path-or-url> --provider <name> --license <terms>
+lte-data scenario add <scenario-id> --boundary-source <path-or-url> --provider <name> --license <terms> --redistribution-confirmed
 lte-data scenario list
 lte-data dem export <scenario-id> --dry-run
 lte-data dem ingest <scenario-id> --tiles-dir <download-directory>
 lte-data validate <scenario-id>
 ```
+
+Use `--redistribution-confirmed` only after verifying that the supplied license
+permits the normalized boundary to be tracked in this repository.
 
 `manage_data.py` is the thin source-tree wrapper for `lte-data`; it adds
 `src/` to `sys.path` and delegates to `lte_scenario_toolkit.data_cli.main`.
