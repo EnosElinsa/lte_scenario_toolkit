@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .boundary_data import BoundaryImportError, register_scenario
 from .data_catalog import CatalogError, load_data_catalog
+from .data_validation import validate_scenario_data
 from .dem_data import (
     DemIngestError,
     EarthEngineExportError,
@@ -97,6 +98,33 @@ def _dem_ingest(args: argparse.Namespace) -> int:
     dem_path = ingested.resolve(ingested.dataset(dem_id)["entrypoint"])
     print(f"Final DEM: {dem_path}")
     return 0
+
+
+def _validate(args: argparse.Namespace) -> int:
+    """Validate one scenario or every scenario in stable ID order."""
+
+    if bool(args.all_scenarios) == bool(args.scenario_id):
+        raise CatalogError("validate requires exactly one scenario ID or --all")
+    catalog = load_data_catalog(args.catalog)
+    scenario_ids = (
+        sorted(catalog.scenarios_by_id)
+        if args.all_scenarios
+        else [args.scenario_id]
+    )
+    reports = [
+        validate_scenario_data(
+            catalog,
+            scenario_id,
+            full_checksum=args.full_checksum,
+        )
+        for scenario_id in scenario_ids
+    ]
+    for report in reports:
+        state = "ok" if report.ok else "failed"
+        print(f"{report.scenario_id}: {report.status} ({state})")
+        for message in report.messages:
+            print(f"  {message.level.upper()} {message.code}: {message.message}")
+    return 0 if all(report.ok for report in reports) else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -196,6 +224,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="directory containing downloaded GeoTIFF shards",
     )
     ingest.set_defaults(handler=_dem_ingest)
+
+    validate = commands.add_parser(
+        "validate",
+        help="validate registered scenario boundary, manifest, DEM, and config data",
+    )
+    validate.add_argument("scenario_id", nargs="?", metavar="id")
+    validate.add_argument(
+        "--all",
+        dest="all_scenarios",
+        action="store_true",
+        help="validate every registered scenario in sorted ID order",
+    )
+    validate.add_argument(
+        "--full-checksum",
+        action="store_true",
+        help="compute and compare SHA256 values (fast mode checks sizes only)",
+    )
+    validate.set_defaults(handler=_validate)
     return parser
 
 
