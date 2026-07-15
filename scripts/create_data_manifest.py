@@ -28,8 +28,19 @@ def main(argv=None) -> int:
         default=ROOT / "data" / "manifest.json",
         help="generated JSON manifest",
     )
+    parser.add_argument(
+        "--dataset-id",
+        action="append",
+        help="dataset ID to rehash; repeat to update multiple datasets",
+    )
     args = parser.parse_args(argv)
-    output = create_data_manifest(args.metadata, args.output, repo_root=ROOT)
+    dataset_ids = set(args.dataset_id) if args.dataset_id else None
+    output = create_data_manifest(
+        args.metadata,
+        args.output,
+        repo_root=ROOT,
+        dataset_ids=dataset_ids,
+    )
     print(f"Data manifest written: {output}")
     return 0
 

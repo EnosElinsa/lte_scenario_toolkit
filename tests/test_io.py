@@ -93,10 +93,12 @@ def test_create_data_manifest_combines_provenance_with_file_checksums(tmp_path):
     metadata = tmp_path / "datasets.yaml"
     metadata.write_text(
         """
-schema_version: 1
+schema_version: 2
 datasets:
   - dataset_id: fixture
+    role: points
     path: inputs
+    entrypoint: inputs/a.txt
     source_url: https://example.test/fixture
     provider: Example
     license: CC0-1.0
@@ -104,14 +106,22 @@ datasets:
     crs: EPSG:3857
     spatial_resolution: vector
     notes: test data
+scenarios: []
 """.strip(),
         encoding="utf-8",
     )
 
-    output = create_data_manifest(metadata, tmp_path / "manifest.json", repo_root=tmp_path)
+    output = create_data_manifest(
+        metadata,
+        tmp_path / "manifest.json",
+        repo_root=tmp_path,
+        dataset_ids={"fixture"},
+    )
 
     payload = json.loads(output.read_text(encoding="utf-8"))
     dataset = payload["datasets"][0]
+    assert payload["schema_version"] == 2
+    assert payload["scenarios"] == []
     assert dataset["dataset_id"] == "fixture"
     assert dataset["source_url"] == "https://example.test/fixture"
     assert dataset["files"][0]["path"] == "inputs/a.txt"

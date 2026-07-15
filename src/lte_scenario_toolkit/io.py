@@ -14,7 +14,6 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-import yaml
 
 
 def build_output_dataframe(
@@ -127,70 +126,14 @@ def create_data_manifest(
     output_path: str | Path,
     *,
     repo_root: str | Path | None = None,
+    dataset_ids: Iterable[str] | None = None,
 ) -> Path:
-    """Expand dataset-level YAML metadata into a checksummed JSON manifest."""
+    """Validate a schema-v2 catalog and update its checksummed JSON manifest."""
 
-    metadata_file = Path(metadata_path).resolve()
-    document = yaml.safe_load(metadata_file.read_text(encoding="utf-8")) or {}
-    datasets = document.get("datasets")
-    if not isinstance(datasets, list):
-        raise ValueError("Dataset metadata must contain a datasets list")
-    root = Path(repo_root).resolve() if repo_root is not None else metadata_file.parents[1]
-    required = {
-        "dataset_id",
-        "path",
-        "source_url",
-        "provider",
-        "license",
-        "download_date",
-        "crs",
-        "spatial_resolution",
-        "notes",
-    }
-    expanded: list[dict[str, Any]] = []
-    for raw_dataset in datasets:
-        if not isinstance(raw_dataset, dict):
-            raise ValueError("Each dataset entry must be a mapping")
-        missing = sorted(required.difference(raw_dataset))
-        if missing:
-            raise ValueError(
-                f"Dataset {raw_dataset.get('dataset_id', '<unknown>')} is missing: {', '.join(missing)}"
-            )
-        dataset = dict(raw_dataset)
-        local_path = resolve_path = Path(dataset["path"])
-        if not local_path.is_absolute():
-            resolve_path = root / local_path
-        external = bool(dataset.get("external", False))
-        if not resolve_path.exists() and not external:
-            raise FileNotFoundError(resolve_path)
+    from .data_catalog import _load_data_catalog, update_data_manifest
 
-        if resolve_path.is_file():
-            files = [resolve_path]
-        elif resolve_path.is_dir():
-            files = sorted(path for path in resolve_path.rglob("*") if path.is_file())
-        else:
-            files = []
-        dataset["files"] = [
-            {
-                "path": path.relative_to(root).as_posix(),
-                "size_bytes": path.stat().st_size,
-                "sha256": sha256_file(path),
-            }
-            for path in files
-        ]
-        expanded.append(_json_safe(dataset))
-
-    payload = {
-        "schema_version": int(document.get("schema_version", 1)),
-        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "datasets": expanded,
-    }
-    output = Path(output_path)
-    if not output.is_absolute():
-        output = root / output
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return output
+    catalog = _load_data_catalog(metadata_path, repo_root)
+    return update_data_manifest(catalog, output_path, dataset_ids=dataset_ids)
 
 
 def software_versions() -> dict[str, str]:
