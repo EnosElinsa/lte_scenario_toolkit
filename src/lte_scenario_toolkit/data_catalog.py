@@ -435,6 +435,8 @@ def _reusable_manifest_files(
         return None
     if previous.get("entrypoint") != dataset["entrypoint"]:
         return None
+    if previous.get("external", False) != dataset.get("external", False):
+        return None
     files = previous.get("files")
     if not isinstance(files, list):
         return None

@@ -493,6 +493,19 @@ def test_manifest_allows_missing_external_data_but_rejects_missing_local_data(tm
         update_data_manifest(catalog, output, dataset_ids={"boundary"})
 
 
+def test_incremental_manifest_recomputes_when_external_file_semantics_change(tmp_path):
+    create_entrypoints(tmp_path)
+    shutil.rmtree(tmp_path / "inputs" / "dem")
+    catalog = load_data_catalog(write_catalog(tmp_path))
+    output = update_data_manifest(catalog, "data/manifest.json")
+    updated_document = deepcopy(catalog.document)
+    updated_document["datasets"][1]["external"] = False
+    catalog = save_data_catalog(catalog, updated_document)
+
+    with pytest.raises(FileNotFoundError, match="inputs.*dem"):
+        update_data_manifest(catalog, output, dataset_ids={"boundary"})
+
+
 def test_manifest_rejects_unknown_target_dataset_ids(tmp_path):
     create_entrypoints(tmp_path)
     catalog = load_data_catalog(write_catalog(tmp_path))
