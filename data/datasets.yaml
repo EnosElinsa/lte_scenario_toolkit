@@ -1,8 +1,10 @@
-schema_version: 1
+schema_version: 2
 
 datasets:
   - dataset_id: usa_clear_lte_base_stations
+    role: points
     path: points_shp/USA_Clear_LTE_Base_Station
+    entrypoint: points_shp/USA_Clear_LTE_Base_Station/USA_Clear_LTE_Base_Station.shp
     source_url: null
     provider: Repository owner supplied dataset
     license: Public redistribution permission confirmed by repository owner
@@ -11,42 +13,213 @@ datasets:
     spatial_resolution: point vector
     notes: Source URL and original acquisition date were not available during repository initialization.
 
-  - dataset_id: administrative_boundaries
-    path: boundary_shp
+  - dataset_id: boundary_phoenix
+    role: boundary
+    path: boundary_shp/Arizona_Maricopa_Phoenix
+    entrypoint: boundary_shp/Arizona_Maricopa_Phoenix/Arizona_Maricopa_Phoenix.shp
     source_url: null
-    provider: Repository owner supplied datasets
-    license: Public redistribution permission confirmed by repository owner
+    provider: Repository owner supplied dataset
+    license: Public redistribution confirmed by repository owner
     download_date: null
     crs: EPSG:3857
     spatial_resolution: polygon vector
-    notes: Includes the city and study-area boundary Shapefiles tracked in this repository.
+    geometry_type: MultiPolygon
+    feature_count: 1
+    redistribution_confirmed: true
+    notes: Source URL and original acquisition date were not available during repository initialization.
+
+  - dataset_id: boundary_chicago
+    role: boundary
+    path: boundary_shp/Chicago
+    entrypoint: boundary_shp/Chicago/Chicago_Boundary.shp
+    source_url: null
+    provider: Repository owner supplied dataset
+    license: Public redistribution confirmed by repository owner
+    download_date: null
+    crs: EPSG:3857
+    spatial_resolution: polygon vector
+    geometry_type: MultiPolygon
+    feature_count: 1
+    redistribution_confirmed: true
+    notes: Source URL and original acquisition date were not available during repository initialization.
+
+  - dataset_id: boundary_chicago_cbd
+    role: boundary
+    path: boundary_shp/Chicago_CBD
+    entrypoint: boundary_shp/Chicago_CBD/Chicago_CBD.shp
+    source_url: null
+    provider: Repository owner supplied dataset
+    license: Public redistribution confirmed by repository owner
+    download_date: null
+    crs: EPSG:4326
+    spatial_resolution: polygon vector
+    geometry_type: Polygon
+    feature_count: 1
+    redistribution_confirmed: true
+    notes: Source URL and original acquisition date were not available during repository initialization.
+
+  - dataset_id: boundary_cambridge
+    role: boundary
+    path: boundary_shp/Massachusetts_Middlesex_Cambridge
+    entrypoint: boundary_shp/Massachusetts_Middlesex_Cambridge/Massachusetts_Middlesex_Cambridge.shp
+    source_url: null
+    provider: Repository owner supplied dataset
+    license: Public redistribution confirmed by repository owner
+    download_date: null
+    crs: EPSG:3857
+    spatial_resolution: polygon vector
+    geometry_type: Polygon
+    feature_count: 1
+    redistribution_confirmed: true
+    notes: Source URL and original acquisition date were not available during repository initialization.
+
+  - dataset_id: boundary_new_york_city
+    role: boundary
+    path: boundary_shp/NewYorkState_NewYork
+    entrypoint: boundary_shp/NewYorkState_NewYork/NewYorkState_NewYork.shp
+    source_url: null
+    provider: Repository owner supplied dataset
+    license: Public redistribution confirmed by repository owner
+    download_date: null
+    crs: EPSG:3857
+    spatial_resolution: polygon vector
+    geometry_type: MultiPolygon
+    feature_count: 1
+    redistribution_confirmed: true
+    notes: Source URL and original acquisition date were not available during repository initialization.
+
+  - dataset_id: usgs_3dep_1m_dem_phoenix
+    role: dem
+    path: dem/phoenix
+    entrypoint: dem/phoenix/usgs_3dep_1m_phoenix.tif
+    source_url: https://developers.google.com/earth-engine/datasets/catalog/USGS_3DEP_1m
+    provider: United States Geological Survey
+    license: USGS public-domain data; retain source attribution
+    download_date: null
+    crs: EPSG:3857
+    spatial_resolution: 1 m
+    notes: Pending external Earth Engine export and local ingestion for Phoenix.
+    external: true
+    earth_engine_collection: USGS/3DEP/1m
+    band: elevation
+    units: metres
+    vertical_datum: NAVD88
+    native_scale_m: 1
+    export_crs: EPSG:3857
+    export_prefix: usgs_3dep_1m_phoenix
+    drive_folder: lte-scenario-toolkit-dem
 
   - dataset_id: usgs_3dep_1m_dem_chicago
+    role: dem
     path: dem/USGS_1M_DEM_Chicago
+    entrypoint: dem/USGS_1M_DEM_Chicago/USGS_1M_DEM_Chicago.tif
     source_url: https://developers.google.com/earth-engine/datasets/catalog/USGS_3DEP_1m
     provider: United States Geological Survey
     license: USGS public-domain data; retain source attribution
     download_date: null
-    earth_engine_collection: USGS/3DEP/1m
-    band: elevation
     crs: EPSG:3857
     spatial_resolution: 1 m
-    units: metres
-    vertical_datum: NAVD88
     notes: External local input for the Chicago study area. DEM files are excluded from Git.
     external: true
+    earth_engine_collection: USGS/3DEP/1m
+    band: elevation
+    units: metres
+    vertical_datum: NAVD88
+    native_scale_m: 1
+    export_crs: EPSG:3857
+    export_prefix: USGS_1M_DEM_Chicago
+    drive_folder: lte-scenario-toolkit-dem
 
-  - dataset_id: usgs_3dep_1m_dem_new_york_city
-    path: dem/USGS_1M_DEM_NewYorkState_NewYork
+  - dataset_id: usgs_3dep_1m_dem_chicago_cbd
+    role: dem
+    path: dem/chicago-cbd
+    entrypoint: dem/chicago-cbd/usgs_3dep_1m_chicago-cbd.tif
     source_url: https://developers.google.com/earth-engine/datasets/catalog/USGS_3DEP_1m
     provider: United States Geological Survey
     license: USGS public-domain data; retain source attribution
     download_date: null
-    earth_engine_collection: USGS/3DEP/1m
-    band: elevation
     crs: EPSG:3857
     spatial_resolution: 1 m
+    notes: Pending external Earth Engine export and local ingestion for Chicago CBD.
+    external: true
+    earth_engine_collection: USGS/3DEP/1m
+    band: elevation
     units: metres
     vertical_datum: NAVD88
-    notes: External local input clipped to the union of the five New York City counties and merged into one GeoTIFF. Download with the documented Earth Engine workflow; DEM files are excluded from Git.
+    native_scale_m: 1
+    export_crs: EPSG:3857
+    export_prefix: usgs_3dep_1m_chicago-cbd
+    drive_folder: lte-scenario-toolkit-dem
+
+  - dataset_id: usgs_3dep_1m_dem_cambridge
+    role: dem
+    path: dem/cambridge
+    entrypoint: dem/cambridge/usgs_3dep_1m_cambridge.tif
+    source_url: https://developers.google.com/earth-engine/datasets/catalog/USGS_3DEP_1m
+    provider: United States Geological Survey
+    license: USGS public-domain data; retain source attribution
+    download_date: null
+    crs: EPSG:3857
+    spatial_resolution: 1 m
+    notes: Pending external Earth Engine export and local ingestion for Cambridge.
     external: true
+    earth_engine_collection: USGS/3DEP/1m
+    band: elevation
+    units: metres
+    vertical_datum: NAVD88
+    native_scale_m: 1
+    export_crs: EPSG:3857
+    export_prefix: usgs_3dep_1m_cambridge
+    drive_folder: lte-scenario-toolkit-dem
+
+  - dataset_id: usgs_3dep_1m_dem_new_york_city
+    role: dem
+    path: dem/USGS_1M_DEM_NewYorkState_NewYork
+    entrypoint: dem/USGS_1M_DEM_NewYorkState_NewYork/USGS_1M_DEM_NewYorkState_NewYork.tif
+    source_url: https://developers.google.com/earth-engine/datasets/catalog/USGS_3DEP_1m
+    provider: United States Geological Survey
+    license: USGS public-domain data; retain source attribution
+    download_date: null
+    crs: EPSG:3857
+    spatial_resolution: 1 m
+    notes: External local input clipped to the New York City study-area boundary. DEM files are excluded from Git.
+    external: true
+    earth_engine_collection: USGS/3DEP/1m
+    band: elevation
+    units: metres
+    vertical_datum: NAVD88
+    native_scale_m: 1
+    export_crs: EPSG:3857
+    export_prefix: USGS_1M_DEM_NewYorkState_NewYork
+    drive_folder: lte-scenario-toolkit-dem
+
+scenarios:
+  - scenario_id: phoenix
+    display_name: Phoenix
+    boundary_dataset_id: boundary_phoenix
+    dem_dataset_id: usgs_3dep_1m_dem_phoenix
+    config_path: null
+
+  - scenario_id: chicago
+    display_name: Chicago
+    boundary_dataset_id: boundary_chicago
+    dem_dataset_id: usgs_3dep_1m_dem_chicago
+    config_path: configs/example.yaml
+
+  - scenario_id: chicago-cbd
+    display_name: Chicago CBD
+    boundary_dataset_id: boundary_chicago_cbd
+    dem_dataset_id: usgs_3dep_1m_dem_chicago_cbd
+    config_path: null
+
+  - scenario_id: cambridge
+    display_name: Cambridge
+    boundary_dataset_id: boundary_cambridge
+    dem_dataset_id: usgs_3dep_1m_dem_cambridge
+    config_path: null
+
+  - scenario_id: new-york-city
+    display_name: New York City
+    boundary_dataset_id: boundary_new_york_city
+    dem_dataset_id: usgs_3dep_1m_dem_new_york_city
+    config_path: configs/newyork.yaml

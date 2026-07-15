@@ -18,9 +18,96 @@ PUBLIC_READMES = (
     "tests/README.md",
 )
 CJK_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
-DEM_DATASETS = {
-    "usgs_3dep_1m_dem_chicago": "dem/USGS_1M_DEM_Chicago",
-    "usgs_3dep_1m_dem_new_york_city": "dem/USGS_1M_DEM_NewYorkState_NewYork",
+SCENARIOS = {
+    "phoenix": ("Phoenix", "boundary_phoenix", "usgs_3dep_1m_dem_phoenix", None),
+    "chicago": (
+        "Chicago",
+        "boundary_chicago",
+        "usgs_3dep_1m_dem_chicago",
+        "configs/example.yaml",
+    ),
+    "chicago-cbd": (
+        "Chicago CBD",
+        "boundary_chicago_cbd",
+        "usgs_3dep_1m_dem_chicago_cbd",
+        None,
+    ),
+    "cambridge": (
+        "Cambridge",
+        "boundary_cambridge",
+        "usgs_3dep_1m_dem_cambridge",
+        None,
+    ),
+    "new-york-city": (
+        "New York City",
+        "boundary_new_york_city",
+        "usgs_3dep_1m_dem_new_york_city",
+        "configs/newyork.yaml",
+    ),
+}
+BOUNDARIES = {
+    "boundary_phoenix": (
+        "boundary_shp/Arizona_Maricopa_Phoenix",
+        "boundary_shp/Arizona_Maricopa_Phoenix/Arizona_Maricopa_Phoenix.shp",
+        "EPSG:3857",
+        "MultiPolygon",
+    ),
+    "boundary_chicago": (
+        "boundary_shp/Chicago",
+        "boundary_shp/Chicago/Chicago_Boundary.shp",
+        "EPSG:3857",
+        "MultiPolygon",
+    ),
+    "boundary_chicago_cbd": (
+        "boundary_shp/Chicago_CBD",
+        "boundary_shp/Chicago_CBD/Chicago_CBD.shp",
+        "EPSG:4326",
+        "Polygon",
+    ),
+    "boundary_cambridge": (
+        "boundary_shp/Massachusetts_Middlesex_Cambridge",
+        "boundary_shp/Massachusetts_Middlesex_Cambridge/Massachusetts_Middlesex_Cambridge.shp",
+        "EPSG:3857",
+        "Polygon",
+    ),
+    "boundary_new_york_city": (
+        "boundary_shp/NewYorkState_NewYork",
+        "boundary_shp/NewYorkState_NewYork/NewYorkState_NewYork.shp",
+        "EPSG:3857",
+        "MultiPolygon",
+    ),
+}
+DEMS = {
+    "usgs_3dep_1m_dem_phoenix": (
+        "dem/phoenix",
+        "dem/phoenix/usgs_3dep_1m_phoenix.tif",
+        "usgs_3dep_1m_phoenix",
+        False,
+    ),
+    "usgs_3dep_1m_dem_chicago": (
+        "dem/USGS_1M_DEM_Chicago",
+        "dem/USGS_1M_DEM_Chicago/USGS_1M_DEM_Chicago.tif",
+        "USGS_1M_DEM_Chicago",
+        True,
+    ),
+    "usgs_3dep_1m_dem_chicago_cbd": (
+        "dem/chicago-cbd",
+        "dem/chicago-cbd/usgs_3dep_1m_chicago-cbd.tif",
+        "usgs_3dep_1m_chicago-cbd",
+        False,
+    ),
+    "usgs_3dep_1m_dem_cambridge": (
+        "dem/cambridge",
+        "dem/cambridge/usgs_3dep_1m_cambridge.tif",
+        "usgs_3dep_1m_cambridge",
+        False,
+    ),
+    "usgs_3dep_1m_dem_new_york_city": (
+        "dem/USGS_1M_DEM_NewYorkState_NewYork",
+        "dem/USGS_1M_DEM_NewYorkState_NewYork/USGS_1M_DEM_NewYorkState_NewYork.tif",
+        "USGS_1M_DEM_NewYorkState_NewYork",
+        True,
+    ),
 }
 
 
@@ -63,13 +150,17 @@ def test_packaging_declares_research_cli_commands():
     assert metadata["project"]["name"] == "lte_scenario_toolkit"
     assert scripts["lte-select-sites"] == "lte_scenario_toolkit.select_sites:main"
     assert scripts["lte-generate-figures"] == "lte_scenario_toolkit.generate_figures:main"
-    assert scripts["lte-download-newyork-dem"] == "lte_scenario_toolkit.newyork_dem:main"
+    assert scripts["lte-data"] == "lte_scenario_toolkit.data_cli:main"
+    assert "lte-download-newyork-dem" not in scripts
 
 
-def test_gee_exporters_have_dedicated_locations():
-    assert (ROOT / "gee" / "newyork_1m_dem.js").is_file()
-    assert not (ROOT / "gee_newyork_1m_dem.js").exists()
-    assert not (ROOT / "download_newyork_1m_dem.py").exists()
+def test_generic_data_cli_replaces_city_specific_exporters():
+    assert (ROOT / "scripts" / "manage_data.py").is_file()
+    assert (ROOT / "src" / "lte_scenario_toolkit" / "data_cli.py").is_file()
+    assert (ROOT / "src" / "lte_scenario_toolkit" / "dem_data.py").is_file()
+    assert not (ROOT / "scripts" / "download_newyork_1m_dem.py").exists()
+    assert not (ROOT / "src" / "lte_scenario_toolkit" / "newyork_dem.py").exists()
+    assert not (ROOT / "gee" / "newyork_1m_dem.js").exists()
 
 
 def test_public_readmes_and_source_files_are_english_only():
@@ -87,35 +178,72 @@ def test_public_readmes_and_source_files_are_english_only():
     assert not offenders, f"CJK characters found in public English files: {offenders}"
 
 
-def test_chicago_and_new_york_dems_have_separate_registry_entries():
+def test_repository_catalog_registers_every_boundary_and_scenario():
     metadata = yaml.safe_load((ROOT / "data" / "datasets.yaml").read_text(encoding="utf-8"))
     datasets = {item["dataset_id"]: item for item in metadata["datasets"]}
+    scenarios = {item["scenario_id"]: item for item in metadata["scenarios"]}
 
-    assert "usgs_3dep_1m_dem" not in datasets
-    assert DEM_DATASETS.keys() <= datasets.keys()
-    for dataset_id, expected_path in DEM_DATASETS.items():
-        dataset = datasets[dataset_id]
-        assert dataset["path"] == expected_path
-        assert dataset["source_url"].endswith("/USGS_3DEP_1m")
-        assert dataset["provider"] == "United States Geological Survey"
-        assert "public-domain" in dataset["license"]
-        assert dataset["earth_engine_collection"] == "USGS/3DEP/1m"
-        assert dataset["band"] == "elevation"
-        assert dataset["crs"] == "EPSG:3857"
-        assert dataset["spatial_resolution"] == "1 m"
-        assert dataset["units"] == "metres"
-        assert dataset["vertical_datum"] == "NAVD88"
-        assert dataset["external"] is True
+    assert metadata["schema_version"] == 2
+    assert set(scenarios) == set(SCENARIOS)
+    assert "administrative_boundaries" not in datasets
+    assert datasets["usa_clear_lte_base_stations"]["role"] == "points"
+    assert datasets["usa_clear_lte_base_stations"]["entrypoint"].endswith(
+        "/USA_Clear_LTE_Base_Station.shp"
+    )
+
+    for boundary_id, (path, entrypoint, crs, geometry_type) in BOUNDARIES.items():
+        boundary = datasets[boundary_id]
+        assert boundary["role"] == "boundary"
+        assert boundary["path"] == path
+        assert boundary["entrypoint"] == entrypoint
+        assert boundary["crs"] == crs
+        assert boundary["geometry_type"] == geometry_type
+        assert boundary["provider"] == "Repository owner supplied dataset"
+        assert boundary["license"] == "Public redistribution confirmed by repository owner"
+        assert boundary["source_url"] is None
+        assert boundary["download_date"] is None
+        assert boundary["feature_count"] == 1
+        assert boundary["redistribution_confirmed"] is True
+
+    for dem_id, (path, entrypoint, export_prefix, _available) in DEMS.items():
+        dem = datasets[dem_id]
+        assert dem["role"] == "dem"
+        assert dem["path"] == path
+        assert dem["entrypoint"] == entrypoint
+        assert dem["source_url"].endswith("/USGS_3DEP_1m")
+        assert dem["provider"] == "United States Geological Survey"
+        assert "public-domain" in dem["license"]
+        assert dem["earth_engine_collection"] == "USGS/3DEP/1m"
+        assert dem["band"] == "elevation"
+        assert dem["crs"] == "EPSG:3857"
+        assert dem["spatial_resolution"] == "1 m"
+        assert dem["units"] == "metres"
+        assert dem["vertical_datum"] == "NAVD88"
+        assert dem["native_scale_m"] == 1
+        assert dem["export_crs"] == "EPSG:3857"
+        assert dem["export_prefix"] == export_prefix
+        assert dem["drive_folder"] == "lte-scenario-toolkit-dem"
+        assert dem["external"] is True
+
+    for scenario_id, (display_name, boundary_id, dem_id, config_path) in SCENARIOS.items():
+        scenario = scenarios[scenario_id]
+        assert scenario["display_name"] == display_name
+        assert scenario["boundary_dataset_id"] == boundary_id
+        assert scenario["dem_dataset_id"] == dem_id
+        assert scenario["config_path"] == config_path
 
 
-def test_manifest_inventories_chicago_and_new_york_dems_separately():
+def test_manifest_uses_schema_v2_and_preserves_scenario_links():
     manifest = json.loads((ROOT / "data" / "manifest.json").read_text(encoding="utf-8"))
     datasets = {item["dataset_id"]: item for item in manifest["datasets"]}
+    scenarios = {item["scenario_id"]: item for item in manifest["scenarios"]}
 
-    assert "usgs_3dep_1m_dem" not in datasets
-    assert DEM_DATASETS.keys() <= datasets.keys()
-    for dataset_id, expected_path in DEM_DATASETS.items():
-        files = datasets[dataset_id]["files"]
-        assert files
-        assert all(item["path"].startswith(f"{expected_path}/") for item in files)
-        assert any(item["path"].lower().endswith(".tif") for item in files)
+    assert manifest["schema_version"] == 2
+    assert set(scenarios) == set(SCENARIOS)
+    assert "administrative_boundaries" not in datasets
+    assert set(BOUNDARIES) <= set(datasets)
+    assert set(DEMS) <= set(datasets)
+    for boundary_id in BOUNDARIES:
+        assert datasets[boundary_id]["files"]
+    for dem_id, (_path, _entrypoint, _prefix, available) in DEMS.items():
+        assert bool(datasets[dem_id]["files"]) is available

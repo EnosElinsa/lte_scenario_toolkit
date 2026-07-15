@@ -82,10 +82,10 @@ def test_generate_figures_thin_script_forwards_help():
     assert "--config" in command_help("scripts/generate_scenario_figures.py")
 
 
-def test_newyork_dem_thin_script_forwards_help():
-    dem_help = command_help("scripts/download_newyork_1m_dem.py")
-    assert "--project" in dem_help
-    assert "--dry-run" in dem_help
+def test_city_specific_dem_exporters_are_removed():
+    assert not (ROOT / "scripts" / "download_newyork_1m_dem.py").exists()
+    assert not (ROOT / "src" / "lte_scenario_toolkit" / "newyork_dem.py").exists()
+    assert not (ROOT / "gee" / "newyork_1m_dem.js").exists()
 
 
 def _write_cli_catalog(tmp_path: Path) -> Path:
