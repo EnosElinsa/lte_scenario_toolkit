@@ -713,6 +713,7 @@ def main(argv=None):
             for path in (
                 cfg["output_csv"],
                 cfg["output_3d_png"],
+                cfg["output_3d_png"].with_suffix(".eps"),
                 cfg["output_3d_html"],
                 cfg["preview_png"],
             )

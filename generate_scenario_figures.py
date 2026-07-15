@@ -634,7 +634,13 @@ def main(argv=None):
             ),
         ]
         outputs = [
-            path for path in (cfg["output_3d_png"], cfg["output_3d_html"]) if path.exists()
+            path
+            for path in (
+                cfg["output_3d_png"],
+                cfg["output_3d_png"].with_suffix(".eps"),
+                cfg["output_3d_html"],
+            )
+            if path.exists()
         ]
         run_record = reproducible_io.write_run_record(
             cfg["output_dir"],

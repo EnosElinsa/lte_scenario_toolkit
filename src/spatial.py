@@ -100,7 +100,8 @@ def resolve_io_paths(config: dict[str, Any], *, create_output: bool = True) -> d
     )
     cache_name = (
         f"{base_name}_step{config['scan_step']}_"
-        f"sp{config['min_spacing']}_{config['strategy']}"
+        f"sp{config['min_spacing']}_{config['strategy']}_"
+        f"seed{config.get('random_seed', 42)}"
     )
     output_root = resolve_root_dir(config["output_root"], config.get("repo_root"))
     output_dir = output_root if config.get("output_dir_is_final") else output_root / city_tag
@@ -161,4 +162,3 @@ def load_and_prepare(config: dict[str, Any]):
     points = gpd.read_file(config["points_shp"])
     boundaries = gpd.read_file(config["boundary_shp"])
     return prepare_spatial_data(points, boundaries, target_crs=config.get("target_crs", "EPSG:3857"))
-

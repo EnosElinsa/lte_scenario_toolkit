@@ -31,6 +31,7 @@ def test_resolve_io_paths_selects_city_by_name(tmp_path):
         "scan_step": 50,
         "min_spacing": 500,
         "strategy": "uniform",
+        "random_seed": 7,
     }
 
     paths = resolve_io_paths(config)
@@ -41,6 +42,7 @@ def test_resolve_io_paths_selects_city_by_name(tmp_path):
     assert paths["boundary_shp"] == boundary_dir / "city_boundary.shp"
     assert paths["output_dir"] == tmp_path / "output"
     assert paths["output_dir"].is_dir()
+    assert paths["cache_json"].name.endswith("_uniform_seed7_cache.json")
 
 
 def test_discover_boundary_layers_rejects_empty_root(tmp_path):
