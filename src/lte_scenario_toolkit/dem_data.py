@@ -1013,6 +1013,8 @@ def _ingest_dem_shards_locked(
     expected_crs = dem.get("export_crs") or dem.get("crs")
     if not isinstance(expected_crs, str) or not expected_crs:
         raise DemIngestError(f"Registered DEM {dem_id!r} has no expected CRS")
+    original_catalog = catalog.path.read_bytes()
+    original_manifest = _optional_bytes(manifest_path)
     expected_resolution = _registry_resolution(dem)
     shards = inspect_dem_shards(tiles_dir, prefix=prefix)
     expected_crs_obj, _ = _canonical_crs(expected_crs)
@@ -1032,6 +1034,7 @@ def _ingest_dem_shards_locked(
         destination.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise DemIngestError(f"Cannot create DEM destination parent: {destination.parent}") from exc
+    partial_name: str | None = None
     try:
         partial_fd, partial_name = tempfile.mkstemp(
             prefix=f".{destination.name}.", suffix=".partial", dir=destination.parent
@@ -1040,10 +1043,15 @@ def _ingest_dem_shards_locked(
         partial = Path(partial_name)
         partial.unlink()
     except OSError as exc:
+        if partial_name is not None:
+            Path(partial_name).unlink(missing_ok=True)
+        if not destination_parent_existed and destination.parent.is_dir():
+            try:
+                destination.parent.rmdir()
+            except OSError:
+                pass
         raise DemIngestError(f"Cannot allocate hidden DEM merge destination beside {destination}") from exc
 
-    original_catalog = catalog.path.read_bytes()
-    original_manifest = _optional_bytes(manifest_path)
     installed_stat: tuple[int, int] | None = None
     written_catalog: bytes | None = None
     manifest_update_started = False
