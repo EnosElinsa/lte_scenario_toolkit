@@ -3,6 +3,7 @@ import importlib
 import io
 import json
 import stat
+import threading
 import zipfile
 from pathlib import Path
 
@@ -545,6 +546,164 @@ def test_register_scenario_rejects_malformed_manifest_location_before_staging(
 
     assert catalog_path.read_bytes() == original_catalog
     assert not (tmp_path / "boundary_shp").exists()
+    assert not (tmp_path / ".lte-data").exists()
+
+
+def test_register_scenario_rejects_an_existing_catalog_transaction_lock(tmp_path):
+    module = importlib.import_module("lte_scenario_toolkit.boundary_data")
+    source = _write_geojson(tmp_path / "boundary.geojson", [box(0, 0, 1, 1)])
+    catalog_path = _write_empty_catalog(tmp_path)
+    original_catalog = catalog_path.read_bytes()
+    lock_path = tmp_path / ".lte-data" / "catalog.lock"
+    lock_path.parent.mkdir()
+    lock_path.write_text("other registration", encoding="utf-8")
+
+    with pytest.raises(module.BoundaryImportError, match="lock|progress"):
+        module.register_scenario(
+            catalog_path,
+            scenario_id="sample-city",
+            display_name="Sample City",
+            boundary_source=source,
+            provider="Example GIS Office",
+            license_name="CC0-1.0",
+            redistribution_confirmed=True,
+        )
+
+    assert catalog_path.read_bytes() == original_catalog
+    assert lock_path.read_text(encoding="utf-8") == "other registration"
+    assert not (tmp_path / "boundary_shp").exists()
+    assert not (tmp_path / "data" / "manifest.json").exists()
+
+
+def test_catalog_is_loaded_only_after_transaction_lock_is_acquired(tmp_path, monkeypatch):
+    module = importlib.import_module("lte_scenario_toolkit.boundary_data")
+    source = _write_geojson(tmp_path / "boundary.geojson", [box(0, 0, 1, 1)])
+    catalog_path = _write_empty_catalog(tmp_path)
+    lock_path = tmp_path / ".lte-data" / "catalog.lock"
+    real_load = module.load_data_catalog
+
+    def assert_locked_load(*args, **kwargs):
+        assert lock_path.is_file()
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(module, "load_data_catalog", assert_locked_load)
+
+    module.register_scenario(
+        catalog_path,
+        scenario_id="sample-city",
+        display_name="Sample City",
+        boundary_source=source,
+        provider="Example GIS Office",
+        license_name="CC0-1.0",
+        redistribution_confirmed=True,
+    )
+
+    assert not lock_path.exists()
+
+
+def test_catalog_lock_serializes_different_registrations_and_retry_preserves_manifest(
+    tmp_path, monkeypatch
+):
+    module = importlib.import_module("lte_scenario_toolkit.boundary_data")
+    source = _write_geojson(tmp_path / "boundary.geojson", [box(0, 0, 1, 1)])
+    catalog_path = _write_empty_catalog(tmp_path)
+    alpha_staged = threading.Event()
+    resume_alpha = threading.Event()
+    winner_errors = []
+    real_import = module.import_boundary_source
+
+    def pause_alpha_import(*args, **kwargs):
+        artifact = real_import(*args, **kwargs)
+        if kwargs["scenario_id"] == "alpha":
+            alpha_staged.set()
+            if not resume_alpha.wait(timeout=10):
+                raise RuntimeError("timed out waiting to resume alpha")
+        return artifact
+
+    def register_alpha():
+        try:
+            module.register_scenario(
+                catalog_path,
+                scenario_id="alpha",
+                display_name="Alpha City",
+                boundary_source=source,
+                provider="Example GIS Office",
+                license_name="CC0-1.0",
+                redistribution_confirmed=True,
+            )
+        except Exception as exc:
+            winner_errors.append(exc)
+
+    monkeypatch.setattr(module, "import_boundary_source", pause_alpha_import)
+    winner = threading.Thread(target=register_alpha)
+    winner.start()
+    assert alpha_staged.wait(timeout=10)
+    try:
+        with pytest.raises(module.BoundaryImportError, match="lock|progress"):
+            module.register_scenario(
+                catalog_path,
+                scenario_id="beta",
+                display_name="Beta City",
+                boundary_source=source,
+                provider="Example GIS Office",
+                license_name="CC0-1.0",
+                redistribution_confirmed=True,
+            )
+    finally:
+        resume_alpha.set()
+        winner.join(timeout=10)
+
+    assert not winner.is_alive()
+    assert winner_errors == []
+    assert not (tmp_path / ".lte-data" / "catalog.lock").exists()
+
+    module.register_scenario(
+        catalog_path,
+        scenario_id="beta",
+        display_name="Beta City",
+        boundary_source=source,
+        provider="Example GIS Office",
+        license_name="CC0-1.0",
+        redistribution_confirmed=True,
+    )
+
+    catalog = module.load_data_catalog(catalog_path)
+    assert sorted(catalog.scenarios_by_id) == ["alpha", "beta"]
+    assert catalog.scenario_status("alpha") == "dem-pending"
+    assert catalog.scenario_status("beta") == "dem-pending"
+    manifest = json.loads((tmp_path / "data" / "manifest.json").read_text(encoding="utf-8"))
+    manifest_ids = {item["dataset_id"] for item in manifest["datasets"]}
+    assert {
+        "boundary_alpha",
+        "usgs_3dep_1m_dem_alpha",
+        "boundary_beta",
+        "usgs_3dep_1m_dem_beta",
+    } <= manifest_ids
+    assert {item["scenario_id"] for item in manifest["scenarios"]} == {"alpha", "beta"}
+
+
+def test_catalog_transaction_lock_is_released_when_registration_fails(tmp_path, monkeypatch):
+    module = importlib.import_module("lte_scenario_toolkit.boundary_data")
+    source = _write_geojson(tmp_path / "boundary.geojson", [box(0, 0, 1, 1)])
+    catalog_path = _write_empty_catalog(tmp_path)
+
+    def fail_import(*args, **kwargs):
+        raise module.BoundaryImportError("boundary failed")
+
+    monkeypatch.setattr(module, "import_boundary_source", fail_import)
+
+    with pytest.raises(module.BoundaryImportError, match="boundary failed"):
+        module.register_scenario(
+            catalog_path,
+            scenario_id="sample-city",
+            display_name="Sample City",
+            boundary_source=source,
+            provider="Example GIS Office",
+            license_name="CC0-1.0",
+            redistribution_confirmed=True,
+        )
+
+    assert not (tmp_path / ".lte-data" / "catalog.lock").exists()
     assert not (tmp_path / ".lte-data").exists()
 
 

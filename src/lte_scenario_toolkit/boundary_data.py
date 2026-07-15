@@ -12,6 +12,8 @@ import tempfile
 import urllib.error
 import urllib.request
 import zipfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import unquote, urlsplit, urlunsplit
@@ -223,9 +225,6 @@ def _rollback_registration(
 
 def _cleanup_staging(
     transaction_dir: Path,
-    staging_root: Path,
-    *,
-    staging_root_existed: bool,
 ) -> None:
     try:
         shutil.rmtree(transaction_dir)
@@ -236,15 +235,74 @@ def _cleanup_staging(
             f"Scenario staging cleanup failed: {transaction_dir}"
         ) from exc
 
-    if not staging_root_existed:
+
+@contextmanager
+def _catalog_transaction_lock(root: Path) -> Iterator[Path]:
+    """Exclusively serialize catalog, boundary, and manifest transactions."""
+
+    staging_root = _safe_repository_path(root, ".lte-data")
+    lock_path = _safe_repository_path(root, ".lte-data", "catalog.lock")
+    if os.path.lexists(staging_root) and not staging_root.is_dir():
+        raise BoundaryImportError(f"Staging path is not a directory: {staging_root}")
+    staging_root_existed = staging_root.exists()
+    try:
+        staging_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise BoundaryImportError(
+            f"Could not create scenario staging directory: {staging_root}"
+        ) from exc
+
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except FileExistsError as exc:
+        raise BoundaryImportError(
+            f"Scenario catalog registration is already in progress; lock exists: {lock_path}"
+        ) from exc
+    except OSError as exc:
+        if not staging_root_existed:
+            try:
+                staging_root.rmdir()
+            except OSError:
+                pass
+        raise BoundaryImportError(
+            f"Could not acquire scenario catalog lock: {lock_path}"
+        ) from exc
+
+    operation_error: Exception | None = None
+    try:
+        yield staging_root
+    except Exception as exc:
+        operation_error = exc
+        raise
+    finally:
+        failures: list[tuple[str, Exception]] = []
         try:
-            staging_root.rmdir()
-        except FileNotFoundError:
-            pass
+            os.close(descriptor)
         except OSError as exc:
-            raise BoundaryImportError(
-                f"Scenario staging cleanup failed: {staging_root}"
-            ) from exc
+            failures.append(("close", exc))
+        try:
+            lock_path.unlink()
+        except OSError as exc:
+            failures.append(("remove", exc))
+        if not staging_root_existed:
+            try:
+                staging_root.rmdir()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                # Another registration may acquire the lock before this cleanup.
+                pass
+        if failures:
+            details = "; ".join(f"{action}: {error}" for action, error in failures)
+            release_error = BoundaryImportError(
+                f"Could not release scenario catalog lock {lock_path}: {details}"
+            )
+            if operation_error is None:
+                raise release_error
+            raise operation_error from release_error
 
 
 def _safe_zip_member_path(
@@ -891,31 +949,21 @@ def _registration_records(
     return boundary, dem, scenario
 
 
-def register_scenario(
-    catalog_path: str | Path,
+def _register_scenario_locked(
+    catalog_path: Path,
+    repo_root: Path,
+    staging_root: Path,
     *,
-    scenario_id: str,
+    scenario: str,
     display_name: str,
     boundary_source: str | Path,
     provider: str,
     license_name: str,
-    redistribution_confirmed: bool,
-    layer: str | None = None,
-    download_date: str | None = None,
-    config_path: str | Path | None = None,
+    layer: str | None,
+    download_date: str | None,
+    config_path: str | Path | None,
 ) -> DataCatalog:
-    """Register a normalized boundary and pending DEM declaration transactionally."""
-
-    if redistribution_confirmed is not True:
-        raise BoundaryImportError("Boundary redistribution must be explicitly confirmed")
-    if not isinstance(scenario_id, str) or SCENARIO_ID_PATTERN.fullmatch(scenario_id) is None:
-        raise BoundaryImportError(f"scenario_id must match {SCENARIO_ID_PATTERN.pattern}")
-    scenario = _validate_scenario_id(scenario_id)
-    name = _required_text(display_name, field="display_name")
-    provider_name = _required_text(provider, field="provider")
-    declared_license = _required_text(license_name, field="license")
-
-    catalog = load_data_catalog(catalog_path)
+    catalog = load_data_catalog(catalog_path, repo_root=repo_root)
     token = scenario.replace("-", "_")
     boundary_id = f"boundary_{token}"
     dem_id = f"usgs_3dep_1m_dem_{token}"
@@ -927,7 +975,6 @@ def register_scenario(
 
     destination_parent = _safe_repository_path(catalog.root, "boundary_shp")
     destination = _safe_repository_path(catalog.root, "boundary_shp", scenario)
-    staging_root = _safe_repository_path(catalog.root, ".lte-data")
     manifest_path = _safe_repository_path(catalog.root, "data", "manifest.json")
     if os.path.lexists(destination):
         raise BoundaryImportError(f"Boundary destination already exists: {destination}")
@@ -935,8 +982,6 @@ def register_scenario(
         raise BoundaryImportError(
             f"Boundary destination parent is not a directory: {destination_parent}"
         )
-    if os.path.lexists(staging_root) and not staging_root.is_dir():
-        raise BoundaryImportError(f"Staging path is not a directory: {staging_root}")
     if os.path.lexists(manifest_path.parent) and not manifest_path.parent.is_dir():
         raise BoundaryImportError(
             f"Data manifest parent must be a directory: {manifest_path.parent}"
@@ -945,18 +990,11 @@ def register_scenario(
         raise BoundaryImportError(f"Data manifest path must be a file: {manifest_path}")
 
     original_catalog = catalog.path.read_bytes()
-    staging_root_existed = staging_root.exists()
     try:
-        staging_root.mkdir(parents=True, exist_ok=True)
         transaction_dir = Path(
             tempfile.mkdtemp(prefix=f"scenario-{scenario}-", dir=staging_root)
         )
     except OSError as exc:
-        if not staging_root_existed:
-            try:
-                staging_root.rmdir()
-            except OSError:
-                pass
         raise BoundaryImportError(f"Could not create scenario staging directory: {staging_root}") from exc
     destination_parent_existed = destination_parent.exists()
     installed = False
@@ -969,16 +1007,16 @@ def register_scenario(
         artifact = import_boundary_source(
             boundary_source,
             scenario_id=scenario,
-            display_name=name,
+            display_name=display_name,
             staging_dir=transaction_dir / "boundary",
             layer=layer,
         )
         boundary, dem, scenario_record = _registration_records(
             artifact,
             scenario_id=scenario,
-            display_name=name,
-            provider=provider_name,
-            license_name=declared_license,
+            display_name=display_name,
+            provider=provider,
+            license_name=license_name,
             download_date=download_date,
             config_path=config_path,
         )
@@ -1027,12 +1065,54 @@ def register_scenario(
         raise
     finally:
         try:
-            _cleanup_staging(
-                transaction_dir,
-                staging_root,
-                staging_root_existed=staging_root_existed,
-            )
+            _cleanup_staging(transaction_dir)
         except BoundaryImportError as cleanup_error:
             if operation_error is None:
                 raise
             raise operation_error from cleanup_error
+
+
+def register_scenario(
+    catalog_path: str | Path,
+    *,
+    scenario_id: str,
+    display_name: str,
+    boundary_source: str | Path,
+    provider: str,
+    license_name: str,
+    redistribution_confirmed: bool,
+    layer: str | None = None,
+    download_date: str | None = None,
+    config_path: str | Path | None = None,
+) -> DataCatalog:
+    """Register a normalized boundary and pending DEM declaration transactionally."""
+
+    if redistribution_confirmed is not True:
+        raise BoundaryImportError("Boundary redistribution must be explicitly confirmed")
+    if not isinstance(scenario_id, str) or SCENARIO_ID_PATTERN.fullmatch(scenario_id) is None:
+        raise BoundaryImportError(f"scenario_id must match {SCENARIO_ID_PATTERN.pattern}")
+    scenario = _validate_scenario_id(scenario_id)
+    name = _required_text(display_name, field="display_name")
+    provider_name = _required_text(provider, field="provider")
+    declared_license = _required_text(license_name, field="license")
+
+    resolved_catalog_path = Path(catalog_path).resolve()
+    repo_root = (
+        resolved_catalog_path.parent.parent
+        if resolved_catalog_path.parent.name == "data"
+        else resolved_catalog_path.parent
+    )
+    with _catalog_transaction_lock(repo_root) as staging_root:
+        return _register_scenario_locked(
+            resolved_catalog_path,
+            repo_root,
+            staging_root,
+            scenario=scenario,
+            display_name=name,
+            boundary_source=boundary_source,
+            provider=provider_name,
+            license_name=declared_license,
+            layer=layer,
+            download_date=download_date,
+            config_path=config_path,
+        )
