@@ -47,3 +47,9 @@ def test_packaging_declares_research_cli_commands():
     assert scripts["lte-select-sites"] == "lte_scenario_toolkit.select_sites:main"
     assert scripts["lte-generate-figures"] == "lte_scenario_toolkit.generate_figures:main"
     assert scripts["lte-download-newyork-dem"] == "lte_scenario_toolkit.newyork_dem:main"
+
+
+def test_gee_exporters_have_dedicated_locations():
+    assert (ROOT / "gee" / "newyork_1m_dem.js").is_file()
+    assert not (ROOT / "gee_newyork_1m_dem.js").exists()
+    assert not (ROOT / "download_newyork_1m_dem.py").exists()

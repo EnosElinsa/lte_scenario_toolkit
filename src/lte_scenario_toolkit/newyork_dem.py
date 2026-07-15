@@ -17,7 +17,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-
 DEM_COLLECTION = "USGS/3DEP/1m"
 COUNTY_COLLECTION = "TIGER/2018/Counties"
 TARGET_CRS = "EPSG:3857"

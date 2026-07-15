@@ -41,7 +41,15 @@ def test_data_manifest_generator_exposes_metadata_and_output_arguments():
     assert "--output" in help_text
 
 
-def test_thin_script_entry_points_forward_help():
+def test_select_sites_thin_script_forwards_help():
     assert "--config" in command_help("scripts/select_sites.py")
+
+
+def test_generate_figures_thin_script_forwards_help():
     assert "--config" in command_help("scripts/generate_scenario_figures.py")
-    assert "--project" in command_help("scripts/download_newyork_1m_dem.py")
+
+
+def test_newyork_dem_thin_script_forwards_help():
+    dem_help = command_help("scripts/download_newyork_1m_dem.py")
+    assert "--project" in dem_help
+    assert "--dry-run" in dem_help

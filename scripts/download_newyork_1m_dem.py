@@ -4,9 +4,10 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+SOURCE_ROOT = ROOT / "src"
+sys.path.insert(0, str(SOURCE_ROOT))
 
-from download_newyork_1m_dem import main  # noqa: E402
+from lte_scenario_toolkit.newyork_dem import main  # noqa: E402
 
 if __name__ == "__main__":
     raise SystemExit(main())
