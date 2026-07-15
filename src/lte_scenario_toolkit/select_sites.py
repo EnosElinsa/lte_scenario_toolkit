@@ -181,16 +181,20 @@ def main(argv=None) -> int:
         pass
 
     args = _parse_args(argv)
-    config = load_experiment_config(
-        args.config,
-        city=args.city,
-        output_dir=args.output_dir,
-    )
-    if args.size is not None:
-        config["rect_size"] = args.size
-    if args.target is not None:
-        config["target_count"] = args.target
-    config.update(resolve_selection_io_paths(config))
+    try:
+        config = load_experiment_config(
+            args.config,
+            city=args.city,
+            output_dir=args.output_dir,
+        )
+        if args.size is not None:
+            config["rect_size"] = args.size
+        if args.target is not None:
+            config["target_count"] = args.target
+        config.update(resolve_selection_io_paths(config))
+    except (CatalogError, ValueError, FileNotFoundError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
 
     print(f"City: {config['boundary_folder']} ({config['boundary_layer']})")
     print(f"Points: {config['points_shp']}")

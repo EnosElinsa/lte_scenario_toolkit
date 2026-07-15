@@ -199,6 +199,54 @@ def test_linked_config_rejects_dem_mismatch(tmp_path):
     assert not output_root.exists()
 
 
+def test_main_reports_linked_boundary_mismatch_without_creating_output(
+    tmp_path,
+    capsys,
+):
+    config, _, _, _ = _linked_config_fixture(tmp_path)
+    config_path = Path(config["config_path"])
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "experiment": {"name": "mismatched-linked-config"},
+                "inputs": {
+                    "points_root": "points_shp",
+                    "points_layer": "points",
+                    "boundary_root": "boundary_shp",
+                    "city": "alternate",
+                    "dem_path": "dem/registered/elevation.tif",
+                },
+                "spatial": {
+                    "target_crs": "EPSG:3857",
+                    "rectangle_size_m": 10,
+                    "target_base_station_count": 1,
+                    "count_tolerance": 0,
+                },
+                "scan": {
+                    "strategy": "uniform",
+                    "step_m": 1,
+                    "max_rectangles": 1,
+                    "minimum_center_spacing_m": 1,
+                },
+                "outputs": {"root": "outputs"},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    output_root = Path(config["output_root"])
+    assert not output_root.exists()
+
+    exit_code = select_sites.main(["--config", str(config_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.out == ""
+    assert "ERROR:" in captured.err
+    assert "boundary does not match" in captured.err
+    assert not output_root.exists()
+
+
 def test_unlinked_config_keeps_standalone_path_resolution(tmp_path):
     config, _, alternate_boundary, _ = _linked_config_fixture(tmp_path)
     config["config_path"] = tmp_path / "configs" / "standalone.yaml"
