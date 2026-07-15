@@ -9,7 +9,11 @@ from rasterio.transform import from_origin
 from shapely.geometry import Point, box
 
 from lte_scenario_toolkit import select_sites
+from lte_scenario_toolkit.config import load_experiment_config
+from lte_scenario_toolkit.data_catalog import load_data_catalog
 from lte_scenario_toolkit.select_sites import process_selected_rectangles
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _write_shapefile(path: Path, geometry) -> Path:
@@ -146,20 +150,53 @@ def test_linked_config_uses_exact_registered_boundary_and_dem(tmp_path):
     assert not (tmp_path / "outputs").exists()
 
 
+@pytest.mark.parametrize(
+    ("config_name", "scenario_id"),
+    [
+        ("example.yaml", "chicago"),
+        ("newyork.yaml", "new-york-city"),
+    ],
+)
+def test_repository_linked_configs_resolve_exact_catalog_entrypoints(
+    config_name,
+    scenario_id,
+):
+    config = load_experiment_config(ROOT / "configs" / config_name)
+    catalog = load_data_catalog(ROOT / "data" / "datasets.yaml", repo_root=ROOT)
+    scenario = catalog.scenario(scenario_id)
+    boundary = catalog.dataset(scenario["boundary_dataset_id"])
+    dem = catalog.dataset(scenario["dem_dataset_id"])
+
+    paths = select_sites.resolve_selection_io_paths(config, create_output=False)
+
+    assert paths["registered_scenario_id"] == scenario_id
+    assert paths["boundary_shp"] == catalog.resolve(boundary["entrypoint"])
+    assert paths["dem_path"] == catalog.resolve(dem["entrypoint"])
+    assert not Path(paths["output_dir"]).exists()
+
+
 def test_linked_config_rejects_discovered_boundary_mismatch(tmp_path):
     config, _, _, _ = _linked_config_fixture(tmp_path)
     config["city_name"] = "alternate"
+    output_root = Path(config["output_root"])
+    assert not output_root.exists()
 
     with pytest.raises(ValueError, match="boundary.*does not match"):
-        select_sites.resolve_selection_io_paths(config, create_output=False)
+        select_sites.resolve_selection_io_paths(config)
+
+    assert not output_root.exists()
 
 
 def test_linked_config_rejects_dem_mismatch(tmp_path):
     config, _, _, _ = _linked_config_fixture(tmp_path)
     config["dem_path"] = tmp_path / "dem" / "other" / "elevation.tif"
+    output_root = Path(config["output_root"])
+    assert not output_root.exists()
 
     with pytest.raises(ValueError, match="DEM.*does not match"):
-        select_sites.resolve_selection_io_paths(config, create_output=False)
+        select_sites.resolve_selection_io_paths(config)
+
+    assert not output_root.exists()
 
 
 def test_unlinked_config_keeps_standalone_path_resolution(tmp_path):
