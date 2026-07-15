@@ -149,7 +149,8 @@ def test_import_boundary_source_fetches_mocked_http_zip_and_preserves_url(tmp_pa
         def __exit__(self, exc_type, exc, traceback):
             self.close()
 
-    def fake_urlopen(url):
+    def fake_urlopen(url, *, timeout):
+        del timeout
         requested.append(str(url))
         return Response(payload)
 
@@ -182,3 +183,161 @@ def test_import_boundary_source_rejects_shapefile_without_prj(tmp_path):
             display_name="No CRS",
             staging_dir=tmp_path / "stage",
         )
+
+
+def test_safe_extract_zip_rejects_member_count_limit(tmp_path, monkeypatch):
+    module = importlib.import_module("lte_scenario_toolkit.boundary_data")
+    archive = tmp_path / "many.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr("one.txt", "1")
+        handle.writestr("two.txt", "2")
+    monkeypatch.setattr(module, "MAX_ZIP_MEMBERS", 1)
+
+    with pytest.raises(ValueError, match="member count"):
+        module.safe_extract_zip(archive, tmp_path / "extract")
+
+
+def test_safe_extract_zip_rejects_member_and_aggregate_expanded_size_limits(
+    tmp_path, monkeypatch
+):
+    module = importlib.import_module("lte_scenario_toolkit.boundary_data")
+    archive = tmp_path / "large.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr("one.txt", "1234")
+        handle.writestr("two.txt", "5678")
+
+    monkeypatch.setattr(module, "MAX_ZIP_MEMBER_BYTES", 3)
+    with pytest.raises(ValueError, match="member.*expanded|expanded.*member"):
+        module.safe_extract_zip(archive, tmp_path / "member-extract")
+
+    monkeypatch.setattr(module, "MAX_ZIP_MEMBER_BYTES", 100)
+    monkeypatch.setattr(module, "MAX_ZIP_TOTAL_BYTES", 7)
+    with pytest.raises(ValueError, match="aggregate.*expanded|expanded.*aggregate"):
+        module.safe_extract_zip(archive, tmp_path / "total-extract")
+
+
+def test_remote_download_uses_timeout_and_rejects_oversized_response(tmp_path, monkeypatch):
+    module = importlib.import_module("lte_scenario_toolkit.boundary_data")
+    requested = []
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            self.close()
+
+    def fake_urlopen(url, *, timeout):
+        requested.append((str(url), timeout))
+        return Response(b"12345")
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(module, "MAX_REMOTE_BYTES", 4)
+    with pytest.raises(ValueError, match="maximum|limit|bytes"):
+        module.import_boundary_source(
+            "https://example.test/too-large.zip",
+            scenario_id="remote-limit",
+            display_name="Remote",
+            staging_dir=tmp_path / "stage",
+        )
+
+    assert requested == [("https://example.test/too-large.zip", module.REMOTE_TIMEOUT_SECONDS)]
+
+
+@pytest.mark.parametrize(
+    "member_name",
+    ["dir/file:stream", "CON.txt", "dir/trailing. ", "dir/trailing./file.txt"],
+)
+def test_safe_extract_zip_rejects_windows_unsafe_member_names(tmp_path, member_name):
+    module = importlib.import_module("lte_scenario_toolkit.boundary_data")
+    archive = tmp_path / "windows-unsafe.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr(member_name, "nope")
+
+    with pytest.raises(ValueError, match="Windows|unsafe|reserved|trailing"):
+        module.safe_extract_zip(archive, tmp_path / "extract")
+
+
+def test_safe_extract_zip_rejects_case_insensitive_duplicate_members(tmp_path):
+    module = importlib.import_module("lte_scenario_toolkit.boundary_data")
+    archive = tmp_path / "duplicate.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr("Boundary.geojson", "one")
+        handle.writestr("boundary.GEOJSON", "two")
+
+    with pytest.raises(ValueError, match="duplicate"):
+        module.safe_extract_zip(archive, tmp_path / "extract")
+
+
+@pytest.mark.parametrize("scenario_id", ["Bad", "a_b", "a.b", "../bad", "con", ""])
+def test_import_boundary_source_rejects_unsafe_scenario_ids(tmp_path, scenario_id):
+    module = importlib.import_module("lte_scenario_toolkit.boundary_data")
+
+    with pytest.raises(ValueError, match="scenario_id"):
+        module.import_boundary_source(
+            tmp_path / "missing.geojson",
+            scenario_id=scenario_id,
+            display_name="Invalid",
+            staging_dir=tmp_path / f"stage-{scenario_id or 'empty'}",
+        )
+
+
+def test_remote_shapefile_sidecars_try_source_extension_case_then_fallback(tmp_path, monkeypatch):
+    module = importlib.import_module("lte_scenario_toolkit.boundary_data")
+    source = _write_geojson(tmp_path / "source.geojson", [box(0, 0, 1, 1)])
+    shapefile = tmp_path / "source.shp"
+    gpd.read_file(source).to_file(shapefile, driver="ESRI Shapefile", encoding="UTF-8")
+    payloads = {
+        f"https://example.test/boundary{suffix.upper()}": shapefile.with_suffix(suffix).read_bytes()
+        for suffix in (".shp", ".shx", ".dbf", ".prj", ".cpg")
+    }
+    requested = []
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            self.close()
+
+    def fake_urlopen(url, *, timeout):
+        del timeout
+        requested.append(str(url))
+        try:
+            return Response(payloads[str(url)])
+        except KeyError as exc:
+            raise module.urllib.error.HTTPError(str(url), 404, "missing", None, None) from exc
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", fake_urlopen)
+    artifact = module.import_boundary_source(
+        "https://example.test/boundary.SHP",
+        scenario_id="upper-sidecars",
+        display_name="Upper",
+        staging_dir=tmp_path / "stage",
+    )
+
+    assert artifact.entrypoint.is_file()
+    assert requested[:4] == [
+        "https://example.test/boundary.SHP",
+        "https://example.test/boundary.SHX",
+        "https://example.test/boundary.SHP".replace(".SHP", ".DBF"),
+        "https://example.test/boundary.SHP".replace(".SHP", ".PRJ"),
+    ]
+
+
+def test_zip_metadata_json_is_not_treated_as_a_vector_layer(tmp_path):
+    module = importlib.import_module("lte_scenario_toolkit.boundary_data")
+    boundary = _write_geojson(tmp_path / "boundary.geojson", [box(0, 0, 1, 1)])
+    archive = tmp_path / "with-metadata.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.write(boundary, arcname="boundary.geojson")
+        handle.writestr("metadata.json", '{"title": "not a vector"}')
+
+    artifact = module.import_boundary_source(
+        archive,
+        scenario_id="metadata-filter",
+        display_name="Metadata",
+        staging_dir=tmp_path / "stage",
+    )
+
+    assert artifact.entrypoint.is_file()

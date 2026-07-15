@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import shutil
 import stat
 import urllib.error
@@ -19,6 +20,23 @@ _SHAPEFILE_REQUIRED_SUFFIXES = (".shp", ".shx", ".dbf", ".prj")
 _SHAPEFILE_OPTIONAL_SUFFIXES = (".cpg",)
 _NORMALIZED_CRS = "EPSG:3857"
 _POLYGON_TYPES = frozenset({"Polygon", "MultiPolygon"})
+REMOTE_TIMEOUT_SECONDS = 30.0
+MAX_REMOTE_BYTES = 512 * 1024 * 1024
+MAX_ZIP_MEMBERS = 4096
+MAX_ZIP_MEMBER_BYTES = 256 * 1024 * 1024
+MAX_ZIP_TOTAL_BYTES = 1024 * 1024 * 1024
+_DOWNLOAD_CHUNK_BYTES = 64 * 1024
+_SCENARIO_ID_PATTERN = re.compile(r"[a-z][a-z0-9-]*\Z")
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        *(f"com{index}" for index in range(1, 10)),
+        *(f"lpt{index}" for index in range(1, 10)),
+    }
+)
 
 
 class BoundaryImportError(ValueError):
@@ -42,6 +60,11 @@ class BoundaryArtifact:
 class _StagedSource:
     primary: Path
     files: tuple[Path, ...]
+
+
+@dataclass
+class _DownloadBudget:
+    consumed: int = 0
 
 
 @dataclass(frozen=True)
@@ -70,11 +93,17 @@ class _VectorLayer:
         return aliases
 
 
-def _safe_zip_member_path(name: str, destination: Path) -> Path:
+def _safe_zip_member_path(
+    name: str,
+    destination: Path,
+    *,
+    seen_names: set[str] | None = None,
+) -> Path:
     normalized = name.replace("\\", "/")
     windows_name = PureWindowsPath(normalized)
     if (
         not normalized
+        or "\x00" in normalized
         or normalized.startswith("/")
         or normalized.startswith("\\")
         or windows_name.is_absolute()
@@ -82,10 +111,26 @@ def _safe_zip_member_path(name: str, destination: Path) -> Path:
     ):
         raise BoundaryImportError(f"Unsafe ZIP member path: {name!r}")
 
-    parts = PurePosixPath(normalized).parts
-    if ".." in parts:
+    raw_parts = normalized.split("/")
+    if raw_parts and raw_parts[-1] == "":
+        raw_parts.pop()
+    if any(not part or part in {".", ".."} for part in raw_parts):
         raise BoundaryImportError(f"Unsafe ZIP member path traversal: {name!r}")
+    if any(
+        ":" in part
+        or part.endswith((".", " "))
+        or part.split(".", 1)[0].casefold() in _WINDOWS_RESERVED_NAMES
+        for part in raw_parts
+    ):
+        raise BoundaryImportError(f"Windows-unsafe ZIP member path: {name!r}")
 
+    canonical_name = "/".join(part.casefold() for part in raw_parts)
+    if seen_names is not None:
+        if canonical_name in seen_names:
+            raise BoundaryImportError(f"duplicate ZIP member path: {name!r}")
+        seen_names.add(canonical_name)
+
+    parts = PurePosixPath(normalized).parts
     target = destination.joinpath(*parts)
     try:
         target.resolve().relative_to(destination.resolve())
@@ -102,22 +147,66 @@ def safe_extract_zip(archive: str | Path, destination: str | Path) -> Path:
     destination_path.mkdir(parents=True, exist_ok=True)
     try:
         with zipfile.ZipFile(archive_path) as handle:
+            infos = handle.infolist()
+            if len(infos) > MAX_ZIP_MEMBERS:
+                raise BoundaryImportError(
+                    f"ZIP member count exceeds limit ({MAX_ZIP_MEMBERS})"
+                )
             members: list[tuple[zipfile.ZipInfo, Path]] = []
-            for info in handle.infolist():
+            seen_names: set[str] = set()
+            declared_total = 0
+            for info in infos:
                 mode = (info.external_attr >> 16) & 0xFFFF
                 if stat.S_ISLNK(mode):
                     raise BoundaryImportError(
                         f"ZIP symlink entries are not allowed: {info.filename!r}"
                     )
-                members.append((info, _safe_zip_member_path(info.filename, destination_path)))
+                if info.file_size > MAX_ZIP_MEMBER_BYTES:
+                    raise BoundaryImportError(
+                        f"ZIP member expanded size exceeds limit ({MAX_ZIP_MEMBER_BYTES}): "
+                        f"{info.filename!r}"
+                    )
+                declared_total += info.file_size
+                if declared_total > MAX_ZIP_TOTAL_BYTES:
+                    raise BoundaryImportError(
+                        f"ZIP aggregate expanded size exceeds limit ({MAX_ZIP_TOTAL_BYTES})"
+                    )
+                members.append(
+                    (
+                        info,
+                        _safe_zip_member_path(
+                            info.filename,
+                            destination_path,
+                            seen_names=seen_names,
+                        ),
+                    )
+                )
 
+            written_total = 0
             for info, target in members:
                 if info.is_dir() or info.filename.endswith(("/", "\\")):
                     target.mkdir(parents=True, exist_ok=True)
                     continue
                 target.parent.mkdir(parents=True, exist_ok=True)
+                written_member = 0
                 with handle.open(info) as source, target.open("wb") as output:
-                    shutil.copyfileobj(source, output)
+                    while True:
+                        chunk = source.read(_DOWNLOAD_CHUNK_BYTES)
+                        if not chunk:
+                            break
+                        written_member += len(chunk)
+                        written_total += len(chunk)
+                        if written_member > MAX_ZIP_MEMBER_BYTES:
+                            raise BoundaryImportError(
+                                f"ZIP member expanded size exceeds limit "
+                                f"({MAX_ZIP_MEMBER_BYTES}): {info.filename!r}"
+                            )
+                        if written_total > MAX_ZIP_TOTAL_BYTES:
+                            raise BoundaryImportError(
+                                f"ZIP aggregate expanded size exceeds limit "
+                                f"({MAX_ZIP_TOTAL_BYTES})"
+                            )
+                        output.write(chunk)
     except zipfile.BadZipFile as exc:
         raise BoundaryImportError(f"Invalid ZIP archive: {archive_path}") from exc
     return destination_path
@@ -208,41 +297,128 @@ def _url_with_suffix(url: str, suffix: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, f"{path[:dot]}{suffix}", parts.query, parts.fragment))
 
 
-def _download_url(url: str, target: Path) -> Path:
+def _url_suffix_variants(url: str, suffix: str) -> list[str]:
+    parts = urlsplit(url)
+    path = parts.path
+    dot = path.rfind(".")
+    if dot < path.rfind("/"):
+        raise BoundaryImportError(f"URL does not have a replaceable file suffix: {url}")
+    source_suffix = path[dot:]
+    if source_suffix.isupper():
+        convention = suffix.upper()
+    elif source_suffix.islower():
+        convention = suffix.lower()
+    else:
+        convention = suffix.capitalize()
+    variants: list[str] = []
+    for candidate_suffix in (convention, suffix.lower(), suffix.upper()):
+        candidate = _url_with_suffix(url, candidate_suffix)
+        if candidate not in variants:
+            variants.append(candidate)
+    return variants
+
+
+def _response_content_length(response) -> int | None:
+    headers = getattr(response, "headers", None)
+    value = headers.get("Content-Length") if headers is not None else None
+    if value is None and hasattr(response, "getheader"):
+        value = response.getheader("Content-Length")
     try:
-        with urllib.request.urlopen(url) as response, target.open("wb") as output:
-            shutil.copyfileobj(response, output)
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _download_url(url: str, target: Path, *, budget: _DownloadBudget) -> Path:
+    remaining = MAX_REMOTE_BYTES - budget.consumed
+    if remaining <= 0:
+        raise BoundaryImportError(
+            f"Remote boundary download exceeds maximum aggregate size ({MAX_REMOTE_BYTES} bytes)"
+        )
+    try:
+        with urllib.request.urlopen(url, timeout=REMOTE_TIMEOUT_SECONDS) as response:
+            content_length = _response_content_length(response)
+            if content_length is not None and content_length > remaining:
+                raise BoundaryImportError(
+                    f"Remote boundary download exceeds maximum size ({MAX_REMOTE_BYTES} bytes)"
+                )
+            downloaded = 0
+            with target.open("wb") as output:
+                while True:
+                    chunk = response.read(_DOWNLOAD_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    downloaded += len(chunk)
+                    if downloaded > remaining:
+                        raise BoundaryImportError(
+                            f"Remote boundary download exceeds maximum size "
+                            f"({MAX_REMOTE_BYTES} bytes)"
+                        )
+                    output.write(chunk)
+            budget.consumed += downloaded
+    except BoundaryImportError:
+        target.unlink(missing_ok=True)
+        raise
     except (OSError, urllib.error.URLError) as exc:
         target.unlink(missing_ok=True)
         raise BoundaryImportError(f"Could not download boundary source: {url}") from exc
     return target
 
 
+def _download_remote_component(
+    source_url: str,
+    suffix: str,
+    target: Path,
+    *,
+    budget: _DownloadBudget,
+) -> tuple[Path, str]:
+    errors: list[BoundaryImportError] = []
+    for component_url in _url_suffix_variants(source_url, suffix):
+        try:
+            return _download_url(component_url, target, budget=budget), component_url
+        except BoundaryImportError as exc:
+            errors.append(exc)
+    detail = "; ".join(str(error) for error in errors)
+    raise BoundaryImportError(f"Could not download any matching sidecar URL for {suffix}: {detail}")
+
+
 def _stage_remote_source(url: str, source_dir: Path) -> _StagedSource:
     parsed = urlsplit(url)
     source_name = Path(unquote(parsed.path)).name or "boundary-download"
-    primary = _download_url(url, source_dir / source_name)
     suffix = Path(source_name).suffix.casefold()
+    budget = _DownloadBudget()
+    primary_target = (
+        source_dir / f"{Path(source_name).stem}.shp" if suffix == ".shp" else source_dir / source_name
+    )
+    primary = _download_url(url, primary_target, budget=budget)
 
     if zipfile.is_zipfile(primary):
         return _StagedSource(primary, (primary,))
     if suffix == ".shp":
         components = [primary]
         for component_suffix in _SHAPEFILE_REQUIRED_SUFFIXES[1:]:
-            component_url = _url_with_suffix(url, component_suffix)
-            target = source_dir / f"{Path(source_name).stem}{component_suffix}"
             try:
-                components.append(_download_url(component_url, target))
+                component, _ = _download_remote_component(
+                    url,
+                    component_suffix,
+                    source_dir / f"{Path(source_name).stem}{component_suffix}",
+                    budget=budget,
+                )
+                components.append(component)
             except BoundaryImportError as exc:
                 detail = f"Missing required remote Shapefile component {component_suffix}"
                 if component_suffix == ".prj":
                     detail += " declaring the CRS"
-                raise BoundaryImportError(f"{detail}: {component_url}") from exc
+                raise BoundaryImportError(f"{detail}: {url}") from exc
         for component_suffix in _SHAPEFILE_OPTIONAL_SUFFIXES:
-            component_url = _url_with_suffix(url, component_suffix)
-            target = source_dir / f"{Path(source_name).stem}{component_suffix}"
             try:
-                components.append(_download_url(component_url, target))
+                component, _ = _download_remote_component(
+                    url,
+                    component_suffix,
+                    source_dir / f"{Path(source_name).stem}{component_suffix}",
+                    budget=budget,
+                )
+                components.append(component)
             except BoundaryImportError:
                 pass
         return _StagedSource(primary, tuple(components))
@@ -267,6 +443,8 @@ def _discover_vector_layers(root: Path) -> list[_VectorLayer]:
     )
     layers: list[_VectorLayer] = []
     for path in candidates:
+        if path.suffix.casefold() == ".json" and not _is_usable_json_vector(path):
+            continue
         if path.suffix.casefold() != ".gpkg":
             layers.append(_VectorLayer(path=path, layer=None, root=root))
             continue
@@ -278,6 +456,20 @@ def _discover_vector_layers(root: Path) -> list[_VectorLayer]:
         for layer_name in geometry_layers["name"].astype(str):
             layers.append(_VectorLayer(path=path, layer=layer_name, root=root))
     return layers
+
+
+def _is_usable_json_vector(path: Path) -> bool:
+    try:
+        available = gpd.list_layers(path)
+    except Exception:
+        try:
+            frame = gpd.read_file(path)
+        except Exception:
+            return False
+        return hasattr(frame, "geometry")
+    if available.empty or "geometry_type" not in available.columns:
+        return False
+    return bool(available["geometry_type"].notna().any())
 
 
 def _select_vector_layer(root: Path, requested: str | None) -> _VectorLayer:
@@ -363,10 +555,11 @@ def _normalize_boundary(
 
 
 def _validate_scenario_id(scenario_id: str) -> str:
-    value = str(scenario_id)
-    if not value or value in {".", ".."} or "/" in value or "\\" in value:
-        raise BoundaryImportError("scenario_id must be a nonempty filename-safe value")
-    return value
+    if not isinstance(scenario_id, str) or _SCENARIO_ID_PATTERN.fullmatch(scenario_id) is None:
+        raise BoundaryImportError("scenario_id must match [a-z][a-z0-9-]*")
+    if scenario_id in _WINDOWS_RESERVED_NAMES:
+        raise BoundaryImportError("scenario_id must not be a Windows device name")
+    return scenario_id
 
 
 def import_boundary_source(
