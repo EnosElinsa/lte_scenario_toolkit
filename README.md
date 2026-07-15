@@ -1,137 +1,151 @@
-# USA LTE Base Station Data
+# USA LTE Base Station Scenario Toolkit
 
-面向研究者的可复现实验工具，用于在美国城市行政边界内处理 LTE 基站点、筛选候选空间场景、提取 DEM 高程，并生成 CSV 与二维/三维地形图。
+面向研究者的可复现实验工具：在美国城市行政边界内筛选 LTE 基站场景，采样 1 m DEM 高程，并输出 CSV、二维预览、三维地形图和机器可读运行记录。
 
-当前仓库处于迁移式重构的第一阶段：现有入口脚本保持可运行，仓库先补齐版本管理、数据说明和可复现运行约定。后续再把重复逻辑拆分到 `src/`，并让配置文件成为正式运行入口。
+仓库已经完成配置化和模块化迁移。历史根目录脚本仍可直接运行；推荐使用 `configs/` 中的 YAML 配置和 `scripts/` 下的薄命令行入口。
 
 ## Workflow
 
 ```text
-准备公开的基站点和边界数据
-→ 准备本地 DEM 或通过 GEE/USGS 下载
-→ 统一到 EPSG:3857
-→ 扫描候选矩形
-→ 交互选择场景
-→ 提取基站点 DEM 高程
-→ 输出 CSV 和三维地形图
+准备公开基站点和行政边界
+→ 下载或放置本地 DEM
+→ 校验数据清单、CRS 和分辨率
+→ 读取 YAML 实验配置
+→ 扫描满足点数与间距约束的候选矩形
+→ 交互选择，或用固定候选编号复现选择
+→ 采样基站高程
+→ 输出 CSV、PNG/EPS/HTML 和 run JSON
 ```
 
 ## Repository layout
 
 ```text
-boundary_shp/                 # 已授权公开的城市边界 Shapefile
-points_shp/                   # 公开基站点 Shapefile，Git LFS 管理
-dem/                          # 本地 DEM；大文件不进入 Git
-configs/                      # 可复现实验配置示例
-data/                         # 数据来源和示例数据说明
-docs/                         # 设计、计划和研究文档
-runs/                         # 只跟踪模板与摘要
-select_sites.py               # 候选矩形扫描、交互选择和高程提取
-generate_scenario_figures.py  # 从已有 CSV 生成三维图
-download_newyork_1m_dem.py    # Python/GEE DEM 导出入口
-gee_newyork_1m_dem.js         # GEE Code Editor DEM 导出脚本
+boundary_shp/                 # 已获公开再分发权限的边界 Shapefile
+points_shp/                   # 公开 LTE 基站点；大型组成文件由 Git LFS 管理
+dem/                          # 本地 DEM；不进入 Git/LFS
+configs/                      # Chicago 与 New York YAML 实验配置
+data/datasets.yaml            # 数据集来源、许可和空间元数据
+data/manifest.json            # 文件大小与 SHA256 清单
+src/                          # 配置、空间、场景、DEM、I/O、可视化模块
+scripts/                      # 薄命令行入口与 manifest 生成器
+tests/fixtures/               # 无需完整 DEM/基站数据的小型公开 fixture
+runs/                         # 只跟踪模板和简短摘要
+select_sites.py               # 历史兼容入口
+generate_scenario_figures.py  # 历史兼容入口
+download_newyork_1m_dem.py    # GEE Python 导出入口
+gee_newyork_1m_dem.js         # GEE Code Editor 导出脚本
 ```
 
 ## Installation
 
-要求 Python 3.10 或更高版本。Windows PowerShell 示例：
+要求 Python 3.10 或更高版本。Windows PowerShell：
 
 ```powershell
+git lfs install
+git lfs pull
+
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
 ```
 
-如果只是运行已有脚本，也可以直接安装运行依赖：
-
-```powershell
-python -m pip install geopandas shapely numpy pandas rasterio matplotlib plotly
-```
-
-基站点数据使用 Git LFS：
-
-```powershell
-git lfs install
-git lfs pull
-```
+安装后可使用 `lte-select-sites`、`lte-generate-figures` 和 `lte-download-newyork-dem`；也可继续用 `python scripts/...` 或根目录历史命令。
 
 ## Data preparation
 
-完整数据的来源、许可和目录约定见：
+基站点和边界数据随仓库分发。DEM 体量很大，只保存在本地，目录和下载方式见 [dem/README.md](dem/README.md)。数据来源与许可声明见 [data/README.md](data/README.md)。
 
-- [data/README.md](data/README.md)
-- [dem/README.md](dem/README.md)
-- [configs/README.md](configs/README.md)
-
-当前入口脚本仍读取各自文件顶部的 `CONFIG` 字典；`configs/example.yaml` 是下一阶段配置化迁移的目标格式，当前不会被旧脚本自动读取。
-
-### DEM
-
-完整 1 m DEM 不进入 Git。纽约市 DEM 使用 `USGS/3DEP/1m`，通过 Earth Engine 导出到 Google Drive，再下载到本地 `dem/`。详细步骤见 [dem/README.md](dem/README.md)。
-
-### Base-station points and boundaries
-
-基站点数据可以公开发布，并通过 Git LFS 下载。Shapefile 的 `.shp`、`.shx`、`.dbf`、`.prj` 等组成文件必须保持同一目录，不要单独移动其中一个文件。
-
-## Usage
-
-### Export New York 1 m DEM
-
-先完成 Earth Engine 授权并确认项目 ID：
+纽约市 1 m DEM 的 GEE 检查与导出：
 
 ```powershell
-earthengine authenticate --auth_mode=localhost
-```
-
-先做不提交任务的检查：
-
-```powershell
-python download_newyork_1m_dem.py `
+python scripts/download_newyork_1m_dem.py `
   --project gen-lang-client-0153149292 `
   --dry-run
-```
 
-确认边界、分辨率和 Google Drive 文件夹后提交导出：
-
-```powershell
-python download_newyork_1m_dem.py `
+python scripts/download_newyork_1m_dem.py `
   --project gen-lang-client-0153149292 `
   --export
 ```
 
-脚本默认使用纽约市五县联合边界，输出 EPSG:3857、1 m、分片 GeoTIFF。也可以直接在 GEE Code Editor 中运行 `gee_newyork_1m_dem.js`。
+导出的分片下载后需合并为配置引用的单一 GeoTIFF：
 
-### Select a scenario
-
-准备边界、基站点和本地 DEM 后运行：
-
-```powershell
-python select_sites.py
+```text
+dem/USGS_1M_DEM_NewYorkState_NewYork/USGS_1M_DEM_NewYorkState_NewYork.tif
 ```
 
-脚本当前的城市、DEM 和扫描参数在 `select_sites.py` 顶部 `CONFIG` 中设置。
-
-### Generate figures from an existing CSV
+准备或修改输入后重新生成完整校验清单：
 
 ```powershell
-python generate_scenario_figures.py --help
-python generate_scenario_figures.py --size 3000 --target 30
+python scripts/create_data_manifest.py
 ```
 
-该脚本读取已有 CSV，并根据 `CONFIG` 中的 DEM 路径生成三维图。
+## Reproducible scenario selection
 
-## Reproducibility
+Chicago 示例：
 
-每次正式实验应记录：输入数据来源和 SHA256、边界名称与 CRS、DEM 分辨率和 CRS、扫描参数、软件版本、输出文件和随机种子。运行模板位于 `runs/templates/`，已完成实验只提交简短摘要到 `runs/summaries/`。
+```powershell
+python scripts/select_sites.py --config configs/example.yaml
+```
+
+第一次可以在桌面窗口选择候选矩形。记录候选编号后，正式实验用 `--select-index` 跳过人工选择，使选择过程可复现：
+
+```powershell
+python scripts/select_sites.py `
+  --config configs/example.yaml `
+  --select-index 1
+```
+
+纽约市示例（需先准备并合并 DEM）：
+
+```powershell
+python scripts/select_sites.py `
+  --config configs/newyork.yaml `
+  --select-index 1
+```
+
+通用覆盖参数：
+
+```powershell
+python scripts/select_sites.py `
+  --config configs/example.yaml `
+  --city Chicago `
+  --output-dir results/custom-run `
+  --size 3000 `
+  --target 30
+```
+
+每次成功运行会在输出目录写入 `run-select-sites.json`，包含完整配置、Git commit、输入 SHA256、软件版本和输出文件清单。
+
+## Generate figures from an existing CSV
+
+```powershell
+python scripts/generate_scenario_figures.py `
+  --config configs/example.yaml
+```
+
+该入口读取配置推导出的 CSV，生成论文风格 PNG/EPS 和交互 HTML，并写入 `run-generate-figures.json`。
+
+## Tests and CI
+
+本地验证：
+
+```powershell
+python -m ruff check src scripts tests
+python -m pytest -q
+python -m py_compile select_sites.py generate_scenario_figures.py download_newyork_1m_dem.py
+node --check gee_newyork_1m_dem.js
+```
+
+GitHub Actions 使用小型矢量与内存 DEM fixture，不下载完整数据，也不访问 Earth Engine。
 
 ## Licensing and attribution
 
-源代码采用 MIT License，见 [LICENSE](LICENSE)。数据不自动继承代码许可证：基站点和边界数据按已确认的再分发授权及其元数据发布，USGS 3DEP 数据按 USGS 和 Earth Engine 数据目录要求进行引用。
+源代码采用 [MIT License](LICENSE)。数据不自动继承代码许可证：基站点和边界按仓库所有者确认的公开再分发权限发布；USGS 3DEP 数据保留 USGS 来源说明。缺失的原始来源 URL 和获取日期在 `data/datasets.yaml` 中明确标记为空，不做推测。
 
 ## Known limitations
 
-- 当前两个本地场景脚本仍然包含重复代码和顶部硬编码配置；
-- 当前交互式场景选择依赖桌面图形环境；
-- 1 m 城市 DEM 体量很大，不适合放入普通 Git 历史；
-- CI 将只使用小型 fixture，不会访问 Earth Engine 或下载完整 DEM。
+- 首次候选选择仍需要桌面图形环境；正式复现实验可改用 `--select-index`；
+- 本地场景处理要求单一 GeoTIFF，GEE 产生的纽约 DEM 分片需先合并；
+- EPSG:3857 适合本项目城市尺度的米制扫描，但不是保面积投影；
+- 根目录历史脚本仍保留旧函数定义用于兼容，实际入口已调用 `src/` 模块；后续可在版本化弃用周期后删除这些冗余实现。

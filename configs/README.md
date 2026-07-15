@@ -1,24 +1,33 @@
 # Experiment configurations
 
-`example.yaml` 是后续配置化迁移的目标格式，当前仍属于声明性示例；现有 `select_sites.py` 和 `generate_scenario_figures.py` 继续读取各自文件顶部的 `CONFIG` 字典。
+YAML 是本地场景工具的正式配置入口：
 
-字段对应关系：
+- `example.yaml`：Chicago 示例；
+- `newyork.yaml`：纽约市五县边界示例，要求先准备合并后的本地 DEM。
 
-| YAML 字段 | 当前脚本配置 | 含义 |
+```powershell
+python scripts/select_sites.py --config configs/example.yaml
+python scripts/generate_scenario_figures.py --config configs/example.yaml
+```
+
+字段映射：
+
+| YAML 字段 | 运行字段 | 含义 |
 |---|---|---|
-| `inputs.points_root` | `points_root` | 基站点数据根目录 |
-| `inputs.points_layer` | `points_layer` | 基站点图层目录和名称 |
-| `inputs.boundary_root` | `boundary_root` | 行政边界根目录 |
-| `inputs.city` | `city_id`/自动发现 | 当前城市选择；后续改为名称优先 |
-| `inputs.dem_path` | `dem_path` | 本地 DEM 路径 |
-| `spatial.target_crs` | 固定 `EPSG:3857` | 分析坐标系 |
+| `experiment.name` | `experiment_name` | 运行名称 |
+| `experiment.random_seed` | `random_seed` | `uniform` 扫描的确定性随机种子 |
+| `inputs.points_root` | `points_root` | 基站点根目录 |
+| `inputs.points_layer` | `points_layer` | Shapefile 目录和图层名 |
+| `inputs.boundary_root` | `boundary_root` | 边界根目录 |
+| `inputs.city` | `city_name` | 边界目录名或图层名，不区分大小写 |
+| `inputs.dem_path` | `dem_path` | 单一 GeoTIFF 路径 |
+| `spatial.target_crs` | `target_crs` | 分析坐标系，当前推荐 `EPSG:3857` |
 | `spatial.rectangle_size_m` | `rect_size` | 候选矩形边长 |
-| `spatial.target_base_station_count` | `target_count` | 目标基站数量 |
-| `spatial.count_tolerance` | `tolerance` | 数量容差 |
-| `scan.strategy` | `strategy` | 矩形扫描策略 |
-| `scan.step_m` | `scan_step` | 扫描步长 |
-| `scan.max_rectangles` | `max_rects` | 最大候选矩形数 |
-| `scan.minimum_center_spacing_m` | `min_spacing` | 候选中心最小间距 |
-| `outputs.root` | `output_root` | 结果根目录 |
+| `spatial.target_base_station_count` | `target_count` | 目标基站数 |
+| `spatial.count_tolerance` | `tolerance` | 点数容差 |
+| `scan.*` | 扫描控制字段 | 策略、步长、最大候选数和中心间距 |
+| `outputs.root` | `output_root` | 本次运行的最终输出目录 |
 
-后续配置化任务会让脚本通过 `--config configs/example.yaml` 读取该文件，并保留旧的顶部配置作为兼容入口。
+命令行中的 `--city`、`--output-dir`、`--size` 和 `--target` 优先于 YAML。未提供 `--config` 时，根目录脚本顶部的历史 `CONFIG` 仍作为兼容默认值。
+
+`--select-index N` 使用一基编号固定选择第 N 个候选矩形，适合正式复现实验；未提供时打开交互选择窗口。
