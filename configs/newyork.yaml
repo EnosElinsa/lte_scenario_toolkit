@@ -1,13 +1,13 @@
 experiment:
-  name: chicago_example
+  name: newyork_3000m_target30
   random_seed: 42
 
 inputs:
   points_root: points_shp
   points_layer: USA_Clear_LTE_Base_Station
   boundary_root: boundary_shp
-  city: Chicago
-  dem_path: dem/USGS_1M_DEM_Chicago/USGS_1M_DEM_Chicago.tif
+  city: NewYorkState_NewYork
+  dem_path: dem/USGS_1M_DEM_NewYorkState_NewYork/USGS_1M_DEM_NewYorkState_NewYork.tif
 
 spatial:
   target_crs: EPSG:3857
@@ -22,7 +22,7 @@ scan:
   minimum_center_spacing_m: 3000
 
 outputs:
-  root: results/chicago_example
+  root: results/newyork_3000m_target30
   save_csv: true
   save_preview_png: true
   save_terrain_png: true

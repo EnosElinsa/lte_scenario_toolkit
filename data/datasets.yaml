@@ -1,0 +1,33 @@
+schema_version: 1
+
+datasets:
+  - dataset_id: usa_clear_lte_base_stations
+    path: points_shp/USA_Clear_LTE_Base_Station
+    source_url: null
+    provider: Repository owner supplied dataset
+    license: Public redistribution permission confirmed by repository owner
+    download_date: null
+    crs: EPSG:4326
+    spatial_resolution: point vector
+    notes: Source URL and original acquisition date were not available during repository initialization.
+
+  - dataset_id: administrative_boundaries
+    path: boundary_shp
+    source_url: null
+    provider: Repository owner supplied datasets
+    license: Public redistribution permission confirmed by repository owner
+    download_date: null
+    crs: EPSG:3857
+    spatial_resolution: polygon vector
+    notes: Includes the city and study-area boundary Shapefiles tracked in this repository.
+
+  - dataset_id: usgs_3dep_1m_dem
+    path: dem
+    source_url: https://developers.google.com/earth-engine/datasets/catalog/USGS_3DEP_1m
+    provider: United States Geological Survey
+    license: USGS public-domain data; retain source attribution
+    download_date: null
+    crs: EPSG:3857
+    spatial_resolution: 1 m
+    notes: External local input. Download with the documented Earth Engine workflow; DEM files are excluded from Git.
+    external: true

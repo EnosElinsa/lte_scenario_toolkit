@@ -23,6 +23,19 @@ dependencies = [
   "shapely>=2.0",
 ]
 
+[project.scripts]
+lte-select-sites = "select_sites:main"
+lte-generate-figures = "generate_scenario_figures:main"
+lte-download-newyork-dem = "download_newyork_1m_dem:main"
+
+[tool.setuptools]
+packages = ["src"]
+py-modules = [
+  "select_sites",
+  "generate_scenario_figures",
+  "download_newyork_1m_dem",
+]
+
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0",
@@ -35,3 +48,7 @@ testpaths = ["tests"]
 [tool.ruff]
 target-version = "py310"
 line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]

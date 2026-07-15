@@ -16,6 +16,14 @@ from shapely.prepared import prep
 import json
 import time
 import warnings
+
+from src.config import load_experiment_config
+from src import io as reproducible_io
+from src import scenario as scenario_core
+from src import spatial as spatial_core
+from src import terrain as terrain_core
+from src import visualization as visualization_core
+
 warnings.filterwarnings('ignore')
 
 # ---- 中文字体 ----
@@ -405,7 +413,8 @@ def process_selected_rectangles(chosen, points_gdf, dem, cfg):
         print(f"     裁剪到 {len(selected)} 个点")
 
         # 提取高程
-        elevations = extract_elevation(selected, dem)
+        elevations = terrain_core.extract_elevation(selected, dem)
+        terrain_core.require_valid_elevations(elevations)
         selected["elevation"] = elevations
         valid = np.sum(~np.isnan(elevations))
         elev_valid = elevations[~np.isnan(elevations)]
@@ -416,7 +425,7 @@ def process_selected_rectangles(chosen, points_gdf, dem, cfg):
         all_selected.append(selected)
 
         # 构建输出行
-        df = build_output_dataframe(
+        df = reproducible_io.build_output_dataframe(
             selected, points_crs,
             rect_id=rect_id,
             pt_count=r['pt_count'],
@@ -499,13 +508,50 @@ def build_output_dataframe(selected, points_crs, *,
 
 # ======================== 主程序 ========================
 
-def main():
+def main(argv=None):
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(
+        description="Select an LTE scenario using a reproducible YAML configuration"
+    )
+    parser.add_argument("--config", type=Path, help="experiment YAML; paths are repository-relative")
+    parser.add_argument("--city", help="boundary directory or layer name")
+    parser.add_argument("--output-dir", type=Path, help="write outputs directly to this directory")
+    parser.add_argument("--size", type=int, help="override rectangle size in metres")
+    parser.add_argument("--target", type=int, help="override target base-station count")
+    parser.add_argument(
+        "--select-index",
+        type=int,
+        help="choose a one-based candidate index without opening the interactive selector",
+    )
+    args = parser.parse_args(argv)
+
+    if args.config:
+        cfg = load_experiment_config(
+            args.config,
+            city=args.city,
+            output_dir=args.output_dir,
+        )
+    else:
+        cfg = CONFIG.copy()
+        cfg["repo_root"] = SCRIPT_DIR
+        cfg["target_crs"] = "EPSG:3857"
+        if args.city:
+            cfg["city_name"] = args.city
+        if args.output_dir:
+            cfg["output_root"] = args.output_dir
+            cfg["output_dir_is_final"] = True
+    if args.size is not None:
+        cfg["rect_size"] = args.size
+    if args.target is not None:
+        cfg["target_count"] = args.target
+
     print("=" * 60)
-    print(f"  基站点数据 — {CONFIG['rect_size']}m×{CONFIG['rect_size']}m矩形框选工具")
+    print(f"  基站点数据 — {cfg['rect_size']}m×{cfg['rect_size']}m矩形框选工具")
     print("=" * 60)
 
-    cfg = CONFIG.copy()
-    io_paths = resolve_io_paths(cfg)
+    io_paths = spatial_core.resolve_io_paths(cfg)
     cfg.update(io_paths)
 
     city_list = " | ".join(
@@ -520,7 +566,7 @@ def main():
 
     # 1. 加载数据
     print(f"\n{'='*20} Step 1: 加载数据 {'='*20}")
-    points_gdf, boundary, coords = load_and_prepare(cfg)
+    points_gdf, boundary, coords = spatial_core.load_and_prepare(cfg)
 
     # 2. 扫描 (或读取缓存)
     cache_path = cfg["cache_json"]
@@ -537,15 +583,19 @@ def main():
                                r['bottom_y'] + cfg['rect_size'])
     else:
         print(f"\n{'='*20} Step 2: 生成扫描网格 {'='*20}")
-        positions = generate_scan_positions(
-            boundary, cfg["rect_size"], cfg["scan_step"], cfg["strategy"]
+        positions = scenario_core.generate_scan_positions(
+            boundary,
+            cfg["rect_size"],
+            cfg["scan_step"],
+            cfg["strategy"],
+            random_seed=cfg.get("random_seed", 42),
         )
 
         print(f"\n{'='*20} Step 3: 扫描矩形 {'='*20}")
         print(f"   目标点数: {cfg['target_count']} ± {cfg['tolerance']} "
               f"(即 {cfg['target_count']-cfg['tolerance']}~"
               f"{cfg['target_count']+cfg['tolerance']})")
-        results = scan_rectangles(coords, boundary, positions, cfg)
+        results = scenario_core.scan_rectangles(coords, boundary, positions, cfg)
 
         # 保存缓存 (去掉不可序列化的 geometry)
         cache_data = [{k: v for k, v in r.items() if k != 'geometry'} for r in results]
@@ -554,11 +604,14 @@ def main():
         print(f"   缓存已保存: {cache_path.name}")
 
     # 3. 验证
-    verify_results(results, coords, cfg["rect_size"])
+    scenario_core.verify_results(results, coords, cfg["rect_size"])
 
     # 4. 交互选择
     print(f"\n{'='*20} Step 4: 交互选择 {'='*20}")
-    chosen = interactive_select(points_gdf, boundary, results, coords, cfg)
+    if args.select_index is None:
+        chosen = visualization_core.interactive_select(points_gdf, boundary, results, cfg)
+    else:
+        chosen = scenario_core.choose_result(results, args.select_index)
 
     if not chosen:
         print("\n⚠ 未选中任何矩形, 退出")
@@ -567,10 +620,14 @@ def main():
     # 5. 加载DEM + 提取高程 + 导出CSV
     print(f"\n{'='*20} Step 5: 提取点数据 + DEM高程 → CSV {'='*20}")
     dem_path = cfg["dem_path"]
-    if not dem_path.exists():
+    try:
+        terrain_core.validate_dem_path(dem_path)
+    except FileNotFoundError:
         print(f"   ❌ DEM文件不存在: {dem_path}")
         return None
     dem = rasterio.open(dem_path)
+    dem_crs = str(dem.crs)
+    dem_resolution_m = float(abs(dem.res[0]))
     print(f"   DEM: {dem_path.name}  CRS={dem.crs}  分辨率={dem.res}")
 
     final_df, selected_gdf = process_selected_rectangles(chosen, points_gdf, dem, cfg)
@@ -599,17 +656,79 @@ def main():
     # 6. 生成3D地形图 (DEM仍保持打开)
     print(f"\n{'='*20} Step 6: 生成3D地形图 {'='*20}")
     try:
-        render_3d_terrain(chosen[0], selected_gdf, dem, cfg)
+        visualization_core.render_3d_terrain(chosen[0], selected_gdf, dem, cfg)
     except Exception as exc:
         print(f"   ⚠ 3D地形图生成失败: {exc}")
     finally:
         dem.close()
 
     # 7. 可选: 2D预览图
+    if cfg.get("save_preview_png", True):
+        try:
+            preview_path = visualization_core.save_preview(points_gdf, boundary, chosen, cfg)
+            print(f"   📊 预览图已保存: {preview_path}")
+        except Exception as exc:
+            print(f"   ⚠ 预览图生成失败: {exc}")
+
+    # 8. 保存可复现运行记录；Shapefile 的所有同名组成文件均纳入校验。
     try:
-        preview(points_gdf, boundary, chosen, cfg)
+        input_records = []
+        for role, main_path, source, license_name in (
+            (
+                "base_station_points",
+                cfg["points_shp"],
+                "data/manifest.json",
+                "Public redistribution permission confirmed by repository owner",
+            ),
+            (
+                "administrative_boundary",
+                cfg["boundary_shp"],
+                "data/manifest.json",
+                "Public redistribution permission confirmed by repository owner",
+            ),
+        ):
+            for component in sorted(main_path.parent.glob(f"{main_path.stem}.*")):
+                if component.is_file():
+                    input_records.append(
+                        reproducible_io.build_dataset_record(
+                            component,
+                            name=f"{role}:{component.suffix.lstrip('.')}",
+                            source_url=source,
+                            license_name=license_name,
+                            crs=str(points_gdf.crs),
+                        )
+                    )
+        input_records.append(
+            reproducible_io.build_dataset_record(
+                cfg["dem_path"],
+                name="dem",
+                source_url="https://developers.google.com/earth-engine/datasets/catalog/USGS_3DEP_1m",
+                license_name="USGS public-domain data; retain source attribution",
+                crs=dem_crs,
+                resolution_m=dem_resolution_m,
+            )
+        )
+        outputs = [
+            path
+            for path in (
+                cfg["output_csv"],
+                cfg["output_3d_png"],
+                cfg["output_3d_html"],
+                cfg["preview_png"],
+            )
+            if path.exists()
+        ]
+        run_record = reproducible_io.write_run_record(
+            cfg["output_dir"],
+            config=cfg,
+            inputs=input_records,
+            outputs=outputs,
+            command=sys.argv if argv is None else ["select_sites.py", *argv],
+            filename="run-select-sites.json",
+        )
+        print(f"   🧾 运行记录已保存: {run_record}")
     except Exception as exc:
-        print(f"   ⚠ 预览图生成失败: {exc}")
+        print(f"   ⚠ 运行记录生成失败: {exc}")
 
     print("\n✅ 全部完成!")
     return final_df

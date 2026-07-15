@@ -1,8 +1,8 @@
-from pathlib import Path
 import py_compile
+from pathlib import Path
 
+import tomllib
 import yaml
-
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -37,3 +37,12 @@ def test_existing_python_entry_points_compile():
         "download_newyork_1m_dem.py",
     ):
         py_compile.compile(str(ROOT / relative_path), doraise=True)
+
+
+def test_packaging_declares_research_cli_commands():
+    metadata = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    scripts = metadata["project"]["scripts"]
+
+    assert scripts["lte-select-sites"] == "select_sites:main"
+    assert scripts["lte-generate-figures"] == "generate_scenario_figures:main"
+    assert scripts["lte-download-newyork-dem"] == "download_newyork_1m_dem:main"

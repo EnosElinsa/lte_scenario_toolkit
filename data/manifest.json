@@ -1,0 +1,301 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-07-15T13:50:57.822702Z",
+  "datasets": [
+    {
+      "dataset_id": "usa_clear_lte_base_stations",
+      "path": "points_shp/USA_Clear_LTE_Base_Station",
+      "source_url": null,
+      "provider": "Repository owner supplied dataset",
+      "license": "Public redistribution permission confirmed by repository owner",
+      "download_date": null,
+      "crs": "EPSG:4326",
+      "spatial_resolution": "point vector",
+      "notes": "Source URL and original acquisition date were not available during repository initialization.",
+      "files": [
+        {
+          "path": "points_shp/USA_Clear_LTE_Base_Station/USA_Clear_LTE_Base_Station.cpg",
+          "size_bytes": 5,
+          "sha256": "3ad3031f5503a4404af825262ee8232cc04d4ea6683d42c5dd0a2f2a27ac9824"
+        },
+        {
+          "path": "points_shp/USA_Clear_LTE_Base_Station/USA_Clear_LTE_Base_Station.dbf",
+          "size_bytes": 58676874,
+          "sha256": "c16d7dd47487f45df0f9564a4024894cdc7f1e698115c7a5d21305aed2982824"
+        },
+        {
+          "path": "points_shp/USA_Clear_LTE_Base_Station/USA_Clear_LTE_Base_Station.prj",
+          "size_bytes": 145,
+          "sha256": "a02a27b1d1982c8516d83398e85a3c8b1aef1713c13ef4d84d7bde17430c07c4"
+        },
+        {
+          "path": "points_shp/USA_Clear_LTE_Base_Station/USA_Clear_LTE_Base_Station.sbn",
+          "size_bytes": 4433748,
+          "sha256": "fbcb0bfe410bd54cfa29c1c70f8b5eb4ec17727baf2889af84ed7d55b30c96e3"
+        },
+        {
+          "path": "points_shp/USA_Clear_LTE_Base_Station/USA_Clear_LTE_Base_Station.sbx",
+          "size_bytes": 46828,
+          "sha256": "207d58b172d7b7635382acead56bde92cb79f71fffa9f449cbffe4fbdd83adee"
+        },
+        {
+          "path": "points_shp/USA_Clear_LTE_Base_Station/USA_Clear_LTE_Base_Station.shp",
+          "size_bytes": 13806340,
+          "sha256": "9a6ebfc6c66134c3e786dedb3705641d04de609d7365c9def1800eae95e9b30a"
+        },
+        {
+          "path": "points_shp/USA_Clear_LTE_Base_Station/USA_Clear_LTE_Base_Station.shp.xml",
+          "size_bytes": 9827,
+          "sha256": "96e93c69b57ff7f6c0ec14fb9fd968d2f9cd0cd8c106758de4dd5ce24205f90a"
+        },
+        {
+          "path": "points_shp/USA_Clear_LTE_Base_Station/USA_Clear_LTE_Base_Station.shx",
+          "size_bytes": 3944740,
+          "sha256": "c2c0c3cf2b27eee1b3dbf6b9fa0a15b3178daa112ffdba38532e2c0efbd8991b"
+        }
+      ]
+    },
+    {
+      "dataset_id": "administrative_boundaries",
+      "path": "boundary_shp",
+      "source_url": null,
+      "provider": "Repository owner supplied datasets",
+      "license": "Public redistribution permission confirmed by repository owner",
+      "download_date": null,
+      "crs": "EPSG:3857",
+      "spatial_resolution": "polygon vector",
+      "notes": "Includes the city and study-area boundary Shapefiles tracked in this repository.",
+      "files": [
+        {
+          "path": "boundary_shp/Arizona_Maricopa_Phoenix/Arizona_Maricopa_Phoenix.cpg",
+          "size_bytes": 5,
+          "sha256": "3ad3031f5503a4404af825262ee8232cc04d4ea6683d42c5dd0a2f2a27ac9824"
+        },
+        {
+          "path": "boundary_shp/Arizona_Maricopa_Phoenix/Arizona_Maricopa_Phoenix.dbf",
+          "size_bytes": 378,
+          "sha256": "f66a28ce34e64e19cf24a9dd2bcbdeb9ad8b5f7da6d691990013546b4df5eece"
+        },
+        {
+          "path": "boundary_shp/Arizona_Maricopa_Phoenix/Arizona_Maricopa_Phoenix.prj",
+          "size_bytes": 425,
+          "sha256": "f2e7fb14d55bdd8d6a3bc2c272a48729d8f9d0ad72936e20eae6a9a81c2fccd0"
+        },
+        {
+          "path": "boundary_shp/Arizona_Maricopa_Phoenix/Arizona_Maricopa_Phoenix.sbn",
+          "size_bytes": 132,
+          "sha256": "a651fa9ac17f2d0e3b9aa867de96e777efff0ba782c3beea08ffaec552546ff0"
+        },
+        {
+          "path": "boundary_shp/Arizona_Maricopa_Phoenix/Arizona_Maricopa_Phoenix.sbx",
+          "size_bytes": 116,
+          "sha256": "2cc0d973845a91217407912a184c3fce819e921c211f5bbee632b1b2da04bb50"
+        },
+        {
+          "path": "boundary_shp/Arizona_Maricopa_Phoenix/Arizona_Maricopa_Phoenix.shp",
+          "size_bytes": 86952,
+          "sha256": "c76bafd36c6b90dfbe3c1089c1e5521cadb974dd82e3ff0f2ecf565edf0e3b8f"
+        },
+        {
+          "path": "boundary_shp/Arizona_Maricopa_Phoenix/Arizona_Maricopa_Phoenix.shp.xml",
+          "size_bytes": 41419,
+          "sha256": "99a62cfb3edc11f1f80f825033e2455bb64c0aaf2a32acaa85a7b713914b7633"
+        },
+        {
+          "path": "boundary_shp/Arizona_Maricopa_Phoenix/Arizona_Maricopa_Phoenix.shx",
+          "size_bytes": 108,
+          "sha256": "2adae5f254c4bbde479b83afe4efbbae185f4c860034333dc27ac7e76088fdb3"
+        },
+        {
+          "path": "boundary_shp/Chicago/Chicago_Boundary.cpg",
+          "size_bytes": 5,
+          "sha256": "3ad3031f5503a4404af825262ee8232cc04d4ea6683d42c5dd0a2f2a27ac9824"
+        },
+        {
+          "path": "boundary_shp/Chicago/Chicago_Boundary.dbf",
+          "size_bytes": 1040,
+          "sha256": "67c7f2e83379ddb067ddadb029d2ade05dfd50f89cd08194de2810261bc50f31"
+        },
+        {
+          "path": "boundary_shp/Chicago/Chicago_Boundary.prj",
+          "size_bytes": 425,
+          "sha256": "f2e7fb14d55bdd8d6a3bc2c272a48729d8f9d0ad72936e20eae6a9a81c2fccd0"
+        },
+        {
+          "path": "boundary_shp/Chicago/Chicago_Boundary.sbn",
+          "size_bytes": 132,
+          "sha256": "eefdc5bd7fdc93b3f59951a5a1de560d459ee162b60b44360ab6d52e188730f2"
+        },
+        {
+          "path": "boundary_shp/Chicago/Chicago_Boundary.sbx",
+          "size_bytes": 116,
+          "sha256": "ff832a578d0a4dac9873c4ef9c881b058c7ce50244ab39e907cb4deebfa08344"
+        },
+        {
+          "path": "boundary_shp/Chicago/Chicago_Boundary.shp",
+          "size_bytes": 17456,
+          "sha256": "ea98ab6e291e7be404dea068c3c76e02ab5cae586d977e14b9380e754fd02caa"
+        },
+        {
+          "path": "boundary_shp/Chicago/Chicago_Boundary.shp.xml",
+          "size_bytes": 12941,
+          "sha256": "38e43777b0d1eb541189725624e66f9f4b4743ab9704b8871cf99fe0f3e438b6"
+        },
+        {
+          "path": "boundary_shp/Chicago/Chicago_Boundary.shx",
+          "size_bytes": 108,
+          "sha256": "cb84e8316b23d3576cd4fec6ac083b9739881903df6e834520a4c2f3069faf55"
+        },
+        {
+          "path": "boundary_shp/Chicago_CBD/Chicago_CBD.CPG",
+          "size_bytes": 5,
+          "sha256": "3ad3031f5503a4404af825262ee8232cc04d4ea6683d42c5dd0a2f2a27ac9824"
+        },
+        {
+          "path": "boundary_shp/Chicago_CBD/Chicago_CBD.dbf",
+          "size_bytes": 710,
+          "sha256": "bfbab9aba0daf7d333de9c5b7216a562a1c649ce38f5c96e21292698ca2c862e"
+        },
+        {
+          "path": "boundary_shp/Chicago_CBD/Chicago_CBD.prj",
+          "size_bytes": 238,
+          "sha256": "00a681c97d09da0982b2634a54aafd0df99c38fa634f682d6b241d18213d5a42"
+        },
+        {
+          "path": "boundary_shp/Chicago_CBD/Chicago_CBD.shp",
+          "size_bytes": 23004,
+          "sha256": "817b8203e3c6828baf3de1ead5458a7ddb67a11ca127c07db3d753e71df10f07"
+        },
+        {
+          "path": "boundary_shp/Chicago_CBD/Chicago_CBD.shx",
+          "size_bytes": 108,
+          "sha256": "ad3fcf2de54616242bf54059ff45453512104edc69ffd178abcdf49ace085f3f"
+        },
+        {
+          "path": "boundary_shp/Massachusetts_Middlesex_Cambridge/Massachusetts_Middlesex_Cambridge.cpg",
+          "size_bytes": 5,
+          "sha256": "3ad3031f5503a4404af825262ee8232cc04d4ea6683d42c5dd0a2f2a27ac9824"
+        },
+        {
+          "path": "boundary_shp/Massachusetts_Middlesex_Cambridge/Massachusetts_Middlesex_Cambridge.dbf",
+          "size_bytes": 378,
+          "sha256": "37b4da7b6fd38f4cc768b83840134a53e03b14423d212bff2d4656c40a1fccad"
+        },
+        {
+          "path": "boundary_shp/Massachusetts_Middlesex_Cambridge/Massachusetts_Middlesex_Cambridge.prj",
+          "size_bytes": 425,
+          "sha256": "f2e7fb14d55bdd8d6a3bc2c272a48729d8f9d0ad72936e20eae6a9a81c2fccd0"
+        },
+        {
+          "path": "boundary_shp/Massachusetts_Middlesex_Cambridge/Massachusetts_Middlesex_Cambridge.sbn",
+          "size_bytes": 132,
+          "sha256": "e4ea6fff4f526852504b22d3dd3aa907f43fe47a8b9202f074b0b6d75c359f61"
+        },
+        {
+          "path": "boundary_shp/Massachusetts_Middlesex_Cambridge/Massachusetts_Middlesex_Cambridge.sbx",
+          "size_bytes": 116,
+          "sha256": "9e3fc63614a90ffb7456f9dd80b1d214d28754abaa7519a1a617fc80b7a23bc9"
+        },
+        {
+          "path": "boundary_shp/Massachusetts_Middlesex_Cambridge/Massachusetts_Middlesex_Cambridge.shp",
+          "size_bytes": 10972,
+          "sha256": "b163e51ae6c79b26fff6386a0baac39d237c6fef0b99b756b2a301f6cb38aed5"
+        },
+        {
+          "path": "boundary_shp/Massachusetts_Middlesex_Cambridge/Massachusetts_Middlesex_Cambridge.shp.xml",
+          "size_bytes": 41473,
+          "sha256": "d706ef2cdba399f39750cf44f7b97a10bdd421cd87a95aa45f72639d898754c2"
+        },
+        {
+          "path": "boundary_shp/Massachusetts_Middlesex_Cambridge/Massachusetts_Middlesex_Cambridge.shx",
+          "size_bytes": 108,
+          "sha256": "6aaff28c93c6d916c71aeaa0a613c66c77a7d5a81253a6872d38a85f303d8bc4"
+        },
+        {
+          "path": "boundary_shp/NewYorkState_NewYork/NewYorkState_NewYork.cpg",
+          "size_bytes": 5,
+          "sha256": "3ad3031f5503a4404af825262ee8232cc04d4ea6683d42c5dd0a2f2a27ac9824"
+        },
+        {
+          "path": "boundary_shp/NewYorkState_NewYork/NewYorkState_NewYork.dbf",
+          "size_bytes": 378,
+          "sha256": "a943ec3173a04409d2ad9395e54494e40c6dc214e3ef34ba2ca514ec5cd4bdb6"
+        },
+        {
+          "path": "boundary_shp/NewYorkState_NewYork/NewYorkState_NewYork.prj",
+          "size_bytes": 425,
+          "sha256": "f2e7fb14d55bdd8d6a3bc2c272a48729d8f9d0ad72936e20eae6a9a81c2fccd0"
+        },
+        {
+          "path": "boundary_shp/NewYorkState_NewYork/NewYorkState_NewYork.sbn",
+          "size_bytes": 132,
+          "sha256": "29707d78065e0c7379c5d38f12671047ebea5ea7f2d2b205399390ea22d6bc0d"
+        },
+        {
+          "path": "boundary_shp/NewYorkState_NewYork/NewYorkState_NewYork.sbx",
+          "size_bytes": 116,
+          "sha256": "2609424880d495599f84e2083db29eaf473cc30cb316548e8439ea13ab3af51e"
+        },
+        {
+          "path": "boundary_shp/NewYorkState_NewYork/NewYorkState_NewYork.shp",
+          "size_bytes": 542716,
+          "sha256": "f88837fc28f0a081aabbfa6532dc6c3c169e090d0219011c9f5d185c5a700d92"
+        },
+        {
+          "path": "boundary_shp/NewYorkState_NewYork/NewYorkState_NewYork.shp.xml",
+          "size_bytes": 41395,
+          "sha256": "421ed664cd69015bfdecf694a6d50bbefd768e9d1124b4a89edfa1901d83f422"
+        },
+        {
+          "path": "boundary_shp/NewYorkState_NewYork/NewYorkState_NewYork.shx",
+          "size_bytes": 108,
+          "sha256": "50191aac6aa348bb0c78daa3501b7442051eb7a51458cdcf2fe1921213dabf70"
+        }
+      ]
+    },
+    {
+      "dataset_id": "usgs_3dep_1m_dem",
+      "path": "dem",
+      "source_url": "https://developers.google.com/earth-engine/datasets/catalog/USGS_3DEP_1m",
+      "provider": "United States Geological Survey",
+      "license": "USGS public-domain data; retain source attribution",
+      "download_date": null,
+      "crs": "EPSG:3857",
+      "spatial_resolution": "1 m",
+      "notes": "External local input. Download with the documented Earth Engine workflow; DEM files are excluded from Git.",
+      "external": true,
+      "files": [
+        {
+          "path": "dem/README.md",
+          "size_bytes": 1592,
+          "sha256": "9b5738deed94d3717b3f2b7d98b9581a3d87f3dde5937ad255e65a71ae75087d"
+        },
+        {
+          "path": "dem/USGS_1M_DEM_Chicago/README.md",
+          "size_bytes": 236,
+          "sha256": "cd0a62344c964b1a3f00b9a599d86e08fbba993da3531b1fc1fa2f5db0d7d522"
+        },
+        {
+          "path": "dem/USGS_1M_DEM_Chicago/USGS_1M_DEM_Chicago.tfw",
+          "size_bytes": 92,
+          "sha256": "c4ed00501071726b38b4192239bab3ec7a5ef6e218bf9a5acd5b3d36922bad1a"
+        },
+        {
+          "path": "dem/USGS_1M_DEM_Chicago/USGS_1M_DEM_Chicago.tif",
+          "size_bytes": 10491786671,
+          "sha256": "6e758df2bdd4c91ed1f835ab72cf2440cb888b96ab7167c7c3f8630851363841"
+        },
+        {
+          "path": "dem/USGS_1M_DEM_Chicago/USGS_1M_DEM_Chicago.tif.aux.xml",
+          "size_bytes": 2757,
+          "sha256": "69cb4d3d5181135d08d3b50478aa9a9ddbe99ab65f01ff42f29d4eb14368aa6b"
+        },
+        {
+          "path": "dem/USGS_1M_DEM_Chicago/USGS_1M_DEM_Chicago.tif.ovr",
+          "size_bytes": 996870295,
+          "sha256": "96eeba0106f5af62278ce055a70d7bf7a779cbe2b162ba4888253f44d5260f21"
+        }
+      ]
+    }
+  ]
+}
