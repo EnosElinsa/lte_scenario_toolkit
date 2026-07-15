@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from src.config import load_experiment_config
+from lte_scenario_toolkit.config import load_experiment_config
 
 
 def write_config(path: Path, *, strategy: str = "uniform") -> None:

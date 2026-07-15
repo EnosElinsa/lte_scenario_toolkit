@@ -4,7 +4,7 @@ import json
 import geopandas as gpd
 from shapely.geometry import Point
 
-from src.io import (
+from lte_scenario_toolkit.io import (
     build_dataset_record,
     build_output_dataframe,
     create_data_manifest,

@@ -5,7 +5,11 @@ from rasterio.io import MemoryFile
 from rasterio.transform import from_origin
 from shapely.geometry import Point
 
-from src.terrain import extract_elevation, require_valid_elevations, validate_dem_path
+from lte_scenario_toolkit.terrain import (
+    extract_elevation,
+    require_valid_elevations,
+    validate_dem_path,
+)
 
 
 def test_extract_elevation_handles_values_nodata_and_outside_points():

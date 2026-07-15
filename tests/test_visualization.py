@@ -7,7 +7,7 @@ from shapely.geometry import Point, box
 
 matplotlib.use("Agg")
 
-from src.visualization import render_3d_terrain, save_preview  # noqa: E402
+from lte_scenario_toolkit.visualization import render_3d_terrain, save_preview  # noqa: E402
 
 
 def test_save_preview_writes_noninteractive_png(tmp_path):

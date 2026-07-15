@@ -43,6 +43,7 @@ def test_packaging_declares_research_cli_commands():
     metadata = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     scripts = metadata["project"]["scripts"]
 
-    assert scripts["lte-select-sites"] == "select_sites:main"
-    assert scripts["lte-generate-figures"] == "generate_scenario_figures:main"
-    assert scripts["lte-download-newyork-dem"] == "download_newyork_1m_dem:main"
+    assert metadata["project"]["name"] == "lte_scenario_toolkit"
+    assert scripts["lte-select-sites"] == "lte_scenario_toolkit.select_sites:main"
+    assert scripts["lte-generate-figures"] == "lte_scenario_toolkit.generate_figures:main"
+    assert scripts["lte-download-newyork-dem"] == "lte_scenario_toolkit.newyork_dem:main"

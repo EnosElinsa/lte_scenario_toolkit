@@ -4,7 +4,11 @@ import geopandas as gpd
 import pytest
 from shapely.geometry import Point, box
 
-from src.spatial import discover_boundary_layers, prepare_spatial_data, resolve_io_paths
+from lte_scenario_toolkit.spatial import (
+    discover_boundary_layers,
+    prepare_spatial_data,
+    resolve_io_paths,
+)
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 

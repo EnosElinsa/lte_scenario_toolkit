@@ -3,7 +3,7 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "usa-lte-base-station-data"
+name = "lte_scenario_toolkit"
 version = "0.1.0"
 description = "Reproducible LTE base-station scenario generation with administrative boundaries and DEM terrain data."
 readme = "README.md"
@@ -24,17 +24,12 @@ dependencies = [
 ]
 
 [project.scripts]
-lte-select-sites = "select_sites:main"
-lte-generate-figures = "generate_scenario_figures:main"
-lte-download-newyork-dem = "download_newyork_1m_dem:main"
+lte-select-sites = "lte_scenario_toolkit.select_sites:main"
+lte-generate-figures = "lte_scenario_toolkit.generate_figures:main"
+lte-download-newyork-dem = "lte_scenario_toolkit.newyork_dem:main"
 
-[tool.setuptools]
-packages = ["src"]
-py-modules = [
-  "select_sites",
-  "generate_scenario_figures",
-  "download_newyork_1m_dem",
-]
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [project.optional-dependencies]
 dev = [

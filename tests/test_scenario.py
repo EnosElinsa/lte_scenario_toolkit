@@ -2,7 +2,12 @@ import numpy as np
 import pytest
 from shapely.geometry import box
 
-from src.scenario import choose_result, generate_scan_positions, scan_rectangles, validate_results
+from lte_scenario_toolkit.scenario import (
+    choose_result,
+    generate_scan_positions,
+    scan_rectangles,
+    validate_results,
+)
 
 
 def test_generate_scan_positions_is_deterministic_for_uniform_strategy():
