@@ -18,12 +18,13 @@ def command_help(script: str) -> str:
 
 
 def test_select_sites_exposes_reproducible_configuration_arguments():
-    help_text = command_help("select_sites.py")
+    help_text = command_help("scripts/select_sites.py")
 
     assert "--config" in help_text
     assert "--city" in help_text
     assert "--output-dir" in help_text
     assert "--select-index" in help_text
+    assert not (ROOT / "select_sites.py").exists()
 
 
 def test_figure_generator_exposes_reproducible_configuration_arguments():

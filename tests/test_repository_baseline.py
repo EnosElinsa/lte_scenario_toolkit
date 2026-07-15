@@ -30,13 +30,13 @@ def test_large_and_generated_paths_are_protected():
     assert "points_shp/**/*.shp filter=lfs" in attributes
 
 
-def test_existing_python_entry_points_compile():
-    for relative_path in (
-        "select_sites.py",
-        "generate_scenario_figures.py",
-        "download_newyork_1m_dem.py",
-    ):
-        py_compile.compile(str(ROOT / relative_path), doraise=True)
+def test_packaged_python_modules_and_scripts_compile():
+    python_files = sorted((ROOT / "src" / "lte_scenario_toolkit").glob("*.py"))
+    python_files.extend(sorted((ROOT / "scripts").glob("*.py")))
+
+    assert python_files
+    for path in python_files:
+        py_compile.compile(str(path), doraise=True)
 
 
 def test_packaging_declares_research_cli_commands():
