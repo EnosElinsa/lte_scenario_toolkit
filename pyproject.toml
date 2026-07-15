@@ -27,6 +27,7 @@ dependencies = [
 lte-select-sites = "lte_scenario_toolkit.select_sites:main"
 lte-generate-figures = "lte_scenario_toolkit.generate_figures:main"
 lte-download-newyork-dem = "lte_scenario_toolkit.newyork_dem:main"
+lte-data = "lte_scenario_toolkit.data_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

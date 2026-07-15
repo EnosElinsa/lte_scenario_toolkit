@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
+import os
 import re
 import shutil
 import stat
+import tempfile
 import urllib.error
 import urllib.request
 import zipfile
@@ -14,6 +17,17 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 import geopandas as gpd
+import yaml
+
+from .data_catalog import (
+    SCENARIO_ID_PATTERN,
+    CatalogError,
+    DataCatalog,
+    load_data_catalog,
+    save_data_catalog,
+    update_data_manifest,
+    validate_catalog_document,
+)
 
 _VECTOR_SUFFIXES = frozenset({".shp", ".geojson", ".json", ".gpkg"})
 _SHAPEFILE_REQUIRED_SUFFIXES = (".shp", ".shx", ".dbf", ".prj")
@@ -95,6 +109,142 @@ class _VectorLayer:
             aliases.add(f"{self.path.stem}:{self.layer}")
             aliases.add(f"{relative}:{self.layer}")
         return aliases
+
+
+def _restore_bytes(path: Path, original: bytes | None) -> None:
+    """Atomically restore a file snapshot, or remove a newly created file."""
+
+    if original is None:
+        path.unlink(missing_ok=True)
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{path.name}.",
+            suffix=".rollback",
+            dir=path.parent,
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            stream.write(original)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _safe_repository_path(root: Path, *parts: str) -> Path:
+    """Return a fixed repository path after rejecting symlink traversal."""
+
+    repository = root.resolve()
+    relative = Path(*parts)
+    candidate = repository / relative
+    current = repository
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            raise BoundaryImportError(
+                f"Repository transaction path must not use symlinks: {candidate}"
+            )
+    resolved = candidate.resolve(strict=False)
+    try:
+        resolved.relative_to(repository)
+    except ValueError as exc:
+        raise BoundaryImportError(
+            f"Repository transaction path escapes repository root: {candidate}"
+        ) from exc
+    return candidate
+
+
+def _optional_bytes(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def _restore_owned_bytes(path: Path, original: bytes, written: bytes | None) -> None:
+    """Restore a catalog only when it still contains this transaction's bytes."""
+
+    if written is not None and _optional_bytes(path) == written:
+        _restore_bytes(path, original)
+
+
+def _rollback_registration(
+    *,
+    destination: Path,
+    installed: bool,
+    destination_parent: Path,
+    destination_parent_existed: bool,
+    catalog_path: Path,
+    original_catalog: bytes,
+    written_catalog: bytes | None,
+    manifest_path: Path,
+    original_manifest: bytes | None,
+    manifest_update_started: bool,
+    operation_error: Exception,
+) -> None:
+    failures: list[tuple[str, Exception]] = []
+    if installed:
+        try:
+            shutil.rmtree(destination)
+        except Exception as exc:
+            failures.append(("destination", exc))
+
+    try:
+        _restore_owned_bytes(catalog_path, original_catalog, written_catalog)
+    except Exception as exc:
+        failures.append(("catalog", exc))
+    if manifest_update_started:
+        try:
+            if _optional_bytes(manifest_path) != original_manifest:
+                _restore_bytes(manifest_path, original_manifest)
+        except Exception as exc:
+            failures.append(("manifest", exc))
+
+    if not destination_parent_existed and not os.path.lexists(destination):
+        try:
+            destination_parent.rmdir()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+    if failures:
+        details = "; ".join(f"{name}: {error}" for name, error in failures)
+        raise BoundaryImportError(f"Scenario rollback failed: {details}") from operation_error
+
+
+def _cleanup_staging(
+    transaction_dir: Path,
+    staging_root: Path,
+    *,
+    staging_root_existed: bool,
+) -> None:
+    try:
+        shutil.rmtree(transaction_dir)
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        raise BoundaryImportError(
+            f"Scenario staging cleanup failed: {transaction_dir}"
+        ) from exc
+
+    if not staging_root_existed:
+        try:
+            staging_root.rmdir()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise BoundaryImportError(
+                f"Scenario staging cleanup failed: {staging_root}"
+            ) from exc
 
 
 def _safe_zip_member_path(
@@ -661,3 +811,228 @@ def import_boundary_source(
         geometry_type=output_geometry.geom_type,
         feature_count=len(normalized),
     )
+
+
+def _required_text(value: str, *, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise BoundaryImportError(f"{field} must be a non-empty string")
+    return value.strip()
+
+
+def _catalog_path(value: str | Path | None) -> str | None:
+    if value is None:
+        return None
+    return Path(value).as_posix()
+
+
+def _registration_records(
+    artifact: BoundaryArtifact,
+    *,
+    scenario_id: str,
+    display_name: str,
+    provider: str,
+    license_name: str,
+    download_date: str | None,
+    config_path: str | Path | None,
+) -> tuple[dict, dict, dict]:
+    token = scenario_id.replace("-", "_")
+    boundary_id = f"boundary_{token}"
+    dem_id = f"usgs_3dep_1m_dem_{token}"
+    boundary_directory = f"boundary_shp/{scenario_id}"
+    dem_directory = f"dem/{scenario_id}"
+    export_prefix = f"usgs_3dep_1m_{scenario_id}"
+
+    boundary = {
+        "dataset_id": boundary_id,
+        "role": "boundary",
+        "path": boundary_directory,
+        "entrypoint": f"{boundary_directory}/{scenario_id}.shp",
+        "source_url": artifact.source_url,
+        "source_file_sha256": artifact.source_sha256,
+        "provider": provider,
+        "license": license_name,
+        "download_date": download_date,
+        "crs": artifact.crs,
+        "spatial_resolution": "polygon vector",
+        "geometry_type": artifact.geometry_type,
+        "feature_count": artifact.feature_count,
+        "redistribution_confirmed": True,
+        "notes": "Normalized, dissolved scenario boundary in EPSG:3857.",
+    }
+    dem = {
+        "dataset_id": dem_id,
+        "role": "dem",
+        "path": dem_directory,
+        "entrypoint": f"{dem_directory}/{export_prefix}.tif",
+        "source_url": "https://developers.google.com/earth-engine/datasets/catalog/USGS_3DEP_1m",
+        "provider": "United States Geological Survey",
+        "license": "USGS public-domain data; retain source attribution",
+        "download_date": None,
+        "crs": "EPSG:3857",
+        "spatial_resolution": "1 m",
+        "notes": "Pending external Earth Engine export for this scenario.",
+        "external": True,
+        "earth_engine_collection": "USGS/3DEP/1m",
+        "band": "elevation",
+        "units": "metres",
+        "vertical_datum": "NAVD88",
+        "native_scale_m": 1,
+        "export_crs": "EPSG:3857",
+        "export_prefix": export_prefix,
+        "drive_folder": "lte-scenario-toolkit-dem",
+    }
+    scenario = {
+        "scenario_id": scenario_id,
+        "display_name": display_name,
+        "boundary_dataset_id": boundary_id,
+        "dem_dataset_id": dem_id,
+        "config_path": _catalog_path(config_path),
+    }
+    return boundary, dem, scenario
+
+
+def register_scenario(
+    catalog_path: str | Path,
+    *,
+    scenario_id: str,
+    display_name: str,
+    boundary_source: str | Path,
+    provider: str,
+    license_name: str,
+    redistribution_confirmed: bool,
+    layer: str | None = None,
+    download_date: str | None = None,
+    config_path: str | Path | None = None,
+) -> DataCatalog:
+    """Register a normalized boundary and pending DEM declaration transactionally."""
+
+    if redistribution_confirmed is not True:
+        raise BoundaryImportError("Boundary redistribution must be explicitly confirmed")
+    if not isinstance(scenario_id, str) or SCENARIO_ID_PATTERN.fullmatch(scenario_id) is None:
+        raise BoundaryImportError(f"scenario_id must match {SCENARIO_ID_PATTERN.pattern}")
+    scenario = _validate_scenario_id(scenario_id)
+    name = _required_text(display_name, field="display_name")
+    provider_name = _required_text(provider, field="provider")
+    declared_license = _required_text(license_name, field="license")
+
+    catalog = load_data_catalog(catalog_path)
+    token = scenario.replace("-", "_")
+    boundary_id = f"boundary_{token}"
+    dem_id = f"usgs_3dep_1m_dem_{token}"
+    if scenario in catalog.scenarios_by_id:
+        raise CatalogError(f"Scenario already exists: {scenario}")
+    for dataset_id in (boundary_id, dem_id):
+        if dataset_id in catalog.datasets_by_id:
+            raise CatalogError(f"Dataset already exists: {dataset_id}")
+
+    destination_parent = _safe_repository_path(catalog.root, "boundary_shp")
+    destination = _safe_repository_path(catalog.root, "boundary_shp", scenario)
+    staging_root = _safe_repository_path(catalog.root, ".lte-data")
+    manifest_path = _safe_repository_path(catalog.root, "data", "manifest.json")
+    if os.path.lexists(destination):
+        raise BoundaryImportError(f"Boundary destination already exists: {destination}")
+    if os.path.lexists(destination_parent) and not destination_parent.is_dir():
+        raise BoundaryImportError(
+            f"Boundary destination parent is not a directory: {destination_parent}"
+        )
+    if os.path.lexists(staging_root) and not staging_root.is_dir():
+        raise BoundaryImportError(f"Staging path is not a directory: {staging_root}")
+    if os.path.lexists(manifest_path.parent) and not manifest_path.parent.is_dir():
+        raise BoundaryImportError(
+            f"Data manifest parent must be a directory: {manifest_path.parent}"
+        )
+    if os.path.lexists(manifest_path) and not manifest_path.is_file():
+        raise BoundaryImportError(f"Data manifest path must be a file: {manifest_path}")
+
+    original_catalog = catalog.path.read_bytes()
+    staging_root_existed = staging_root.exists()
+    try:
+        staging_root.mkdir(parents=True, exist_ok=True)
+        transaction_dir = Path(
+            tempfile.mkdtemp(prefix=f"scenario-{scenario}-", dir=staging_root)
+        )
+    except OSError as exc:
+        if not staging_root_existed:
+            try:
+                staging_root.rmdir()
+            except OSError:
+                pass
+        raise BoundaryImportError(f"Could not create scenario staging directory: {staging_root}") from exc
+    destination_parent_existed = destination_parent.exists()
+    installed = False
+    written_catalog: bytes | None = None
+    original_manifest: bytes | None = None
+    manifest_update_started = False
+    operation_error: Exception | None = None
+
+    try:
+        artifact = import_boundary_source(
+            boundary_source,
+            scenario_id=scenario,
+            display_name=name,
+            staging_dir=transaction_dir / "boundary",
+            layer=layer,
+        )
+        boundary, dem, scenario_record = _registration_records(
+            artifact,
+            scenario_id=scenario,
+            display_name=name,
+            provider=provider_name,
+            license_name=declared_license,
+            download_date=download_date,
+            config_path=config_path,
+        )
+        document = copy.deepcopy(catalog.document)
+        document["datasets"].extend((boundary, dem))
+        document["scenarios"].append(scenario_record)
+        validate_catalog_document(document, catalog.root)
+        written_catalog = yaml.safe_dump(
+            document,
+            sort_keys=False,
+            allow_unicode=True,
+        ).encode("utf-8")
+
+        try:
+            destination_parent.mkdir(parents=True, exist_ok=True)
+            if os.path.lexists(destination):
+                raise BoundaryImportError(f"Boundary destination already exists: {destination}")
+            artifact.directory.replace(destination)
+            installed = True
+            saved_catalog = save_data_catalog(catalog, document)
+            original_manifest = _optional_bytes(manifest_path)
+            manifest_update_started = True
+            update_data_manifest(
+                saved_catalog,
+                "data/manifest.json",
+                dataset_ids={boundary_id, dem_id},
+            )
+        except Exception as exc:
+            _rollback_registration(
+                destination=destination,
+                installed=installed,
+                destination_parent=destination_parent,
+                destination_parent_existed=destination_parent_existed,
+                catalog_path=catalog.path,
+                original_catalog=original_catalog,
+                written_catalog=written_catalog,
+                manifest_path=manifest_path,
+                original_manifest=original_manifest,
+                manifest_update_started=manifest_update_started,
+                operation_error=exc,
+            )
+            raise
+        return saved_catalog
+    except Exception as exc:
+        operation_error = exc
+        raise
+    finally:
+        try:
+            _cleanup_staging(
+                transaction_dir,
+                staging_root,
+                staging_root_existed=staging_root_existed,
+            )
+        except BoundaryImportError as cleanup_error:
+            if operation_error is None:
+                raise
+            raise operation_error from cleanup_error
