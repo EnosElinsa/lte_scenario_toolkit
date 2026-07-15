@@ -648,16 +648,56 @@ def test_inspect_dem_shards_distinguishes_nan_nodata_from_absent_nodata(tmp_path
         inspect_dem_shards(tiles, prefix="dem_")
 
 
-def test_inspect_dem_shards_rejects_invalid_internal_mask_without_nodata(tmp_path):
-    from lte_scenario_toolkit.dem_data import DemIngestError, inspect_dem_shards
+def test_merge_dem_shards_preserves_all_invalid_internal_mask_without_nodata(tmp_path):
+    from lte_scenario_toolkit.dem_data import (
+        DemIngestError,
+        inspect_dem_shards,
+        merge_dem_shards,
+        validate_dem_coverage,
+    )
 
     tiles = tmp_path / "tiles"
     path = _write_dem_tile(tiles / "dem_masked.tif", left=0, top=2, nodata=None)
     with rasterio.open(path, "r+") as dataset:
         dataset.write_mask(np.zeros((2, 2), dtype=np.uint8))
 
-    with pytest.raises(DemIngestError, match="mask.*nodata|nodata.*mask"):
-        inspect_dem_shards(tiles, prefix="dem_")
+    shards = inspect_dem_shards(tiles, prefix="dem_")
+    output = tmp_path / "merged" / "dem.tif"
+    output.parent.mkdir()
+    merge_dem_shards(shards, output)
+    with rasterio.open(output) as dataset:
+        assert dataset.nodata == np.finfo(np.float32).min
+        assert np.ma.getmaskarray(dataset.read(1, masked=True)).all()
+
+    boundary = tmp_path / "boundary.geojson"
+    gpd.GeoDataFrame({"name": ["city"]}, geometry=[box(0, 0, 2, 2)], crs="EPSG:3857").to_file(boundary, driver="GeoJSON")
+    with pytest.raises(DemIngestError, match="no valid"):
+        validate_dem_coverage(
+            output, boundary, expected_crs="EPSG:3857", expected_resolution=(1.0, 1.0)
+        )
+
+
+def test_merge_dem_shards_preserves_valid_values_next_to_masked_pixels(tmp_path):
+    from lte_scenario_toolkit.dem_data import inspect_dem_shards, merge_dem_shards
+
+    tiles = tmp_path / "tiles"
+    path = _write_dem_tile(
+        tiles / "dem_mixed.tif",
+        left=0,
+        top=2,
+        values=np.array([[1, 2], [3, 4]], dtype=np.float32),
+        nodata=None,
+    )
+    with rasterio.open(path, "r+") as dataset:
+        dataset.write_mask(np.array([[0, 255], [255, 255]], dtype=np.uint8))
+    shards = inspect_dem_shards(tiles, prefix="dem_")
+    output = tmp_path / "merged" / "dem.tif"
+    output.parent.mkdir()
+    merge_dem_shards(shards, output)
+    with rasterio.open(output) as dataset:
+        values = dataset.read(1, masked=True)
+        assert values.mask.tolist() == [[True, False], [False, False]]
+        assert values[0, 1] == pytest.approx(2)
 
 
 def test_inspect_dem_shards_rejects_even_small_rotation(tmp_path):

@@ -574,23 +574,17 @@ def _footprint(dataset: rasterio.io.DatasetReader):
     return box(left, bottom, right, top)
 
 
-def _reject_unrepresentable_mask(
-    dataset: rasterio.io.DatasetReader, *, path: Path, nodata: float | None
-) -> None:
-    """Reject invalid internal masks that a nodata-less merge would erase."""
+def _dataset_has_invalid_mask(dataset: rasterio.io.DatasetReader) -> bool:
+    """Report whether a source mask contains invalid pixels."""
 
-    if nodata is not None:
-        return
     flags = dataset.mask_flag_enums[0]
     if not flags or MaskFlags.all_valid in flags:
-        return
+        return False
     for _, window in dataset.block_windows(1):
         mask = dataset.dataset_mask(window=window)
         if np.any(mask == 0):
-            raise DemIngestError(
-                f"DEM shard {path.name} has invalid internal mask pixels but no nodata value; "
-                "declare an explicit nodata value before merging"
-            )
+            return True
+    return False
 
 
 def inspect_dem_shards(tiles_dir: str | Path, *, prefix: str) -> DemShardSet:
@@ -651,9 +645,6 @@ def inspect_dem_shards(tiles_dir: str | Path, *, prefix: str) -> DemShardSet:
                         f"DEM shard {path.name} must use a floating-point dtype; found {shard_dtype}"
                     )
                 shard_nodata = _normalise_nodata(dataset.nodata)
-                _reject_unrepresentable_mask(
-                    dataset, path=path, nodata=shard_nodata
-                )
                 transform = dataset.transform
                 shard_origin = (float(transform.c), float(transform.f))
 
@@ -753,6 +744,19 @@ def _overview_levels(width: int, height: int) -> list[int]:
     return [factor for factor in (2, 4, 8, 16, 32, 64) if factor <= minimum_dimension]
 
 
+def _safe_merge_nodata(dtype: np.dtype) -> float | int:
+    """Choose a representable sentinel when source masks have no nodata value."""
+
+    if np.issubdtype(dtype, np.floating):
+        # Keep the NumPy scalar dtype so rasterio.merge's safe-cast check does
+        # not widen the sentinel to float64 and discard it for float32 data.
+        sentinel = dtype.type(np.finfo(dtype).min)
+        return sentinel.item() if dtype.itemsize > 4 else sentinel
+    if np.issubdtype(dtype, np.integer):
+        return dtype.type(np.iinfo(dtype).min)
+    raise DemIngestError(f"Cannot choose a nodata sentinel for dtype {dtype}")
+
+
 def merge_dem_shards(shards: DemShardSet, destination: str | Path) -> Path:
     """Stream validated shards into one tiled, compressed GeoTIFF."""
 
@@ -769,6 +773,13 @@ def merge_dem_shards(shards: DemShardSet, destination: str | Path) -> Path:
     try:
         dtype = np.dtype(shards.dtype)
         predictor = 3 if np.issubdtype(dtype, np.floating) else 2
+        merge_nodata: float | int | None = shards.nodata
+        if merge_nodata is None:
+            for path in shards.paths:
+                with rasterio.open(path) as source:
+                    if _dataset_has_invalid_mask(source):
+                        merge_nodata = _safe_merge_nodata(dtype)
+                        break
         dst_kwds = {
             "driver": "GTiff",
             "BIGTIFF": "YES",
@@ -782,7 +793,7 @@ def merge_dem_shards(shards: DemShardSet, destination: str | Path) -> Path:
             list(shards.paths),
             bounds=shards.bounds,
             res=shards.resolution,
-            nodata=shards.nodata,
+            nodata=merge_nodata,
             dtype=shards.dtype,
             mem_limit=64,
             dst_path=output,
