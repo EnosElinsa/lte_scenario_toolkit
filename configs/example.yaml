@@ -1,0 +1,29 @@
+experiment:
+  name: chicago_example
+  random_seed: 42
+
+inputs:
+  points_root: points_shp
+  points_layer: USA_Clear_LTE_Base_Station
+  boundary_root: boundary_shp
+  city: Chicago
+  dem_path: dem/USGS_1M_DEM_Chicago/USGS_1M_DEM_Chicago.tif
+
+spatial:
+  target_crs: EPSG:3857
+  rectangle_size_m: 3000
+  target_base_station_count: 30
+  count_tolerance: 0
+
+scan:
+  strategy: uniform
+  step_m: 10
+  max_rectangles: 100
+  minimum_center_spacing_m: 3000
+
+outputs:
+  root: results/chicago_example
+  save_csv: true
+  save_preview_png: true
+  save_terrain_png: true
+  save_terrain_eps: true
