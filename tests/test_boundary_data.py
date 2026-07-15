@@ -341,3 +341,97 @@ def test_zip_metadata_json_is_not_treated_as_a_vector_layer(tmp_path):
     )
 
     assert artifact.entrypoint.is_file()
+
+
+def test_remote_budget_overflow_is_not_retried_with_case_variant_sidecar(
+    tmp_path, monkeypatch
+):
+    module = importlib.import_module("lte_scenario_toolkit.boundary_data")
+    requested = []
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            self.close()
+
+    def fake_urlopen(url, *, timeout):
+        del timeout
+        requested.append(str(url))
+        if str(url).endswith(".SHP"):
+            return Response(b"1")
+        if str(url).endswith(".SHX"):
+            return Response(b"234567")
+        if str(url).endswith(".shx"):
+            return Response(b"2")
+        raise module.urllib.error.HTTPError(str(url), 404, "missing", None, None)
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(module, "MAX_REMOTE_BYTES", 5)
+    with pytest.raises(ValueError, match="maximum|limit|bytes"):
+        module.import_boundary_source(
+            "https://example.test/boundary.SHP",
+            scenario_id="budget-retry",
+            display_name="Budget",
+            staging_dir=tmp_path / "stage",
+        )
+
+    assert requested == [
+        "https://example.test/boundary.SHP",
+        "https://example.test/boundary.SHX",
+    ]
+
+
+def test_remote_optional_cpg_does_not_swallow_budget_overflow(tmp_path, monkeypatch):
+    module = importlib.import_module("lte_scenario_toolkit.boundary_data")
+    source = _write_geojson(tmp_path / "source.geojson", [box(0, 0, 1, 1)])
+    shapefile = tmp_path / "source.shp"
+    gpd.read_file(source).to_file(shapefile, driver="ESRI Shapefile", encoding="UTF-8")
+    required = [shapefile.with_suffix(suffix).read_bytes() for suffix in (".shp", ".shx", ".dbf", ".prj")]
+    payloads = {
+        f"https://example.test/boundary{suffix}": shapefile.with_suffix(suffix).read_bytes()
+        for suffix in (".shp", ".shx", ".dbf", ".prj", ".cpg")
+    }
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            self.close()
+
+    def fake_urlopen(url, *, timeout):
+        del timeout
+        try:
+            return Response(payloads[str(url)])
+        except KeyError as exc:
+            raise module.urllib.error.HTTPError(str(url), 404, "missing", None, None) from exc
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(module, "MAX_REMOTE_BYTES", sum(map(len, required)) + 1)
+    with pytest.raises(ValueError, match="maximum|limit|bytes"):
+        module.import_boundary_source(
+            "https://example.test/boundary.shp",
+            scenario_id="budget-cpg",
+            display_name="Budget CPG",
+            staging_dir=tmp_path / "stage",
+        )
+
+
+def test_empty_unknown_json_is_not_treated_as_a_vector_layer(tmp_path):
+    module = importlib.import_module("lte_scenario_toolkit.boundary_data")
+    boundary = _write_geojson(tmp_path / "boundary.geojson", [box(0, 0, 1, 1)])
+    archive = tmp_path / "with-empty-metadata.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.write(boundary, arcname="boundary.geojson")
+        handle.writestr("metadata.json", '{"type": "FeatureCollection", "features": []}')
+
+    artifact = module.import_boundary_source(
+        archive,
+        scenario_id="empty-metadata",
+        display_name="Empty Metadata",
+        staging_dir=tmp_path / "stage",
+    )
+
+    assert artifact.entrypoint.is_file()

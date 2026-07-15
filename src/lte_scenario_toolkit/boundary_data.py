@@ -43,6 +43,10 @@ class BoundaryImportError(ValueError):
     """Raised when a boundary source cannot be safely imported."""
 
 
+class _BoundaryDownloadLimitError(BoundaryImportError):
+    """Internal marker preventing retries after a remote size limit is hit."""
+
+
 @dataclass(frozen=True)
 class BoundaryArtifact:
     """A normalized boundary and the provenance of its staged source."""
@@ -339,7 +343,7 @@ def _download_url(url: str, target: Path, *, budget: _DownloadBudget) -> Path:
         with urllib.request.urlopen(url, timeout=REMOTE_TIMEOUT_SECONDS) as response:
             content_length = _response_content_length(response)
             if content_length is not None and content_length > remaining:
-                raise BoundaryImportError(
+                raise _BoundaryDownloadLimitError(
                     f"Remote boundary download exceeds maximum size ({MAX_REMOTE_BYTES} bytes)"
                 )
             downloaded = 0
@@ -349,13 +353,13 @@ def _download_url(url: str, target: Path, *, budget: _DownloadBudget) -> Path:
                     if not chunk:
                         break
                     downloaded += len(chunk)
+                    budget.consumed += len(chunk)
                     if downloaded > remaining:
-                        raise BoundaryImportError(
+                        raise _BoundaryDownloadLimitError(
                             f"Remote boundary download exceeds maximum size "
                             f"({MAX_REMOTE_BYTES} bytes)"
                         )
                     output.write(chunk)
-            budget.consumed += downloaded
     except BoundaryImportError:
         target.unlink(missing_ok=True)
         raise
@@ -376,6 +380,8 @@ def _download_remote_component(
     for component_url in _url_suffix_variants(source_url, suffix):
         try:
             return _download_url(component_url, target, budget=budget), component_url
+        except _BoundaryDownloadLimitError:
+            raise
         except BoundaryImportError as exc:
             errors.append(exc)
     detail = "; ".join(str(error) for error in errors)
@@ -405,6 +411,8 @@ def _stage_remote_source(url: str, source_dir: Path) -> _StagedSource:
                     budget=budget,
                 )
                 components.append(component)
+            except _BoundaryDownloadLimitError:
+                raise
             except BoundaryImportError as exc:
                 detail = f"Missing required remote Shapefile component {component_suffix}"
                 if component_suffix == ".prj":
@@ -419,6 +427,8 @@ def _stage_remote_source(url: str, source_dir: Path) -> _StagedSource:
                     budget=budget,
                 )
                 components.append(component)
+            except _BoundaryDownloadLimitError:
+                raise
             except BoundaryImportError:
                 pass
         return _StagedSource(primary, tuple(components))
@@ -466,10 +476,24 @@ def _is_usable_json_vector(path: Path) -> bool:
             frame = gpd.read_file(path)
         except Exception:
             return False
-        return hasattr(frame, "geometry")
+        return _has_nonempty_geometry(frame)
     if available.empty or "geometry_type" not in available.columns:
         return False
-    return bool(available["geometry_type"].notna().any())
+    geometry_types = available["geometry_type"].dropna().astype(str)
+    if geometry_types.empty or any(value.casefold() == "unknown" for value in geometry_types):
+        return False
+    try:
+        frame = gpd.read_file(path)
+    except Exception:
+        return False
+    return _has_nonempty_geometry(frame)
+
+
+def _has_nonempty_geometry(frame: gpd.GeoDataFrame) -> bool:
+    if not hasattr(frame, "geometry") or frame.empty:
+        return False
+    geometry = frame.geometry
+    return bool((geometry.notna() & ~geometry.is_empty).any())
 
 
 def _select_vector_layer(root: Path, requested: str | None) -> _VectorLayer:
