@@ -4,35 +4,37 @@
 
 ### `boundary_shp/`
 
-当前边界数据总量约 0.8 MiB，仓库所有者已确认具有公开再分发权限，因此直接纳入 Git。每个 Shapefile 目录中的 `.shp`、`.shx`、`.dbf`、`.prj`、`.cpg` 以及可用的索引/元数据文件应保持完整。
+The boundary data currently occupies approximately 0.8 MiB. The repository owner has confirmed public redistribution permission, so these files are stored directly in Git. Keep each Shapefile's `.shp`, `.shx`, `.dbf`, `.prj`, `.cpg`, and any available index or metadata files together.
 
-当前工作流统一使用 `EPSG:3857`，即 WGS 1984 Web Mercator Auxiliary Sphere。使用其他边界时，运行前需要检查 CRS、几何类型、要素数量和边界名称。
+The current workflow standardises inputs to `EPSG:3857`, WGS 84 / Pseudo-Mercator. Before using another boundary, verify its CRS, geometry type, feature count, and boundary name.
 
 ### `points_shp/`
 
-完整 LTE 基站点数据约 77 MiB，仓库所有者已确认可以公开。大型二进制文件通过 Git LFS 管理，克隆后执行：
+The complete LTE base-station dataset occupies approximately 77 MiB and is approved for public release by the repository owner. Large binary components are managed with Git LFS. After cloning, run:
 
 ```powershell
 git lfs pull
 ```
 
-Shapefile 组成文件必须一起保留。数据字段、来源和授权以目录内元数据及项目发布说明为准。
+All Shapefile components must remain together. Dataset fields, provenance, and permissions follow the directory metadata and project release notes.
 
 ## External inputs
 
 ### `dem/`
 
-完整 DEM 不进入 Git，也不使用 Git LFS。Chicago DEM 和纽约市 1 m DEM 都应通过公开来源或仓库内下载脚本准备。下载后的文件只存在于本地 `dem/`，该目录已被 `.gitignore` 忽略。
+Complete DEM rasters are excluded from both Git and Git LFS. Chicago and New York City are registered as separate external USGS 3DEP 1 m datasets. Each raster must be obtained from the public source or the documented Earth Engine workflow and placed in its registered local directory.
 
-DEM 下载和投影约定见 [dem/README.md](../dem/README.md)。
+See [dem/README.md](../dem/README.md) for download, projection, and path requirements.
 
 ## Dataset terms
 
-MIT License 只适用于本仓库源代码和文档。数据集仍受其来源、元数据和再分发授权约束；使用者应在论文、报告和二次发布中保留数据来源与版权说明。
+The MIT License applies only to repository source code and documentation. Each dataset remains subject to its original provenance, metadata, and redistribution terms. Preserve dataset attribution in papers, reports, and redistributed products.
 
 ## Reproducibility manifest
 
-`datasets.yaml` 保存数据集级来源、提供方、许可、下载日期、CRS、空间分辨率和说明；未知来源 URL 或日期明确写为 `null`。`manifest.json` 在此基础上展开本地文件，并记录：
+`datasets.yaml` stores dataset-level provenance, provider, licensing, acquisition date, CRS, spatial resolution, and notes. Unknown source URLs or dates are explicitly represented as `null`. Chicago and New York City have distinct DEM dataset IDs and paths.
+
+`manifest.json` expands those declarations into local file records containing:
 
 ```text
 dataset_id
@@ -47,10 +49,10 @@ spatial_resolution
 notes
 ```
 
-重新生成：
+Regenerate it with:
 
 ```powershell
 python scripts/create_data_manifest.py
 ```
 
-该命令会流式计算 SHA256，因此本地存在约 11 GiB DEM 时需要等待一段时间。DEM 本身仍受 `.gitignore` 保护，清单只保存路径、大小和摘要。
+The command streams SHA256 calculations, so it can take time when the approximately 11 GiB Chicago DEM and the New York City DEM are present locally. The rasters remain protected by `.gitignore`; only relative paths, sizes, and checksums are stored in the manifest.

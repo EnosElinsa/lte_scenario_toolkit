@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-15T15:48:18.653713Z",
+  "generated_at": "2026-07-15T16:37:32.448478Z",
   "datasets": [
     {
       "dataset_id": "usa_clear_lte_base_stations",
@@ -254,22 +254,21 @@
       ]
     },
     {
-      "dataset_id": "usgs_3dep_1m_dem",
-      "path": "dem",
+      "dataset_id": "usgs_3dep_1m_dem_chicago",
+      "path": "dem/USGS_1M_DEM_Chicago",
       "source_url": "https://developers.google.com/earth-engine/datasets/catalog/USGS_3DEP_1m",
       "provider": "United States Geological Survey",
       "license": "USGS public-domain data; retain source attribution",
       "download_date": null,
+      "earth_engine_collection": "USGS/3DEP/1m",
+      "band": "elevation",
       "crs": "EPSG:3857",
       "spatial_resolution": "1 m",
-      "notes": "External local input. Download with the documented Earth Engine workflow; DEM files are excluded from Git.",
+      "units": "metres",
+      "vertical_datum": "NAVD88",
+      "notes": "External local input for the Chicago study area. DEM files are excluded from Git.",
       "external": true,
       "files": [
-        {
-          "path": "dem/README.md",
-          "size_bytes": 1608,
-          "sha256": "b55473415ba0cd032fae415100ef789b1d2f3cf960ce4a1831dab9f98d888626"
-        },
         {
           "path": "dem/USGS_1M_DEM_Chicago/README.md",
           "size_bytes": 236,
@@ -294,7 +293,25 @@
           "path": "dem/USGS_1M_DEM_Chicago/USGS_1M_DEM_Chicago.tif.ovr",
           "size_bytes": 996870295,
           "sha256": "96eeba0106f5af62278ce055a70d7bf7a779cbe2b162ba4888253f44d5260f21"
-        },
+        }
+      ]
+    },
+    {
+      "dataset_id": "usgs_3dep_1m_dem_new_york_city",
+      "path": "dem/USGS_1M_DEM_NewYorkState_NewYork",
+      "source_url": "https://developers.google.com/earth-engine/datasets/catalog/USGS_3DEP_1m",
+      "provider": "United States Geological Survey",
+      "license": "USGS public-domain data; retain source attribution",
+      "download_date": null,
+      "earth_engine_collection": "USGS/3DEP/1m",
+      "band": "elevation",
+      "crs": "EPSG:3857",
+      "spatial_resolution": "1 m",
+      "units": "metres",
+      "vertical_datum": "NAVD88",
+      "notes": "External local input clipped to the union of the five New York City counties and merged into one GeoTIFF. Download with the documented Earth Engine workflow; DEM files are excluded from Git.",
+      "external": true,
+      "files": [
         {
           "path": "dem/USGS_1M_DEM_NewYorkState_NewYork/README.md",
           "size_bytes": 804,

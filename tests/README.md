@@ -1,8 +1,8 @@
 # Tests
 
-测试覆盖命名包与 CLI、YAML 配置、城市边界发现、CRS 转换、边界内点筛选、确定性矩形扫描、间距和点数约束、DEM 采样、NoData/缺失文件错误、CSV 字段、数据 manifest、运行记录、二维/三维输出及工作流编排。
+The test suite covers the named package and CLI, YAML configuration, city-boundary discovery, CRS conversion, point-in-boundary filtering, deterministic rectangle scanning, spacing and point-count constraints, DEM sampling, NoData and missing-file errors, CSV fields, the data manifest, run records, 2D and 3D outputs, and workflow orchestration.
 
-`fixtures/` 只含两个很小的公开 GeoJSON；栅格测试使用 Rasterio 内存 GeoTIFF。测试不读取完整 LTE 数据或 1 m DEM，不访问 Earth Engine。
+`fixtures/` contains only two small public GeoJSON files. Raster tests use in-memory GeoTIFFs created with Rasterio. Tests do not read the complete LTE dataset or 1 m DEMs and do not access Earth Engine.
 
 ```powershell
 python -m ruff check src scripts tests

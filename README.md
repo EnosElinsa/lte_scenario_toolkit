@@ -1,41 +1,41 @@
 # lte_scenario_toolkit
 
-面向研究者的可复现实验工具：在美国城市行政边界内筛选 LTE 基站场景，采样 1 m DEM 高程，并输出 CSV、二维预览、三维地形图和机器可读运行记录。
+A reproducible research toolkit for selecting LTE base-station scenarios within U.S. city boundaries, sampling elevations from 1 m DEMs, and producing CSV data, 2D previews, 3D terrain figures, and machine-readable run records.
 
-项目以明确的 `lte_scenario_toolkit` Python 包提供配置化工作流。研究者可以使用安装后的 CLI，也可以运行 `scripts/` 下的薄入口。
+The project exposes a configuration-driven workflow through the `lte_scenario_toolkit` Python package. Researchers can use the installed command-line tools or the thin entry points in `scripts/`.
 
 ## Workflow
 
 ```text
-准备公开基站点和行政边界
-→ 下载或放置本地 DEM
-→ 校验数据清单、CRS 和分辨率
-→ 读取 YAML 实验配置
-→ 扫描满足点数与间距约束的候选矩形
-→ 交互选择，或用固定候选编号复现选择
-→ 采样基站高程
-→ 输出 CSV、PNG/EPS/HTML 和 run JSON
+Prepare the public base-station points and administrative boundaries
+→ Download or place the local DEM
+→ Validate the data manifest, CRS, and spatial resolution
+→ Load a YAML experiment configuration
+→ Scan candidate rectangles that satisfy count and spacing constraints
+→ Select interactively or reproduce a selection with a fixed candidate index
+→ Sample base-station elevations
+→ Write CSV, PNG/EPS/HTML, and run JSON outputs
 ```
 
 ## Repository layout
 
 ```text
-boundary_shp/                 # 已获公开再分发权限的边界 Shapefile
-points_shp/                   # 公开 LTE 基站点；大型组成文件由 Git LFS 管理
-dem/                          # 本地 DEM；不进入 Git/LFS
-configs/                      # Chicago 与 New York YAML 实验配置
-data/datasets.yaml            # 数据集来源、许可和空间元数据
-data/manifest.json            # 文件大小与 SHA256 清单
-src/lte_scenario_toolkit/     # 唯一 Python 实现包
-scripts/                      # 薄命令行入口与 manifest 生成器
-gee/newyork_1m_dem.js         # GEE Code Editor 导出脚本
-tests/fixtures/               # 无需完整 DEM/基站数据的小型公开 fixture
-runs/                         # 只跟踪模板和简短摘要
+boundary_shp/                 # Boundary Shapefiles approved for public redistribution
+points_shp/                   # Public LTE base stations; large components use Git LFS
+dem/                          # Local DEMs; excluded from Git and Git LFS
+configs/                      # Chicago and New York City experiment configurations
+data/datasets.yaml            # Dataset provenance, licensing, and spatial metadata
+data/manifest.json            # File sizes and SHA256 checksums
+src/lte_scenario_toolkit/     # The single Python implementation package
+scripts/                      # Thin CLI entry points and manifest generator
+gee/newyork_1m_dem.js         # GEE Code Editor export script
+tests/fixtures/               # Small public fixtures that do not require full datasets
+runs/                         # Only reusable templates and concise summaries are tracked
 ```
 
 ## Installation
 
-要求 Python 3.10 或更高版本。Windows PowerShell：
+Python 3.10 or later is required. On Windows PowerShell:
 
 ```powershell
 git lfs install
@@ -47,9 +47,9 @@ python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
 ```
 
-安装后可使用 `lte-select-sites`、`lte-generate-figures` 和 `lte-download-newyork-dem`，也可使用对应的 `python scripts/...` 命令。
+The installation provides `lte-select-sites`, `lte-generate-figures`, and `lte-download-newyork-dem`. Equivalent `python scripts/...` commands are also available.
 
-Python 导入名与项目名一致：
+The distribution name and Python import name are both `lte_scenario_toolkit`:
 
 ```python
 from lte_scenario_toolkit.config import load_experiment_config
@@ -58,27 +58,27 @@ from lte_scenario_toolkit.scenario import scan_rectangles
 
 ## Data preparation
 
-基站点和边界数据随仓库分发。DEM 体量很大，只保存在本地，目录和下载方式见 [dem/README.md](dem/README.md)。数据来源与许可声明见 [data/README.md](data/README.md)。
+The base-station points and boundary data are distributed with the repository. DEM rasters are much larger and remain local; see [dem/README.md](dem/README.md) for the required paths and download workflow. Dataset provenance and terms are documented in [data/README.md](data/README.md).
 
-纽约市 1 m DEM 的 GEE 检查与导出：
+Check or export the New York City 1 m DEM with Earth Engine:
 
 ```powershell
 python scripts/download_newyork_1m_dem.py `
-  --project gen-lang-client-0153149292 `
+  --project YOUR_EARTH_ENGINE_PROJECT_ID `
   --dry-run
 
 python scripts/download_newyork_1m_dem.py `
-  --project gen-lang-client-0153149292 `
+  --project YOUR_EARTH_ENGINE_PROJECT_ID `
   --export
 ```
 
-导出的分片下载后需合并为配置引用的单一 GeoTIFF：
+After downloading the exported tiles, merge them into the single GeoTIFF referenced by the configuration:
 
 ```text
 dem/USGS_1M_DEM_NewYorkState_NewYork/USGS_1M_DEM_NewYorkState_NewYork.tif
 ```
 
-准备或修改输入后重新生成完整校验清单：
+Regenerate the complete checksum manifest after preparing or changing any input:
 
 ```powershell
 python scripts/create_data_manifest.py
@@ -86,13 +86,13 @@ python scripts/create_data_manifest.py
 
 ## Reproducible scenario selection
 
-Chicago 示例：
+Chicago example:
 
 ```powershell
 python scripts/select_sites.py --config configs/example.yaml
 ```
 
-第一次可以在桌面窗口选择候选矩形。记录候选编号后，正式实验用 `--select-index` 跳过人工选择，使选择过程可复现：
+The first run can use the desktop window to choose a candidate rectangle. Record its index and use `--select-index` for formal experiments so that the selection is reproducible:
 
 ```powershell
 python scripts/select_sites.py `
@@ -100,7 +100,7 @@ python scripts/select_sites.py `
   --select-index 1
 ```
 
-纽约市示例（需先准备并合并 DEM）：
+New York City example, after preparing and merging the DEM:
 
 ```powershell
 python scripts/select_sites.py `
@@ -108,7 +108,7 @@ python scripts/select_sites.py `
   --select-index 1
 ```
 
-通用覆盖参数：
+Common command-line overrides:
 
 ```powershell
 python scripts/select_sites.py `
@@ -119,7 +119,7 @@ python scripts/select_sites.py `
   --target 30
 ```
 
-每次成功运行会在输出目录写入 `run-select-sites.json`，包含完整配置、Git commit、输入 SHA256、软件版本和输出文件清单。
+Each successful run writes `run-select-sites.json` to the output directory. It records the resolved configuration, Git commit, input SHA256 checksums, software versions, and output inventory.
 
 ## Generate figures from an existing CSV
 
@@ -128,11 +128,11 @@ python scripts/generate_scenario_figures.py `
   --config configs/example.yaml
 ```
 
-该入口读取配置推导出的 CSV，生成论文风格 PNG/EPS 和交互 HTML，并写入 `run-generate-figures.json`。
+This command reads the CSV resolved from the configuration, produces publication-style PNG/EPS figures and an interactive HTML view, and writes `run-generate-figures.json`.
 
 ## Tests and CI
 
-本地验证：
+Run the local checks with:
 
 ```powershell
 python -m ruff check src scripts tests
@@ -141,15 +141,15 @@ python -m compileall -q src/lte_scenario_toolkit scripts
 node --check gee/newyork_1m_dem.js
 ```
 
-GitHub Actions 使用小型矢量与内存 DEM fixture，不下载完整数据，也不访问 Earth Engine。
+GitHub Actions uses small vector fixtures and in-memory DEM rasters. It does not download the full datasets or access Earth Engine.
 
 ## Licensing and attribution
 
-源代码采用 [MIT License](LICENSE)。数据不自动继承代码许可证：基站点和边界按仓库所有者确认的公开再分发权限发布；USGS 3DEP 数据保留 USGS 来源说明。缺失的原始来源 URL 和获取日期在 `data/datasets.yaml` 中明确标记为空，不做推测。
+The source code is released under the [MIT License](LICENSE). Data does not automatically inherit the software license. The base-station and boundary datasets are published under redistribution permissions confirmed by the repository owner, and USGS 3DEP data retains its USGS attribution. Unknown original source URLs and acquisition dates remain explicitly `null` in `data/datasets.yaml` rather than being inferred.
 
 ## Known limitations
 
-- 首次候选选择仍需要桌面图形环境；正式复现实验可改用 `--select-index`；
-- 本地场景处理要求单一 GeoTIFF，GEE 产生的纽约 DEM 分片需先合并；
-- EPSG:3857 适合本项目城市尺度的米制扫描，但不是保面积投影；
-- 当前只提供源码安装和 GitHub 使用方式，尚未发布到 PyPI。
+- Initial interactive candidate selection requires a desktop graphical environment; reproducible runs can use `--select-index`.
+- Local scenario processing expects one GeoTIFF, so Earth Engine output tiles must be merged first.
+- EPSG:3857 provides metre-based scanning at the city scale used here, but it is not an equal-area projection.
+- The project currently supports source installation and GitHub distribution and is not yet published on PyPI.

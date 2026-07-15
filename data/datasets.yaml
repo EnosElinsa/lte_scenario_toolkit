@@ -21,13 +21,32 @@ datasets:
     spatial_resolution: polygon vector
     notes: Includes the city and study-area boundary Shapefiles tracked in this repository.
 
-  - dataset_id: usgs_3dep_1m_dem
-    path: dem
+  - dataset_id: usgs_3dep_1m_dem_chicago
+    path: dem/USGS_1M_DEM_Chicago
     source_url: https://developers.google.com/earth-engine/datasets/catalog/USGS_3DEP_1m
     provider: United States Geological Survey
     license: USGS public-domain data; retain source attribution
     download_date: null
+    earth_engine_collection: USGS/3DEP/1m
+    band: elevation
     crs: EPSG:3857
     spatial_resolution: 1 m
-    notes: External local input. Download with the documented Earth Engine workflow; DEM files are excluded from Git.
+    units: metres
+    vertical_datum: NAVD88
+    notes: External local input for the Chicago study area. DEM files are excluded from Git.
+    external: true
+
+  - dataset_id: usgs_3dep_1m_dem_new_york_city
+    path: dem/USGS_1M_DEM_NewYorkState_NewYork
+    source_url: https://developers.google.com/earth-engine/datasets/catalog/USGS_3DEP_1m
+    provider: United States Geological Survey
+    license: USGS public-domain data; retain source attribution
+    download_date: null
+    earth_engine_collection: USGS/3DEP/1m
+    band: elevation
+    crs: EPSG:3857
+    spatial_resolution: 1 m
+    units: metres
+    vertical_datum: NAVD88
+    notes: External local input clipped to the union of the five New York City counties and merged into one GeoTIFF. Download with the documented Earth Engine workflow; DEM files are excluded from Git.
     external: true

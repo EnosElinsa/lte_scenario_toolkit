@@ -1,10 +1,27 @@
+import json
 import py_compile
+import re
 from pathlib import Path
 
 import tomllib
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+PUBLIC_READMES = (
+    "README.md",
+    "configs/README.md",
+    "data/README.md",
+    "dem/README.md",
+    "runs/README.md",
+    "scripts/README.md",
+    "src/README.md",
+    "tests/README.md",
+)
+CJK_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+DEM_DATASETS = {
+    "usgs_3dep_1m_dem_chicago": "dem/USGS_1M_DEM_Chicago",
+    "usgs_3dep_1m_dem_new_york_city": "dem/USGS_1M_DEM_NewYorkState_NewYork",
+}
 
 
 def test_repository_metadata_files_exist():
@@ -53,3 +70,52 @@ def test_gee_exporters_have_dedicated_locations():
     assert (ROOT / "gee" / "newyork_1m_dem.js").is_file()
     assert not (ROOT / "gee_newyork_1m_dem.js").exists()
     assert not (ROOT / "download_newyork_1m_dem.py").exists()
+
+
+def test_public_readmes_and_source_files_are_english_only():
+    checked_paths = [ROOT / relative_path for relative_path in PUBLIC_READMES]
+    for source_root in (ROOT / "src", ROOT / "scripts", ROOT / "gee", ROOT / "tests"):
+        checked_paths.extend(source_root.rglob("*.py"))
+        checked_paths.extend(source_root.rglob("*.js"))
+
+    offenders = []
+    for path in sorted(set(checked_paths)):
+        text = path.read_text(encoding="utf-8")
+        if CJK_PATTERN.search(text):
+            offenders.append(path.relative_to(ROOT).as_posix())
+
+    assert not offenders, f"CJK characters found in public English files: {offenders}"
+
+
+def test_chicago_and_new_york_dems_have_separate_registry_entries():
+    metadata = yaml.safe_load((ROOT / "data" / "datasets.yaml").read_text(encoding="utf-8"))
+    datasets = {item["dataset_id"]: item for item in metadata["datasets"]}
+
+    assert "usgs_3dep_1m_dem" not in datasets
+    assert DEM_DATASETS.keys() <= datasets.keys()
+    for dataset_id, expected_path in DEM_DATASETS.items():
+        dataset = datasets[dataset_id]
+        assert dataset["path"] == expected_path
+        assert dataset["source_url"].endswith("/USGS_3DEP_1m")
+        assert dataset["provider"] == "United States Geological Survey"
+        assert "public-domain" in dataset["license"]
+        assert dataset["earth_engine_collection"] == "USGS/3DEP/1m"
+        assert dataset["band"] == "elevation"
+        assert dataset["crs"] == "EPSG:3857"
+        assert dataset["spatial_resolution"] == "1 m"
+        assert dataset["units"] == "metres"
+        assert dataset["vertical_datum"] == "NAVD88"
+        assert dataset["external"] is True
+
+
+def test_manifest_inventories_chicago_and_new_york_dems_separately():
+    manifest = json.loads((ROOT / "data" / "manifest.json").read_text(encoding="utf-8"))
+    datasets = {item["dataset_id"]: item for item in manifest["datasets"]}
+
+    assert "usgs_3dep_1m_dem" not in datasets
+    assert DEM_DATASETS.keys() <= datasets.keys()
+    for dataset_id, expected_path in DEM_DATASETS.items():
+        files = datasets[dataset_id]["files"]
+        assert files
+        assert all(item["path"].startswith(f"{expected_path}/") for item in files)
+        assert any(item["path"].lower().endswith(".tif") for item in files)

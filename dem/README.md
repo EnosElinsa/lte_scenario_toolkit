@@ -1,10 +1,15 @@
 # DEM data
 
-完整 DEM 不纳入 Git。这个目录只用于本地存放下载后的栅格文件；`.gitignore` 会忽略其中的大型文件。
+Complete DEM rasters are not committed to Git. This directory is reserved for locally downloaded raster files, and `.gitignore` excludes the large data products.
+
+The data registry treats the Chicago and New York City DEMs as two independent external datasets:
+
+- `usgs_3dep_1m_dem_chicago`
+- `usgs_3dep_1m_dem_new_york_city`
 
 ## Chicago
 
-现有 Chicago DEM 使用 USGS National Map 3DEP 1 m 数据，当前本地约 10.96 GiB。使用本地场景脚本前，需要把文件放在：
+The existing Chicago raster uses the USGS National Map 3DEP 1 m DEM collection and currently occupies approximately 10.96 GiB locally. Place it at:
 
 ```text
 dem/USGS_1M_DEM_Chicago/USGS_1M_DEM_Chicago.tif
@@ -12,34 +17,40 @@ dem/USGS_1M_DEM_Chicago/USGS_1M_DEM_Chicago.tif
 
 ## New York City
 
-数据集：`USGS/3DEP/1m`
+Dataset: `USGS/3DEP/1m`
 
-- 波段：`elevation`
-- 单位：米
-- 垂直基准：NAVD88
-- 原始影像：USGS 3DEP 1 m ImageCollection
-- 输出 CRS：`EPSG:3857`
-- 输出方式：Google Drive 分片 GeoTIFF
+- Band: `elevation`
+- Units: metres
+- Vertical datum: NAVD88
+- Source imagery: USGS 3DEP 1 m ImageCollection
+- Output CRS: `EPSG:3857`
+- Export destination: tiled GeoTIFF files in Google Drive
 
-使用 Python 导出：
+Export with Python:
 
 ```powershell
 python scripts/download_newyork_1m_dem.py `
-  --project gen-lang-client-0153149292 `
+  --project YOUR_EARTH_ENGINE_PROJECT_ID `
   --dry-run
 
 python scripts/download_newyork_1m_dem.py `
-  --project gen-lang-client-0153149292 `
+  --project YOUR_EARTH_ENGINE_PROJECT_ID `
   --export
 ```
 
-也可以把 `gee/newyork_1m_dem.js` 粘贴到 GEE Code Editor，在 `Tasks` 面板中启动导出。
+Alternatively, paste `gee/newyork_1m_dem.js` into the Earth Engine Code Editor and start the export from the `Tasks` panel.
 
-默认范围是纽约市五县联合边界：Bronx、Kings、New York、Queens、Richmond。只导出 Manhattan/纽约县时，Python 使用 `--boundary-mode county --county-geoid 36061`，JavaScript 将 `boundaryMode` 改为 `'county'`。
+The default region is the union of New York City's five counties: Bronx, Kings, New York, Queens, and Richmond. To export Manhattan/New York County only, pass `--boundary-mode county --county-geoid 36061` to the Python command or set `boundaryMode` to `'county'` in the JavaScript file.
 
-城市级 1 m DEM 通常会生成多个分片。下载完成后，将分片放入本地 `dem/`，必要时用 QGIS 或 Rasterio 合并；不要把合并后的大文件提交到 GitHub。
+A city-scale 1 m export normally produces multiple tiles. Download and merge them with QGIS, Rasterio, or another geospatial tool into:
+
+```text
+dem/USGS_1M_DEM_NewYorkState_NewYork/USGS_1M_DEM_NewYorkState_NewYork.tif
+```
+
+Do not commit the tiles or merged raster to GitHub.
 
 ## Official sources
 
-- [USGS 3DEP 1m Earth Engine catalog](https://developers.google.com/earth-engine/datasets/catalog/USGS_3DEP_1m)
-- [Earth Engine Export.image.toDrive](https://developers.google.com/earth-engine/apidocs/export-image-todrive)
+- [USGS 3DEP 1 m Earth Engine catalog](https://developers.google.com/earth-engine/datasets/catalog/USGS_3DEP_1m)
+- [Earth Engine `Export.image.toDrive`](https://developers.google.com/earth-engine/apidocs/export-image-todrive)
