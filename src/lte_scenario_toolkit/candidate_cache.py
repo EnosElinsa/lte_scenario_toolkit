@@ -7,8 +7,9 @@ import json
 import math
 import os
 import re
+import stat
 import uuid
-from dataclasses import asdict, fields
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone
 from numbers import Integral, Real
 from pathlib import Path
@@ -36,6 +37,34 @@ _RESULT_FIELDS = frozenset(
     }
 )
 _CANDIDATE_FIELDS = frozenset(field.name for field in fields(Candidate))
+
+
+@dataclass(frozen=True)
+class _CacheLeafSnapshot:
+    device: int
+    inode: int
+    mode: int
+    size: int
+    mtime_ns: int
+    digest: str | None = None
+
+
+def _leaf_snapshot(path: Path) -> _CacheLeafSnapshot:
+    status = path.lstat()
+    return _CacheLeafSnapshot(
+        device=status.st_dev,
+        inode=status.st_ino,
+        mode=status.st_mode,
+        size=status.st_size,
+        mtime_ns=status.st_mtime_ns,
+    )
+
+
+def _same_leaf(
+    left: _CacheLeafSnapshot,
+    right: _CacheLeafSnapshot,
+) -> bool:
+    return replace(left, digest=None) == replace(right, digest=None)
 
 
 def _required_text(value: Any, *, field: str) -> str:
@@ -226,9 +255,21 @@ def _result_from_payload(value: Any, request: ScanRequest) -> ScanResult:
         raise ValueError(
             "result.candidates flat_grid_id must be less than total_positions"
         )
+    if len(candidates) > checked_positions:
+        raise ValueError(
+            "result.candidates exceeds result.checked_positions"
+        )
     if request.mode == "complete" and checked_positions != total_positions:
         raise ValueError(
             "result.checked_positions must equal total_positions for complete scans"
+        )
+    if (
+        request.mode == "fast"
+        and checked_positions < total_positions
+        and len(candidates) != request.max_candidates
+    ):
+        raise ValueError(
+            "fast partial-coverage result.candidates must equal max_candidates"
         )
     if mapping["completed"] is not True:
         raise ValueError("result.completed must be true")
@@ -299,9 +340,25 @@ class CandidateCache:
         return self._path_for(key, allow_leaf_symlink=False)
 
     @staticmethod
-    def _quarantine(path: Path) -> None:
-        if not os.path.lexists(path):
+    def _quarantine(path: Path, expected: _CacheLeafSnapshot) -> None:
+        try:
+            current = _leaf_snapshot(path)
+        except FileNotFoundError:
             return
+        if not _same_leaf(current, expected):
+            return
+        if expected.digest is not None:
+            try:
+                content = path.read_bytes()
+                after_read = _leaf_snapshot(path)
+            except OSError:
+                return
+            if (
+                not _same_leaf(after_read, expected)
+                or len(content) != expected.size
+                or hashlib.sha256(content).hexdigest() != expected.digest
+            ):
+                return
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         target = path.with_name(f"{path.name}.corrupt-{timestamp}")
         if os.path.lexists(target):
@@ -324,13 +381,30 @@ class CandidateCache:
         path = self._path_for(validated_key, allow_leaf_symlink=True)
         if not os.path.lexists(path):
             return None
-        if path.is_symlink():
-            self._quarantine(path)
-            return None
         try:
-            if not path.is_file():
-                raise ValueError("Candidate cache path is not a regular file")
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            before_read = _leaf_snapshot(path)
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(before_read.mode):
+            self._quarantine(path, before_read)
+            return None
+        if not stat.S_ISREG(before_read.mode):
+            self._quarantine(path, before_read)
+            return None
+        read_snapshot = before_read
+        try:
+            content = path.read_bytes()
+            after_read = _leaf_snapshot(path)
+            if (
+                not _same_leaf(before_read, after_read)
+                or len(content) != after_read.size
+            ):
+                return None
+            read_snapshot = replace(
+                after_read,
+                digest=hashlib.sha256(content).hexdigest(),
+            )
+            payload = json.loads(content.decode("utf-8"))
             mapping = _strict_mapping(payload, _PAYLOAD_FIELDS, field="cache")
             schema_version = mapping["schema_version"]
             if type(schema_version) is not int or schema_version != CACHE_SCHEMA_VERSION:
@@ -344,7 +418,7 @@ class CandidateCache:
         except FileNotFoundError:
             return None
         except Exception:
-            self._quarantine(path)
+            self._quarantine(path, read_snapshot)
             return None
 
     def store(

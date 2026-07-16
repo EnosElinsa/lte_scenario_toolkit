@@ -298,6 +298,69 @@ def test_corrupt_cache_is_quarantined_collision_safely_without_harming_other_ent
     assert cache.load(other_key, other_request) == make_result()
 
 
+def test_quarantine_does_not_move_concurrent_valid_atomic_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    cache = CandidateCache(tmp_path)
+    request = make_request()
+    result = make_result()
+    key = key_for(request)
+    path = cache.path_for(key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{broken json", encoding="utf-8")
+    real_quarantine = cache._quarantine
+    replaced = False
+
+    def replace_then_quarantine(candidate, *args, **kwargs):
+        nonlocal replaced
+        if not replaced:
+            cache.store(key, request, result)
+            replaced = True
+        return real_quarantine(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(cache, "_quarantine", replace_then_quarantine)
+
+    assert cache.load(key, request) is None
+    assert replaced is True
+    assert path.is_file()
+    assert cache.load(key, request) == result
+    assert not list(path.parent.glob(f"{key}.json.corrupt-*"))
+
+
+def test_symlink_quarantine_does_not_move_concurrent_valid_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    cache = CandidateCache(tmp_path)
+    request = make_request()
+    result = make_result()
+    key = key_for(request)
+    path = cache.path_for(key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside-broken.json"
+    outside.write_text("{broken json", encoding="utf-8")
+    _symlink_or_skip(path, outside)
+    real_quarantine = cache._quarantine
+    replaced = False
+
+    def replace_then_quarantine(candidate, *args, **kwargs):
+        nonlocal replaced
+        if not replaced:
+            candidate.unlink()
+            cache.store(key, request, result)
+            replaced = True
+        return real_quarantine(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(cache, "_quarantine", replace_then_quarantine)
+
+    assert cache.load(key, request) is None
+    assert replaced is True
+    assert path.is_file() and not path.is_symlink()
+    assert cache.load(key, request) == result
+    assert outside.read_text(encoding="utf-8") == "{broken json"
+
+
 def test_missing_cache_returns_none_without_creating_cache_directories(tmp_path):
     cache = CandidateCache(tmp_path)
 
@@ -314,6 +377,79 @@ def test_store_rejects_incomplete_results_without_writing(tmp_path):
         cache.store(key, request, make_result(completed=False))
 
     assert not cache.path_for(key).exists()
+
+
+def test_store_rejects_more_candidates_than_checked_positions(tmp_path):
+    cache = CandidateCache(tmp_path)
+    request = make_request()
+    key = key_for(request)
+
+    with pytest.raises(ValueError, match="candidates|checked_positions"):
+        cache.store(key, request, make_result(checked_positions=1))
+
+    assert not cache.path_for(key).exists()
+
+
+def test_load_quarantines_more_candidates_than_checked_positions(tmp_path):
+    cache = CandidateCache(tmp_path)
+    request = make_request()
+    key = key_for(request)
+    path = cache.store(key, request, make_result())
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["result"]["checked_positions"] = 1
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert cache.load(key, request) is None
+    assert not path.exists()
+    assert list(path.parent.glob(f"{key}.json.corrupt-*"))
+
+
+def test_fast_partial_coverage_requires_capacity_candidate_count_on_store(
+    tmp_path,
+):
+    cache = CandidateCache(tmp_path)
+    request = make_request(mode="fast", max_candidates=2)
+    key = key_for(request)
+    partial = make_result(
+        candidates=(Candidate(1, 2, 1.0, 1.0, 2.0, 2.0),),
+        checked_positions=8,
+        total_positions=10,
+    )
+
+    with pytest.raises(ValueError, match="fast|max_candidates|candidates"):
+        cache.store(key, request, partial)
+
+    assert not cache.path_for(key).exists()
+
+
+def test_load_quarantines_fast_partial_coverage_below_capacity(tmp_path):
+    cache = CandidateCache(tmp_path)
+    request = make_request(mode="fast", max_candidates=2)
+    key = key_for(request)
+    path = cache.store(key, request, make_result())
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["result"]["candidates"].pop()
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert cache.load(key, request) is None
+    assert not path.exists()
+    assert list(path.parent.glob(f"{key}.json.corrupt-*"))
+
+
+def test_fast_full_coverage_may_store_fewer_than_capacity(tmp_path):
+    cache = CandidateCache(tmp_path)
+    request = make_request(mode="fast", max_candidates=2)
+    key = key_for(request)
+    result = make_result(
+        candidates=(Candidate(1, 2, 1.0, 1.0, 2.0, 2.0),),
+        checked_positions=10,
+        total_positions=10,
+    )
+
+    path = cache.store(key, request, result)
+
+    assert path.is_file()
+    assert cache.load(key, request) == result
 
 
 @pytest.mark.parametrize(
