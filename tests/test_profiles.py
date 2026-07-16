@@ -653,9 +653,125 @@ def test_profile_store_preserves_external_catalog_after_save_failure(
     with pytest.raises(OSError, match="external replacement") as error:
         store.save(make_profile(repo_root), set_default=True)
 
-    assert not destination.exists()
+    assert destination.is_file()
+    assert load_profile(destination, repo_root=repo_root).profile_id == (
+        "chicago-default"
+    )
     assert catalog_path.read_bytes() == external_state["bytes"]
     assert any("rollback skipped" in note for note in error.value.__notes__)
+
+
+def test_profile_store_keeps_new_profile_when_catalog_rollback_fails(
+    profile_repository,
+    monkeypatch,
+):
+    repo_root, catalog_path = profile_repository
+    store = ProfileStore(repo_root, catalog_path)
+    destination = repo_root / "configs/chicago/chicago-default.yaml"
+    real_save = profiles_module.save_data_catalog
+    real_restore = profiles_module._atomic_restore_bytes
+
+    def save_then_fail(catalog, document):
+        real_save(catalog, document)
+        raise OSError("after write")
+
+    def fail_catalog_restore(path, content):
+        if Path(path).resolve() == catalog_path.resolve():
+            raise OSError("rollback failed")
+        return real_restore(path, content)
+
+    monkeypatch.setattr(profiles_module, "save_data_catalog", save_then_fail)
+    monkeypatch.setattr(
+        profiles_module,
+        "_atomic_restore_bytes",
+        fail_catalog_restore,
+    )
+
+    with pytest.raises(OSError, match="after write") as error:
+        store.save(make_profile(repo_root), set_default=True)
+
+    assert any("rollback failed" in note for note in error.value.__notes__)
+    assert any("target was retained" in note for note in error.value.__notes__)
+    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    configured = repo_root / catalog["scenarios"][0]["config_path"]
+    assert configured == destination
+    assert configured.is_file()
+    assert load_profile(configured, repo_root=repo_root).profile_id == (
+        "chicago-default"
+    )
+
+
+def test_profile_store_recognizes_catalog_restored_before_restore_error(
+    profile_repository,
+    monkeypatch,
+):
+    repo_root, catalog_path = profile_repository
+    original_catalog = catalog_path.read_bytes()
+    store = ProfileStore(repo_root, catalog_path)
+    destination = repo_root / "configs/chicago/chicago-default.yaml"
+    real_save = profiles_module.save_data_catalog
+    real_restore = profiles_module._atomic_restore_bytes
+
+    def save_then_fail(catalog, document):
+        real_save(catalog, document)
+        raise OSError("after write")
+
+    def restore_then_fail(path, content):
+        real_restore(path, content)
+        if Path(path).resolve() == catalog_path.resolve():
+            raise OSError("after restore")
+
+    monkeypatch.setattr(profiles_module, "save_data_catalog", save_then_fail)
+    monkeypatch.setattr(
+        profiles_module,
+        "_atomic_restore_bytes",
+        restore_then_fail,
+    )
+
+    with pytest.raises(OSError, match="after write") as error:
+        store.save(make_profile(repo_root), set_default=True)
+
+    assert any("after restore" in note for note in error.value.__notes__)
+    assert catalog_path.read_bytes() == original_catalog
+    assert not destination.exists()
+
+
+def test_profile_store_keeps_overwrite_when_catalog_rollback_is_uncertain(
+    profile_repository,
+    monkeypatch,
+):
+    repo_root, catalog_path = profile_repository
+    store = ProfileStore(repo_root, catalog_path)
+    destination = store.save(make_profile(repo_root))
+    real_save = profiles_module.save_data_catalog
+    real_restore = profiles_module._atomic_restore_bytes
+
+    def save_then_fail(catalog, document):
+        real_save(catalog, document)
+        raise OSError("after write")
+
+    def fail_catalog_restore(path, content):
+        if Path(path).resolve() == catalog_path.resolve():
+            raise OSError("rollback failed")
+        return real_restore(path, content)
+
+    monkeypatch.setattr(profiles_module, "save_data_catalog", save_then_fail)
+    monkeypatch.setattr(
+        profiles_module,
+        "_atomic_restore_bytes",
+        fail_catalog_restore,
+    )
+
+    with pytest.raises(OSError, match="after write") as error:
+        store.save(
+            make_profile(repo_root, display_name="Changed"),
+            overwrite=True,
+            set_default=True,
+        )
+
+    assert any("target was retained" in note for note in error.value.__notes__)
+    assert destination.is_file()
+    assert load_profile(destination, repo_root=repo_root).display_name == "Changed"
 
 
 def test_profile_store_removes_new_profile_if_dump_writes_then_raises(
@@ -934,6 +1050,49 @@ def test_profile_store_default_rename_preserves_concurrently_changed_source(
     catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
     assert catalog["scenarios"][0]["config_path"] == (
         "configs/chicago/chicago-default.yaml"
+    )
+
+
+def test_profile_store_keeps_rename_target_when_catalog_rollback_fails(
+    profile_repository,
+    monkeypatch,
+):
+    repo_root, catalog_path = profile_repository
+    store = ProfileStore(repo_root, catalog_path)
+    source = store.save(make_profile(repo_root), set_default=True)
+    destination = repo_root / "configs/chicago/chicago-renamed.yaml"
+    real_save = profiles_module.save_data_catalog
+    real_restore = profiles_module._atomic_restore_bytes
+
+    def save_then_fail(catalog, document):
+        real_save(catalog, document)
+        raise OSError("after write")
+
+    def fail_catalog_restore(path, content):
+        if Path(path).resolve() == catalog_path.resolve():
+            raise OSError("rollback failed")
+        return real_restore(path, content)
+
+    monkeypatch.setattr(profiles_module, "save_data_catalog", save_then_fail)
+    monkeypatch.setattr(
+        profiles_module,
+        "_atomic_restore_bytes",
+        fail_catalog_restore,
+    )
+
+    with pytest.raises(OSError, match="after write") as error:
+        store.rename(source, "chicago-renamed", "Chicago renamed")
+
+    assert any("rollback failed" in note for note in error.value.__notes__)
+    assert any("target was retained" in note for note in error.value.__notes__)
+    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    configured = repo_root / catalog["scenarios"][0]["config_path"]
+    assert configured == destination
+    assert source.is_file()
+    assert destination.is_file()
+    assert load_profile(source, repo_root=repo_root).profile_id == "chicago-default"
+    assert load_profile(destination, repo_root=repo_root).profile_id == (
+        "chicago-renamed"
     )
 
 

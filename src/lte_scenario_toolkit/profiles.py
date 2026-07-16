@@ -44,10 +44,19 @@ DEFAULT_PROFILE_VALUES: dict[str, Any] = {
 }
 
 _MISSING = object()
+_CATALOG_ROLLBACK_CONFIRMED = "_lte_catalog_rollback_confirmed"
 
 
 class ConcurrentProfileUpdateError(RuntimeError):
     """Raised when a stored profile changes during a mutating transaction."""
+
+
+def _mark_catalog_rollback(error: Exception, *, confirmed: bool) -> None:
+    setattr(error, _CATALOG_ROLLBACK_CONFIRMED, confirmed)
+
+
+def _catalog_rollback_confirmed(error: Exception) -> bool:
+    return getattr(error, _CATALOG_ROLLBACK_CONFIRMED, False) is True
 
 
 @dataclass(frozen=True)
@@ -752,7 +761,8 @@ class ProfileStore:
         )
         try:
             return save_data_catalog(catalog, document)
-        except ConcurrentCatalogUpdateError:
+        except ConcurrentCatalogUpdateError as exc:
+            _mark_catalog_rollback(exc, confirmed=True)
             raise
         except Exception as exc:
             try:
@@ -772,6 +782,15 @@ class ProfileStore:
                 exc.add_note(
                     f"Catalog rollback also failed for {catalog.path}: {rollback_error}"
                 )
+            try:
+                rollback_confirmed = catalog.path.read_bytes() == original
+            except Exception as verification_error:
+                rollback_confirmed = False
+                exc.add_note(
+                    f"Catalog rollback verification failed for {catalog.path}: "
+                    f"{verification_error}"
+                )
+            _mark_catalog_rollback(exc, confirmed=rollback_confirmed)
             raise
 
     @staticmethod
@@ -949,12 +968,18 @@ class ProfileStore:
             try:
                 self._save_catalog(catalog, document)
             except Exception as exc:
-                self._restore_profile_after_error(
-                    destination,
-                    original,
-                    expected,
-                    exc,
-                )
+                if _catalog_rollback_confirmed(exc):
+                    self._restore_profile_after_error(
+                        destination,
+                        original,
+                        expected,
+                        exc,
+                    )
+                else:
+                    exc.add_note(
+                        f"Profile rollback skipped for {destination}: catalog "
+                        "rollback was not confirmed, so the target was retained"
+                    )
                 raise
             return destination
 
@@ -1040,7 +1065,9 @@ class ProfileStore:
                     saved_catalog = self._save_catalog(catalog, document)
                 self._unlink_profile_if_unchanged(source_path, source_bytes)
             except Exception as exc:
-                catalog_restored = saved_catalog is None
+                catalog_restored = not is_default
+                if is_default and saved_catalog is None:
+                    catalog_restored = _catalog_rollback_confirmed(exc)
                 if saved_catalog is not None:
                     try:
                         save_data_catalog(saved_catalog, deepcopy(catalog.document))
@@ -1055,6 +1082,11 @@ class ProfileStore:
                         None,
                         expected,
                         exc,
+                    )
+                else:
+                    exc.add_note(
+                        f"Profile rollback skipped for {destination}: catalog "
+                        "rollback was not confirmed, so the target was retained"
                     )
                 raise
             return destination
