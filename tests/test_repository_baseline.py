@@ -128,6 +128,14 @@ DEMS = {
 }
 
 
+def _is_public_text_file(path: Path) -> bool:
+    """Exclude ignored build metadata from tracked public-surface checks."""
+
+    return path.suffix.casefold() in TEXT_SUFFIXES and not any(
+        part.casefold().endswith(".egg-info") for part in path.parts
+    )
+
+
 def test_repository_metadata_files_exist():
     for relative_path in (
         "README.md",
@@ -142,6 +150,13 @@ def test_repository_metadata_files_exist():
         assert (ROOT / relative_path).is_file(), relative_path
 
 
+def test_generated_package_metadata_is_not_a_public_source_surface():
+    generated = ROOT / "src" / "lte_scenario_toolkit.egg-info" / "PKG-INFO"
+
+    assert not _is_public_text_file(generated)
+    assert _is_public_text_file(ROOT / "src" / "lte_scenario_toolkit" / "data_cli.py")
+
+
 def test_public_surfaces_have_no_legacy_city_exporter_or_project_id():
     legacy_terms = (
         "lte-" + "download-newyork-dem",
@@ -153,13 +168,13 @@ def test_public_surfaces_have_no_legacy_city_exporter_or_project_id():
     paths = []
     for surface in PUBLIC_SURFACES:
         if surface.is_file():
-            if surface.suffix.casefold() in TEXT_SUFFIXES:
+            if _is_public_text_file(surface):
                 paths.append(surface)
         elif surface.is_dir():
             paths.extend(
                 path
                 for path in surface.rglob("*")
-                if path.is_file() and path.suffix.casefold() in TEXT_SUFFIXES
+                if path.is_file() and _is_public_text_file(path)
             )
 
     offenders: list[str] = []
