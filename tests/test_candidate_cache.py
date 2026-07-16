@@ -2,6 +2,7 @@ import json
 import re
 from dataclasses import replace
 from pathlib import Path
+from threading import Event, Thread
 
 import numpy as np
 import pytest
@@ -306,8 +307,8 @@ def test_quarantine_does_not_move_concurrent_valid_atomic_replacement(
     request = make_request()
     result = make_result()
     key = key_for(request)
-    path = cache.path_for(key)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path = cache.store(key, request, result)
+    valid_payload = json.loads(path.read_text(encoding="utf-8"))
     path.write_text("{broken json", encoding="utf-8")
     real_quarantine = cache._quarantine
     replaced = False
@@ -315,7 +316,7 @@ def test_quarantine_does_not_move_concurrent_valid_atomic_replacement(
     def replace_then_quarantine(candidate, *args, **kwargs):
         nonlocal replaced
         if not replaced:
-            cache.store(key, request, result)
+            cache_module.atomic_write_json(candidate, valid_payload)
             replaced = True
         return real_quarantine(candidate, *args, **kwargs)
 
@@ -328,6 +329,138 @@ def test_quarantine_does_not_move_concurrent_valid_atomic_replacement(
     assert not list(path.parent.glob(f"{key}.json.corrupt-*"))
 
 
+def test_same_key_store_waits_until_quarantine_finishes(tmp_path, monkeypatch):
+    loading_cache = CandidateCache(tmp_path)
+    storing_cache = CandidateCache(tmp_path)
+    request = make_request()
+    result = make_result()
+    key = key_for(request)
+    path = loading_cache.path_for(key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{broken json", encoding="utf-8")
+    real_quarantine = loading_cache._quarantine
+    quarantine_entered = Event()
+    release_quarantine = Event()
+    load_done = Event()
+    store_done = Event()
+    thread_errors = []
+    loaded = []
+
+    def pause_quarantine(candidate, *args, **kwargs):
+        quarantine_entered.set()
+        if not release_quarantine.wait(5):
+            raise AssertionError("quarantine release was not signalled")
+        return real_quarantine(candidate, *args, **kwargs)
+
+    def load_cache():
+        try:
+            loaded.append(loading_cache.load(key, request))
+        except BaseException as exc:
+            thread_errors.append(exc)
+        finally:
+            load_done.set()
+
+    def store_cache():
+        try:
+            storing_cache.store(key, request, result)
+        except BaseException as exc:
+            thread_errors.append(exc)
+        finally:
+            store_done.set()
+
+    monkeypatch.setattr(loading_cache, "_quarantine", pause_quarantine)
+    load_thread = Thread(target=load_cache)
+    store_thread = Thread(target=store_cache)
+    load_thread.start()
+    assert quarantine_entered.wait(2)
+    store_thread.start()
+    store_was_blocked = not store_done.wait(0.2)
+    release_quarantine.set()
+    load_thread.join(5)
+    store_thread.join(5)
+
+    assert store_was_blocked is True
+    assert load_done.is_set() and store_done.is_set()
+    assert thread_errors == []
+    assert loaded == [None]
+    assert path.is_file()
+    assert loading_cache.load(key, request) == result
+    assert list(path.parent.glob(f"{key}.json.corrupt-*"))
+
+
+def test_different_cache_keys_do_not_share_mutation_lock(tmp_path, monkeypatch):
+    cache = CandidateCache(tmp_path)
+    blocked_request = make_request()
+    blocked_key = key_for(blocked_request)
+    blocked_path = cache.path_for(blocked_key)
+    blocked_path.parent.mkdir(parents=True, exist_ok=True)
+    blocked_path.write_text("{broken json", encoding="utf-8")
+    other_request = replace(blocked_request, random_seed=8)
+    other_key = key_for(other_request)
+    other_result = make_result()
+    real_quarantine = cache._quarantine
+    quarantine_entered = Event()
+    release_quarantine = Event()
+    load_done = Event()
+    store_done = Event()
+    thread_errors = []
+
+    def pause_quarantine(candidate, *args, **kwargs):
+        quarantine_entered.set()
+        if not release_quarantine.wait(5):
+            raise AssertionError("quarantine release was not signalled")
+        return real_quarantine(candidate, *args, **kwargs)
+
+    def load_cache():
+        try:
+            cache.load(blocked_key, blocked_request)
+        except BaseException as exc:
+            thread_errors.append(exc)
+        finally:
+            load_done.set()
+
+    def store_other_key():
+        try:
+            cache.store(other_key, other_request, other_result)
+        except BaseException as exc:
+            thread_errors.append(exc)
+        finally:
+            store_done.set()
+
+    monkeypatch.setattr(cache, "_quarantine", pause_quarantine)
+    load_thread = Thread(target=load_cache)
+    store_thread = Thread(target=store_other_key)
+    load_thread.start()
+    assert quarantine_entered.wait(2)
+    store_thread.start()
+    other_completed_independently = store_done.wait(2)
+    release_quarantine.set()
+    load_thread.join(5)
+    store_thread.join(5)
+
+    assert other_completed_independently is True
+    assert load_done.is_set() and store_done.is_set()
+    assert thread_errors == []
+    assert cache.load(other_key, other_request) == other_result
+
+
+def test_cache_lock_leaf_symlink_is_rejected_without_touching_target(tmp_path):
+    cache = CandidateCache(tmp_path)
+    request = make_request()
+    key = key_for(request)
+    cache.cache_root.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside-lock.txt"
+    outside.write_text("external lock owner\n", encoding="utf-8")
+    lock_path = cache.cache_root / f"{key}.lock"
+    _symlink_or_skip(lock_path, outside)
+
+    with pytest.raises(ValueError, match="lock|symlink|cache"):
+        cache.store(key, request, make_result())
+
+    assert outside.read_text(encoding="utf-8") == "external lock owner\n"
+    assert lock_path.is_symlink()
+
+
 def test_symlink_quarantine_does_not_move_concurrent_valid_replacement(
     tmp_path,
     monkeypatch,
@@ -336,8 +469,9 @@ def test_symlink_quarantine_does_not_move_concurrent_valid_replacement(
     request = make_request()
     result = make_result()
     key = key_for(request)
-    path = cache.path_for(key)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path = cache.store(key, request, result)
+    valid_payload = json.loads(path.read_text(encoding="utf-8"))
+    path.unlink()
     outside = tmp_path / "outside-broken.json"
     outside.write_text("{broken json", encoding="utf-8")
     _symlink_or_skip(path, outside)
@@ -348,7 +482,7 @@ def test_symlink_quarantine_does_not_move_concurrent_valid_replacement(
         nonlocal replaced
         if not replaced:
             candidate.unlink()
-            cache.store(key, request, result)
+            cache_module.atomic_write_json(candidate, valid_payload)
             replaced = True
         return real_quarantine(candidate, *args, **kwargs)
 

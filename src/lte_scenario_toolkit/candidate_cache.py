@@ -8,11 +8,15 @@ import math
 import os
 import re
 import stat
+import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone
 from numbers import Integral, Real
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 import numpy as np
@@ -37,6 +41,8 @@ _RESULT_FIELDS = frozenset(
     }
 )
 _CANDIDATE_FIELDS = frozenset(field.name for field in fields(Candidate))
+_THREAD_LOCKS_GUARD = Lock()
+_THREAD_LOCKS: dict[Path, Lock] = {}
 
 
 @dataclass(frozen=True)
@@ -65,6 +71,95 @@ def _same_leaf(
     right: _CacheLeafSnapshot,
 ) -> bool:
     return replace(left, digest=None) == replace(right, digest=None)
+
+
+def _is_redirected_path(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if callable(is_junction) and is_junction():
+        return True
+    try:
+        attributes = path.lstat().st_file_attributes
+    except FileNotFoundError:
+        return False
+    except AttributeError:
+        return False
+    reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(attributes & reparse_point)
+
+
+def _thread_lock_for(path: Path) -> Lock:
+    with _THREAD_LOCKS_GUARD:
+        return _THREAD_LOCKS.setdefault(path, Lock())
+
+
+def _open_lock_file(path: Path) -> int:
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise ValueError(f"Candidate cache lock cannot be opened safely: {path}") from exc
+
+    try:
+        opened = os.fstat(descriptor)
+        leaf = path.lstat()
+        if (
+            _is_redirected_path(path)
+            or not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(leaf.st_mode)
+            or opened.st_dev != leaf.st_dev
+            or opened.st_ino != leaf.st_ino
+        ):
+            raise ValueError(f"Candidate cache lock must be a regular file: {path}")
+        if opened.st_size == 0:
+            os.write(descriptor, b"\0")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return descriptor
+    except BaseException as primary_error:
+        try:
+            os.close(descriptor)
+        except BaseException as cleanup_error:
+            if hasattr(primary_error, "add_note"):
+                primary_error.add_note(
+                    f"Candidate cache lock close failed: {cleanup_error}"
+                )
+        raise
+
+
+def _acquire_os_lock(descriptor: int) -> None:
+    if os.name == "nt":
+        import errno
+        import msvcrt
+
+        busy_errors = {errno.EACCES, errno.EAGAIN, errno.EDEADLK}
+        while True:
+            try:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                return
+            except OSError as exc:
+                if exc.errno not in busy_errors:
+                    raise
+                time.sleep(0.05)
+    else:
+        import fcntl
+
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+
+
+def _release_os_lock(descriptor: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
 
 
 def _required_text(value: Any, *, field: str) -> str:
@@ -305,6 +400,31 @@ class CandidateCache:
         self.repo_root = Path(repo_root).resolve()
         self.cache_root = self.repo_root / ".lte-data" / "cache" / "candidates"
 
+    def _ensure_cache_root(self) -> None:
+        if not self.repo_root.is_dir():
+            raise ValueError(
+                f"Candidate cache repository root is not a directory: {self.repo_root}"
+            )
+        current = self.repo_root
+        for part in (".lte-data", "cache", "candidates"):
+            current /= part
+            self._assert_safe_path(current, allow_leaf_symlink=False)
+            try:
+                current.mkdir()
+            except FileExistsError:
+                pass
+            self._assert_safe_path(current, allow_leaf_symlink=False)
+            try:
+                status = current.lstat()
+            except OSError as exc:
+                raise ValueError(
+                    f"Candidate cache directory cannot be inspected: {current}"
+                ) from exc
+            if _is_redirected_path(current) or not stat.S_ISDIR(status.st_mode):
+                raise ValueError(
+                    f"Candidate cache path must contain only real directories: {current}"
+                )
+
     def _assert_safe_path(
         self,
         candidate: Path,
@@ -319,7 +439,9 @@ class CandidateCache:
         for index, part in enumerate(relative.parts):
             current /= part
             is_leaf = index == len(relative.parts) - 1
-            if current.is_symlink() and not (allow_leaf_symlink and is_leaf):
+            if _is_redirected_path(current) and not (
+                allow_leaf_symlink and is_leaf
+            ):
                 raise ValueError(f"Candidate cache path must not use symlinks: {candidate}")
         path_to_resolve = candidate.parent if allow_leaf_symlink else candidate
         try:
@@ -338,6 +460,57 @@ class CandidateCache:
 
     def path_for(self, key: str) -> Path:
         return self._path_for(key, allow_leaf_symlink=False)
+
+    def _lock_path_for(self, key: str) -> Path:
+        self._ensure_cache_root()
+        candidate = self.cache_root / f"{_validated_key(key)}.lock"
+        self._assert_safe_path(candidate, allow_leaf_symlink=False)
+        if os.path.lexists(candidate):
+            try:
+                status = candidate.lstat()
+            except OSError as exc:
+                raise ValueError(
+                    f"Candidate cache lock cannot be inspected: {candidate}"
+                ) from exc
+            if _is_redirected_path(candidate) or not stat.S_ISREG(status.st_mode):
+                raise ValueError(
+                    f"Candidate cache lock must be a regular file: {candidate}"
+                )
+        return candidate
+
+    @contextmanager
+    def _key_lock(self, key: str) -> Iterator[None]:
+        lock_path = self._lock_path_for(_validated_key(key))
+        resolved_lock_path = lock_path.parent.resolve(strict=True) / lock_path.name
+        thread_lock = _thread_lock_for(resolved_lock_path)
+        with thread_lock:
+            descriptor = _open_lock_file(lock_path)
+            acquired = False
+            primary_error: BaseException | None = None
+            try:
+                _acquire_os_lock(descriptor)
+                acquired = True
+                yield
+            except BaseException as exc:
+                primary_error = exc
+                raise
+            finally:
+                cleanup_errors: list[BaseException] = []
+                if acquired:
+                    try:
+                        _release_os_lock(descriptor)
+                    except BaseException as exc:
+                        cleanup_errors.append(exc)
+                try:
+                    os.close(descriptor)
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+                if cleanup_errors and primary_error is None:
+                    raise cleanup_errors[0]
+                if cleanup_errors and hasattr(primary_error, "add_note"):
+                    primary_error.add_note(
+                        f"Candidate cache lock cleanup failed: {cleanup_errors[0]}"
+                    )
 
     @staticmethod
     def _quarantine(path: Path, expected: _CacheLeafSnapshot) -> None:
@@ -381,45 +554,52 @@ class CandidateCache:
         path = self._path_for(validated_key, allow_leaf_symlink=True)
         if not os.path.lexists(path):
             return None
-        try:
-            before_read = _leaf_snapshot(path)
-        except FileNotFoundError:
-            return None
-        if stat.S_ISLNK(before_read.mode):
-            self._quarantine(path, before_read)
-            return None
-        if not stat.S_ISREG(before_read.mode):
-            self._quarantine(path, before_read)
-            return None
-        read_snapshot = before_read
-        try:
-            content = path.read_bytes()
-            after_read = _leaf_snapshot(path)
-            if (
-                not _same_leaf(before_read, after_read)
-                or len(content) != after_read.size
-            ):
+        with self._key_lock(validated_key):
+            path = self._path_for(validated_key, allow_leaf_symlink=True)
+            if not os.path.lexists(path):
                 return None
-            read_snapshot = replace(
-                after_read,
-                digest=hashlib.sha256(content).hexdigest(),
-            )
-            payload = json.loads(content.decode("utf-8"))
-            mapping = _strict_mapping(payload, _PAYLOAD_FIELDS, field="cache")
-            schema_version = mapping["schema_version"]
-            if type(schema_version) is not int or schema_version != CACHE_SCHEMA_VERSION:
-                raise ValueError("cache.schema_version is invalid")
-            if mapping["key"] != validated_key:
-                raise ValueError("cache.key does not match its path")
-            cached_request = _request_from_payload(mapping["request"])
-            if cached_request != expected_request:
-                raise ValueError("cache.request does not match expected_request")
-            return _result_from_payload(mapping["result"], cached_request)
-        except FileNotFoundError:
-            return None
-        except Exception:
-            self._quarantine(path, read_snapshot)
-            return None
+            try:
+                before_read = _leaf_snapshot(path)
+            except FileNotFoundError:
+                return None
+            if stat.S_ISLNK(before_read.mode):
+                self._quarantine(path, before_read)
+                return None
+            if not stat.S_ISREG(before_read.mode):
+                self._quarantine(path, before_read)
+                return None
+            read_snapshot = before_read
+            try:
+                content = path.read_bytes()
+                after_read = _leaf_snapshot(path)
+                if (
+                    not _same_leaf(before_read, after_read)
+                    or len(content) != after_read.size
+                ):
+                    return None
+                read_snapshot = replace(
+                    after_read,
+                    digest=hashlib.sha256(content).hexdigest(),
+                )
+                payload = json.loads(content.decode("utf-8"))
+                mapping = _strict_mapping(payload, _PAYLOAD_FIELDS, field="cache")
+                schema_version = mapping["schema_version"]
+                if (
+                    type(schema_version) is not int
+                    or schema_version != CACHE_SCHEMA_VERSION
+                ):
+                    raise ValueError("cache.schema_version is invalid")
+                if mapping["key"] != validated_key:
+                    raise ValueError("cache.key does not match its path")
+                cached_request = _request_from_payload(mapping["request"])
+                if cached_request != expected_request:
+                    raise ValueError("cache.request does not match expected_request")
+                return _result_from_payload(mapping["result"], cached_request)
+            except FileNotFoundError:
+                return None
+            except Exception:
+                self._quarantine(path, read_snapshot)
+                return None
 
     def store(
         self,
@@ -442,8 +622,9 @@ class CandidateCache:
             "request": request_payload,
             "result": result_payload,
         }
-        path = self.path_for(validated_key)
-        return atomic_write_json(path, payload)
+        with self._key_lock(validated_key):
+            path = self.path_for(validated_key)
+            return atomic_write_json(path, payload)
 
     @staticmethod
     def _legacy_number(value: Any, *, field: str) -> float:
