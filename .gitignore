@@ -8,6 +8,7 @@ __pycache__/
 .venv/
 venv/
 .lte-data/
+.worktrees/
 
 # Editors and operating systems
 .vscode/
