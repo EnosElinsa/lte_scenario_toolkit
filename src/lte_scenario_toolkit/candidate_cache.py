@@ -219,6 +219,17 @@ def _result_from_payload(value: Any, request: ScanRequest) -> ScanResult:
     )
     if checked_positions > total_positions:
         raise ValueError("result.checked_positions exceeds total_positions")
+    if any(
+        candidate.flat_grid_id >= total_positions
+        for candidate in candidates
+    ):
+        raise ValueError(
+            "result.candidates flat_grid_id must be less than total_positions"
+        )
+    if request.mode == "complete" and checked_positions != total_positions:
+        raise ValueError(
+            "result.checked_positions must equal total_positions for complete scans"
+        )
     if mapping["completed"] is not True:
         raise ValueError("result.completed must be true")
     algorithm_version = _required_text(

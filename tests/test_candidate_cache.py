@@ -194,6 +194,87 @@ def test_store_and_load_round_trip_losslessly_without_geometry(tmp_path):
     assert len(payload["result"]["candidates"]) == 2
 
 
+@pytest.mark.parametrize(
+    ("flat_grid_id", "total_positions"),
+    [(10, 10), (11, 10), (0, 0)],
+)
+def test_store_rejects_candidate_ids_outside_total_grid(
+    tmp_path,
+    flat_grid_id,
+    total_positions,
+):
+    cache = CandidateCache(tmp_path)
+    request = make_request()
+    key = key_for(request)
+    result = make_result(
+        candidates=(Candidate(flat_grid_id, 2, 1.0, 1.0, 2.0, 2.0),),
+        checked_positions=min(8, total_positions),
+        total_positions=total_positions,
+    )
+
+    with pytest.raises(ValueError, match="flat_grid_id|total_positions"):
+        cache.store(key, request, result)
+
+    assert not cache.path_for(key).exists()
+
+
+@pytest.mark.parametrize(
+    ("flat_grid_id", "total_positions"),
+    [(10, 10), (11, 10), (0, 0)],
+)
+def test_load_quarantines_candidate_ids_outside_total_grid(
+    tmp_path,
+    flat_grid_id,
+    total_positions,
+):
+    cache = CandidateCache(tmp_path)
+    request = make_request()
+    key = key_for(request)
+    path = cache.store(key, request, make_result())
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["result"]["candidates"][0]["flat_grid_id"] = flat_grid_id
+    payload["result"]["checked_positions"] = min(8, total_positions)
+    payload["result"]["total_positions"] = total_positions
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert cache.load(key, request) is None
+    assert not path.exists()
+    assert list(path.parent.glob(f"{key}.json.corrupt-*"))
+
+
+def test_complete_cache_requires_full_coverage_on_store_and_load(tmp_path):
+    cache = CandidateCache(tmp_path)
+    request = make_request(mode="complete")
+    key = key_for(request)
+    partial = make_result(checked_positions=8, total_positions=10)
+
+    with pytest.raises(ValueError, match="checked_positions|complete|coverage"):
+        cache.store(key, request, partial)
+
+    complete = make_result(checked_positions=10, total_positions=10)
+    path = cache.store(key, request, complete)
+    assert cache.load(key, request) == complete
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["result"]["checked_positions"] = 8
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert cache.load(key, request) is None
+    assert not path.exists()
+    assert list(path.parent.glob(f"{key}.json.corrupt-*"))
+
+
+def test_fast_completed_partial_coverage_remains_cacheable(tmp_path):
+    cache = CandidateCache(tmp_path)
+    request = make_request(mode="fast")
+    result = make_result(checked_positions=8, total_positions=10)
+    key = key_for(request)
+
+    path = cache.store(key, request, result)
+
+    assert path.is_file()
+    assert cache.load(key, request) == result
+
+
 def test_corrupt_cache_is_quarantined_collision_safely_without_harming_other_entries(
     tmp_path,
 ):
