@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 from shapely.geometry import box
 
+import lte_scenario_toolkit.candidate_scanner as scanner_module
 from lte_scenario_toolkit.candidate_scanner import (
     Candidate,
     ScanCancelled,
@@ -645,3 +646,232 @@ def test_scan_accepts_empty_real_coordinate_array_on_non_empty_grid():
 
     assert result.completed is True
     assert len(result.candidates) == 1
+
+
+def test_complete_uniform_scan_is_deterministic_and_checks_every_position():
+    coordinates = np.asarray(
+        [(x, y) for x in range(8) for y in range(8)],
+        dtype=float,
+    )
+    request = make_request(
+        rectangle_size=3,
+        target_count=16,
+        mode="complete",
+        strategy="uniform",
+        max_candidates=3,
+        minimum_spacing=1,
+    )
+    boundary = box(-1, -1, 9, 9)
+
+    first = scan_candidates(request, boundary, coordinates)
+    second = scan_candidates(request, boundary, coordinates)
+
+    assert first == second
+    assert first.completed is True
+    assert first.checked_positions == first.total_positions
+    assert len(first.candidates) <= request.max_candidates
+
+
+def test_complete_scan_enforces_minimum_spacing_on_ranked_result():
+    coordinates = np.asarray(
+        [(x, y) for x in range(12) for y in range(12)],
+        dtype=float,
+    )
+    request = make_request(
+        rectangle_size=3,
+        target_count=16,
+        mode="complete",
+        max_candidates=10,
+        minimum_spacing=4,
+    )
+
+    result = scan_candidates(request, box(-1, -1, 13, 13), coordinates)
+
+    assert result.checked_positions == result.total_positions
+    for left, right in combinations(result.candidates, 2):
+        assert np.hypot(left.center_x - right.center_x, left.center_y - right.center_y) >= 4
+
+
+def test_complete_rank_ties_select_smallest_strictly_contained_flat_id(
+    monkeypatch,
+):
+    monkeypatch.setattr(scanner_module, "_priority", lambda seed, flat_grid_id: 5)
+    request = make_request(
+        target_count=0,
+        mode="complete",
+        strategy="uniform",
+        max_candidates=1,
+    )
+
+    result = scan_candidates(
+        request,
+        box(0, 0, 10, 10),
+        np.empty((0, 2), dtype=float),
+    )
+
+    assert result.checked_positions == result.total_positions
+    assert result.candidates[0].flat_grid_id == 7
+
+
+def test_complete_progress_replays_provisional_selection_and_reaches_total():
+    events = []
+    request = make_request(
+        target_count=0,
+        mode="complete",
+        strategy="uniform",
+        max_candidates=2,
+        minimum_spacing=1,
+    )
+
+    result = scan_candidates(
+        request,
+        box(0, 0, 10, 10),
+        np.empty((0, 2), dtype=float),
+        progress=events.append,
+    )
+
+    replayed = {}
+    for event in events:
+        for candidate in event.added_candidates:
+            replayed[candidate.flat_grid_id] = candidate
+        for flat_grid_id in event.removed_flat_grid_ids:
+            replayed.pop(flat_grid_id, None)
+        assert len(replayed) == event.candidate_count
+        assert event.candidate_count <= request.max_candidates
+    assert events[-1].phase == "completed"
+    assert events[-1].checked_positions == result.total_positions
+    assert result.checked_positions == result.total_positions
+    assert set(replayed) == {candidate.flat_grid_id for candidate in result.candidates}
+    assert any(event.removed_flat_grid_ids for event in events)
+
+
+def test_complete_capacity_replaces_worst_with_later_better_rank(monkeypatch):
+    priorities = {9: 50, 10: 40, 11: 10, 12: 100}
+    monkeypatch.setattr(
+        scanner_module,
+        "_priority",
+        lambda seed, flat_grid_id: priorities.get(flat_grid_id, 1000 + flat_grid_id),
+    )
+    events = []
+    request = make_request(
+        rectangle_size=2,
+        target_count=0,
+        mode="complete",
+        max_candidates=2,
+        minimum_spacing=0.5,
+    )
+
+    result = scan_candidates(
+        request,
+        box(0, 0, 10, 6),
+        np.empty((0, 2), dtype=float),
+        progress=events.append,
+    )
+
+    final_ids = {candidate.flat_grid_id for candidate in result.candidates}
+    assert 11 in final_ids
+    assert 9 not in final_ids
+    assert any(
+        11 in {item.flat_grid_id for item in event.added_candidates}
+        and 9 in event.removed_flat_grid_ids
+        for event in events
+    )
+
+
+@pytest.mark.parametrize(
+    ("new_priority", "replacement_expected"),
+    [(10, True), (25, False)],
+)
+def test_complete_spacing_conflicts_require_better_rank_than_every_conflict(
+    monkeypatch,
+    new_priority,
+    replacement_expected,
+):
+    priorities = {6: 20, 7: 100, 8: 30, 11: 100, 12: new_priority}
+    monkeypatch.setattr(
+        scanner_module,
+        "_priority",
+        lambda seed, flat_grid_id: priorities.get(flat_grid_id, 1000 + flat_grid_id),
+    )
+    events = []
+    request = make_request(
+        rectangle_size=1,
+        target_count=0,
+        mode="complete",
+        max_candidates=2,
+        minimum_spacing=2,
+    )
+
+    result = scan_candidates(
+        request,
+        box(0, 0, 6, 6),
+        np.empty((0, 2), dtype=float),
+        progress=events.append,
+    )
+
+    added_ids = {
+        candidate.flat_grid_id
+        for event in events
+        for candidate in event.added_candidates
+    }
+    removed_ids = {
+        flat_grid_id
+        for event in events
+        for flat_grid_id in event.removed_flat_grid_ids
+    }
+    final_ids = {candidate.flat_grid_id for candidate in result.candidates}
+    if replacement_expected:
+        assert 12 in added_ids
+        assert {6, 8}.issubset(removed_ids)
+        assert 12 in final_ids
+        assert not {6, 8} & final_ids
+    else:
+        assert 12 not in added_ids
+        assert not {6, 8} & removed_ids
+        assert {6, 8}.issubset(final_ids)
+
+
+def test_complete_result_is_rank_sorted_and_repeatable(monkeypatch):
+    monkeypatch.setattr(
+        scanner_module,
+        "_priority",
+        lambda seed, flat_grid_id: (flat_grid_id * 17) % 31,
+    )
+    request = make_request(
+        target_count=0,
+        mode="complete",
+        strategy="uniform",
+        max_candidates=5,
+        minimum_spacing=1,
+    )
+    boundary = box(0, 0, 10, 10)
+    coordinates = np.empty((0, 2), dtype=float)
+
+    first = scan_candidates(request, boundary, coordinates)
+    second = scan_candidates(request, boundary, coordinates)
+
+    assert first == second
+    ranks = [scanner_module._rank(request.random_seed, item) for item in first.candidates]
+    assert ranks == sorted(ranks)
+
+
+def test_complete_scan_cancels_before_full_coverage_without_completed_event():
+    cancel = Event()
+    events = []
+
+    def cancel_after_first_row(event):
+        events.append(event)
+        cancel.set()
+
+    with pytest.raises(ScanCancelled):
+        scan_candidates(
+            make_request(target_count=0, mode="complete", max_candidates=1),
+            box(0, 0, 10, 10),
+            np.empty((0, 2), dtype=float),
+            progress=cancel_after_first_row,
+            cancel=cancel,
+        )
+
+    assert events
+    assert events[-1].checked_positions < events[-1].total_positions
+    assert all(event.phase != "completed" for event in events)

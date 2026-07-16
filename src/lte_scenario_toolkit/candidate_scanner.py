@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -239,6 +240,84 @@ class _SpacingIndex:
         return True
 
 
+def _priority(seed: int, flat_grid_id: int) -> int:
+    payload = f"{seed}:{flat_grid_id}".encode("ascii")
+    return int.from_bytes(
+        hashlib.blake2b(payload, digest_size=8).digest(),
+        "big",
+    )
+
+
+def _rank(seed: int, candidate: Candidate) -> tuple[int, int]:
+    return (
+        _priority(seed, candidate.flat_grid_id),
+        candidate.flat_grid_id,
+    )
+
+
+class _CompleteSelection:
+    def __init__(
+        self,
+        *,
+        random_seed: int,
+        maximum_candidates: int,
+        minimum_spacing: float,
+    ) -> None:
+        self.random_seed = random_seed
+        self.maximum_candidates = maximum_candidates
+        self.minimum_spacing = minimum_spacing
+        self.selected: list[tuple[tuple[int, int], Candidate]] = []
+
+    def consider(self, candidate: Candidate) -> tuple[bool, tuple[int, ...]]:
+        candidate_rank = _rank(self.random_seed, candidate)
+        conflicts = [
+            ranked
+            for ranked in self.selected
+            if math.hypot(
+                ranked[1].center_x - candidate.center_x,
+                ranked[1].center_y - candidate.center_y,
+            )
+            < self.minimum_spacing
+        ]
+        if conflicts:
+            if not all(candidate_rank < rank for rank, _ in conflicts):
+                return False, ()
+            conflict_ids = {selected.flat_grid_id for _, selected in conflicts}
+            removed = tuple(
+                selected.flat_grid_id
+                for _, selected in self.selected
+                if selected.flat_grid_id in conflict_ids
+            )
+            self.selected = [
+                ranked
+                for ranked in self.selected
+                if ranked[1].flat_grid_id not in conflict_ids
+            ]
+        elif len(self.selected) < self.maximum_candidates:
+            removed = ()
+        else:
+            worst = max(self.selected, key=lambda ranked: ranked[0])
+            if candidate_rank >= worst[0]:
+                return False, ()
+            self.selected.remove(worst)
+            removed = (worst[1].flat_grid_id,)
+
+        self.selected.append((candidate_rank, candidate))
+        return True, removed
+
+    def candidates(self) -> tuple[Candidate, ...]:
+        return tuple(
+            candidate
+            for _, candidate in sorted(
+                self.selected,
+                key=lambda ranked: ranked[0],
+            )
+        )
+
+    def __len__(self) -> int:
+        return len(self.selected)
+
+
 def _cancelled(cancel: _CancellationSignal | None) -> bool:
     return cancel is not None and cancel.is_set()
 
@@ -330,7 +409,7 @@ def scan_candidates(
     progress: Callable[[ScanProgress], None] | None = None,
     cancel: _CancellationSignal | None = None,
 ) -> ScanResult:
-    """Run the cancellable row-sweep fast scanner without Cartesian positions."""
+    """Run cancellable fast or bounded-complete scans without Cartesian positions."""
 
     if not isinstance(request, ScanRequest):
         raise ValueError("request must be a ScanRequest")
@@ -359,8 +438,17 @@ def scan_candidates(
     )
     target_minimum = request.target_count - request.tolerance
     target_maximum = request.target_count + request.tolerance
-    selected: list[Candidate] = []
-    spacing = _SpacingIndex(request.minimum_spacing)
+    fast_selected: list[Candidate] = []
+    fast_spacing = _SpacingIndex(request.minimum_spacing)
+    complete_selection = (
+        _CompleteSelection(
+            random_seed=request.random_seed,
+            maximum_candidates=request.max_candidates,
+            minimum_spacing=request.minimum_spacing,
+        )
+        if request.mode == "complete"
+        else None
+    )
     checked_positions = 0
 
     for traversal_y_index, original_y_index_value in enumerate(y_order):
@@ -387,6 +475,7 @@ def scan_candidates(
             request.rectangle_size,
         )
         added_this_row: list[Candidate] = []
+        removed_this_row: list[int] = []
 
         for original_x_index_value in x_order:
             original_x_index = int(original_x_index_value)
@@ -407,25 +496,31 @@ def scan_candidates(
                 center_x=left_x + request.rectangle_size / 2.0,
                 center_y=y + request.rectangle_size / 2.0,
             )
-            if not spacing.accepts(candidate):
+            if complete_selection is not None:
+                accepted, removed_ids = complete_selection.consider(candidate)
+                if not accepted:
+                    continue
+                added_this_row.append(candidate)
+                removed_this_row.extend(removed_ids)
                 continue
-            selected.append(candidate)
+            if not fast_spacing.accepts(candidate):
+                continue
+            fast_selected.append(candidate)
             added_this_row.append(candidate)
-            if len(selected) >= request.max_candidates:
+            if len(fast_selected) >= request.max_candidates:
                 _raise_if_cancelled(cancel)
                 event = ScanProgress(
                     phase="completed",
                     checked_positions=checked_positions,
                     total_positions=total_positions,
-                    candidate_count=len(selected),
+                    candidate_count=len(fast_selected),
                     elapsed_seconds=perf_counter() - started_at,
                     added_candidates=tuple(added_this_row),
                 )
                 if progress is not None:
                     progress(event)
-                # Complete-mode replacement and ranking are intentionally Task 6.
                 return ScanResult(
-                    candidates=tuple(selected),
+                    candidates=tuple(fast_selected),
                     checked_positions=checked_positions,
                     total_positions=total_positions,
                     completed=True,
@@ -439,9 +534,14 @@ def scan_candidates(
             phase="completed" if final_row else "scanning",
             checked_positions=checked_positions,
             total_positions=total_positions,
-            candidate_count=len(selected),
+            candidate_count=(
+                len(complete_selection)
+                if complete_selection is not None
+                else len(fast_selected)
+            ),
             elapsed_seconds=perf_counter() - started_at,
             added_candidates=tuple(added_this_row),
+            removed_flat_grid_ids=tuple(removed_this_row),
         )
         if progress is not None:
             progress(event)
@@ -449,7 +549,11 @@ def scan_candidates(
             _raise_if_cancelled(cancel)
 
     return ScanResult(
-        candidates=tuple(selected),
+        candidates=(
+            complete_selection.candidates()
+            if complete_selection is not None
+            else tuple(fast_selected)
+        ),
         checked_positions=checked_positions,
         total_positions=total_positions,
         completed=True,
