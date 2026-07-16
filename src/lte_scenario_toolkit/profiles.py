@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -29,6 +30,8 @@ DEFAULT_PROFILE_VALUES: dict[str, Any] = {
     "min_spacing": 3000,
     "random_seed": 42,
 }
+
+_MISSING = object()
 
 
 @dataclass(frozen=True)
@@ -127,6 +130,89 @@ def _required(mapping: Mapping[str, Any], key: str, prefix: str) -> Any:
         ) from exc
 
 
+def _value(
+    mapping: Mapping[str, Any],
+    key: str,
+    path: str,
+    *,
+    default: Any = _MISSING,
+) -> Any:
+    if key in mapping:
+        return mapping[key]
+    if default is not _MISSING:
+        return default
+    prefix, _, _ = path.rpartition(".")
+    return _required(mapping, key, prefix)
+
+
+def _string_value(
+    mapping: Mapping[str, Any],
+    key: str,
+    path: str,
+    *,
+    default: Any = _MISSING,
+) -> str:
+    value = _value(mapping, key, path, default=default)
+    if type(value) is not str:
+        raise ValueError(f"{path} must be a string")
+    return value
+
+
+def _optional_string_value(
+    mapping: Mapping[str, Any],
+    key: str,
+    path: str,
+    *,
+    default: str | None,
+) -> str | None:
+    value = _value(mapping, key, path, default=default)
+    if value is not None and type(value) is not str:
+        raise ValueError(f"{path} must be null or a string")
+    return value
+
+
+def _integer_value(
+    mapping: Mapping[str, Any],
+    key: str,
+    path: str,
+    *,
+    default: Any = _MISSING,
+) -> int:
+    value = _value(mapping, key, path, default=default)
+    if type(value) is not int:
+        raise ValueError(f"{path} must be an integer")
+    return value
+
+
+def _boolean_value(
+    mapping: Mapping[str, Any],
+    key: str,
+    path: str,
+    *,
+    default: bool,
+) -> bool:
+    value = _value(mapping, key, path, default=default)
+    if type(value) is not bool:
+        raise ValueError(f"{path} must be a boolean")
+    return value
+
+
+def _finite_float_value(
+    mapping: Mapping[str, Any],
+    key: str,
+    path: str,
+    *,
+    default: float,
+) -> float:
+    value = _value(mapping, key, path, default=default)
+    if type(value) not in {int, float}:
+        raise ValueError(f"{path} must be a finite number")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{path} must be a finite number")
+    return result
+
+
 def _resolve_path(value: str | Path, root: Path) -> Path:
     path = Path(value)
     return path.resolve() if path.is_absolute() else (root / path).resolve()
@@ -175,8 +261,13 @@ def load_profile(
         else source_path.parent
     )
     document = yaml.safe_load(source_path.read_text(encoding="utf-8")) or {}
-    if not isinstance(document, Mapping) or document.get("schema_version") != 2:
-        raise ValueError("Expected a schema-version-2 experiment profile")
+    if not isinstance(document, Mapping):
+        raise ValueError("Configuration document must be a mapping")
+    if "schema_version" not in document:
+        raise ValueError("Missing required configuration value: schema_version")
+    schema_version = document["schema_version"]
+    if type(schema_version) is not int or schema_version != 2:
+        raise ValueError("schema_version must be the integer 2")
 
     profile_section = _mapping(document, "profile")
     inputs = _mapping(document, "inputs")
@@ -188,73 +279,178 @@ def load_profile(
 
     output_defaults = OutputSettings()
     output_settings = OutputSettings(
-        save_csv=bool(outputs.get("save_csv", output_defaults.save_csv)),
-        save_preview_png=bool(
-            outputs.get("save_preview_png", output_defaults.save_preview_png)
+        save_csv=_boolean_value(
+            outputs,
+            "save_csv",
+            "outputs.save_csv",
+            default=output_defaults.save_csv,
         ),
-        save_terrain_png=bool(
-            outputs.get("save_terrain_png", output_defaults.save_terrain_png)
+        save_preview_png=_boolean_value(
+            outputs,
+            "save_preview_png",
+            "outputs.save_preview_png",
+            default=output_defaults.save_preview_png,
         ),
-        save_terrain_eps=bool(
-            outputs.get("save_terrain_eps", output_defaults.save_terrain_eps)
+        save_terrain_png=_boolean_value(
+            outputs,
+            "save_terrain_png",
+            "outputs.save_terrain_png",
+            default=output_defaults.save_terrain_png,
         ),
-        save_terrain_html=bool(
-            outputs.get("save_terrain_html", output_defaults.save_terrain_html)
+        save_terrain_eps=_boolean_value(
+            outputs,
+            "save_terrain_eps",
+            "outputs.save_terrain_eps",
+            default=output_defaults.save_terrain_eps,
+        ),
+        save_terrain_html=_boolean_value(
+            outputs,
+            "save_terrain_html",
+            "outputs.save_terrain_html",
+            default=output_defaults.save_terrain_html,
         ),
     )
     figure_defaults = FigureSettings()
-    title = figures.get("title", figure_defaults.title)
     figure_settings = FigureSettings(
-        preset=str(figures.get("preset", figure_defaults.preset)),
-        colormap=str(figures.get("colormap", figure_defaults.colormap)),
-        dpi=int(figures.get("dpi", figure_defaults.dpi)),
-        azimuth_deg=float(figures.get("azimuth_deg", figure_defaults.azimuth_deg)),
-        elevation_deg=float(
-            figures.get("elevation_deg", figure_defaults.elevation_deg)
+        preset=_string_value(
+            figures,
+            "preset",
+            "figures.preset",
+            default=figure_defaults.preset,
         ),
-        vertical_exaggeration=float(
-            figures.get(
-                "vertical_exaggeration",
-                figure_defaults.vertical_exaggeration,
-            )
+        colormap=_string_value(
+            figures,
+            "colormap",
+            "figures.colormap",
+            default=figure_defaults.colormap,
         ),
-        station_color=str(
-            figures.get("station_color", figure_defaults.station_color)
+        dpi=_integer_value(
+            figures,
+            "dpi",
+            "figures.dpi",
+            default=figure_defaults.dpi,
         ),
-        station_marker_size=float(
-            figures.get(
-                "station_marker_size",
-                figure_defaults.station_marker_size,
-            )
+        azimuth_deg=_finite_float_value(
+            figures,
+            "azimuth_deg",
+            "figures.azimuth_deg",
+            default=figure_defaults.azimuth_deg,
         ),
-        title=None if title is None else str(title),
+        elevation_deg=_finite_float_value(
+            figures,
+            "elevation_deg",
+            "figures.elevation_deg",
+            default=figure_defaults.elevation_deg,
+        ),
+        vertical_exaggeration=_finite_float_value(
+            figures,
+            "vertical_exaggeration",
+            "figures.vertical_exaggeration",
+            default=figure_defaults.vertical_exaggeration,
+        ),
+        station_color=_string_value(
+            figures,
+            "station_color",
+            "figures.station_color",
+            default=figure_defaults.station_color,
+        ),
+        station_marker_size=_finite_float_value(
+            figures,
+            "station_marker_size",
+            "figures.station_marker_size",
+            default=figure_defaults.station_marker_size,
+        ),
+        title=_optional_string_value(
+            figures,
+            "title",
+            "figures.title",
+            default=figure_defaults.title,
+        ),
     )
 
     profile = ExperimentProfile(
         schema_version=2,
-        profile_id=str(_required(profile_section, "id", "profile")),
-        display_name=str(_required(profile_section, "display_name", "profile")),
-        scenario_id=str(_required(profile_section, "scenario_id", "profile")),
-        points_dataset_id=str(
-            _required(inputs, "points_dataset_id", "inputs")
+        profile_id=_string_value(
+            profile_section,
+            "id",
+            "profile.id",
         ),
-        random_seed=int(
-            experiment.get("random_seed", DEFAULT_PROFILE_VALUES["random_seed"])
+        display_name=_string_value(
+            profile_section,
+            "display_name",
+            "profile.display_name",
         ),
-        target_crs=str(_required(spatial, "target_crs", "spatial")),
-        rect_size=int(_required(spatial, "rectangle_size_m", "spatial")),
-        target_count=int(
-            _required(spatial, "target_base_station_count", "spatial")
+        scenario_id=_string_value(
+            profile_section,
+            "scenario_id",
+            "profile.scenario_id",
         ),
-        tolerance=int(_required(spatial, "count_tolerance", "spatial")),
-        scan_mode=str(scan.get("mode", DEFAULT_PROFILE_VALUES["scan_mode"])),
-        strategy=str(_required(scan, "strategy", "scan")),
-        scan_step=int(_required(scan, "step_m", "scan")),
-        max_rects=int(_required(scan, "max_rectangles", "scan")),
-        min_spacing=int(
-            _required(scan, "minimum_center_spacing_m", "scan")
+        points_dataset_id=_string_value(
+            inputs,
+            "points_dataset_id",
+            "inputs.points_dataset_id",
         ),
-        output_root=_resolve_path(outputs.get("root", "results"), root),
+        random_seed=_integer_value(
+            experiment,
+            "random_seed",
+            "experiment.random_seed",
+            default=DEFAULT_PROFILE_VALUES["random_seed"],
+        ),
+        target_crs=_string_value(
+            spatial,
+            "target_crs",
+            "spatial.target_crs",
+        ),
+        rect_size=_integer_value(
+            spatial,
+            "rectangle_size_m",
+            "spatial.rectangle_size_m",
+        ),
+        target_count=_integer_value(
+            spatial,
+            "target_base_station_count",
+            "spatial.target_base_station_count",
+        ),
+        tolerance=_integer_value(
+            spatial,
+            "count_tolerance",
+            "spatial.count_tolerance",
+        ),
+        scan_mode=_string_value(
+            scan,
+            "mode",
+            "scan.mode",
+            default=DEFAULT_PROFILE_VALUES["scan_mode"],
+        ),
+        strategy=_string_value(
+            scan,
+            "strategy",
+            "scan.strategy",
+        ),
+        scan_step=_integer_value(
+            scan,
+            "step_m",
+            "scan.step_m",
+        ),
+        max_rects=_integer_value(
+            scan,
+            "max_rectangles",
+            "scan.max_rectangles",
+        ),
+        min_spacing=_integer_value(
+            scan,
+            "minimum_center_spacing_m",
+            "scan.minimum_center_spacing_m",
+        ),
+        output_root=_resolve_path(
+            _string_value(
+                outputs,
+                "root",
+                "outputs.root",
+                default="results",
+            ),
+            root,
+        ),
         outputs=output_settings,
         figure=figure_settings,
         source_path=source_path,

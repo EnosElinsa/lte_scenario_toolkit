@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import pytest
@@ -198,3 +199,85 @@ def test_load_profile_rejects_unsafe_profile_id(tmp_path, bad_id):
 
     with pytest.raises(ValueError, match=r"profile\.id"):
         load_profile(profile_path, repo_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("field_path", "invalid_value"),
+    [
+        ("schema_version", 2.0),
+        ("schema_version", True),
+        ("profile.display_name", None),
+        ("profile.scenario_id", 123),
+        ("inputs.points_dataset_id", None),
+        ("spatial.rectangle_size_m", 1.9),
+        ("spatial.target_base_station_count", True),
+        ("spatial.count_tolerance", "1"),
+        ("experiment.random_seed", 7.5),
+        ("scan.step_m", True),
+        ("scan.mode", 1),
+        ("outputs.root", ["results"]),
+        ("outputs.save_csv", "false"),
+        ("figures.dpi", True),
+        ("figures.vertical_exaggeration", float("nan")),
+        ("figures.title", 123),
+    ],
+)
+def test_load_profile_rejects_invalid_value_types_with_field_location(
+    tmp_path,
+    field_path,
+    invalid_value,
+):
+    profile_path = tmp_path / "profile.yaml"
+    write_profile(profile_path)
+    document = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    path_parts = field_path.split(".")
+    target = document
+    for part in path_parts[:-1]:
+        target = target[part]
+    target[path_parts[-1]] = invalid_value
+    profile_path.write_text(yaml.safe_dump(document), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=re.escape(field_path)):
+        load_profile(profile_path, repo_root=tmp_path)
+
+
+def test_load_profile_accepts_finite_figure_numbers_and_real_booleans(tmp_path):
+    profile_path = tmp_path / "profile.yaml"
+    write_profile(profile_path)
+    document = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    document["figures"].update(
+        {
+            "azimuth_deg": -45,
+            "elevation_deg": 22.5,
+            "vertical_exaggeration": 2,
+            "station_marker_size": 12.25,
+        }
+    )
+    document["outputs"].update(
+        {
+            "save_csv": False,
+            "save_preview_png": True,
+            "save_terrain_png": False,
+            "save_terrain_eps": True,
+            "save_terrain_html": False,
+        }
+    )
+    profile_path.write_text(yaml.safe_dump(document), encoding="utf-8")
+
+    profile = load_profile(profile_path, repo_root=tmp_path)
+
+    assert profile.figure.azimuth_deg == -45.0
+    assert profile.figure.elevation_deg == 22.5
+    assert profile.figure.vertical_exaggeration == 2.0
+    assert profile.figure.station_marker_size == 12.25
+    assert type(profile.figure.azimuth_deg) is float
+    assert type(profile.figure.elevation_deg) is float
+    assert type(profile.figure.vertical_exaggeration) is float
+    assert type(profile.figure.station_marker_size) is float
+    assert profile.outputs == OutputSettings(
+        save_csv=False,
+        save_preview_png=True,
+        save_terrain_png=False,
+        save_terrain_eps=True,
+        save_terrain_html=False,
+    )
