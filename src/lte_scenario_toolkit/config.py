@@ -8,7 +8,7 @@ from typing import Any
 
 import yaml
 
-from .profiles import load_profile
+from .profiles import _profile_repository, load_profile
 
 VALID_SCAN_STRATEGIES = {"sequential", "uniform"}
 
@@ -26,8 +26,7 @@ def _resolve_path(value: str | Path, root: Path) -> Path:
 
 
 def _infer_project_root(config_path: Path) -> Path:
-    parent = config_path.parent
-    return parent.parent if parent.name.casefold() == "configs" else parent
+    return _profile_repository(config_path)
 
 
 def load_experiment_config(

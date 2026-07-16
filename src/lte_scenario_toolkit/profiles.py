@@ -16,6 +16,7 @@ import yaml
 
 from .data_catalog import (
     CatalogError,
+    ConcurrentCatalogUpdateError,
     DataCatalog,
     catalog_transaction_lock,
     load_data_catalog,
@@ -43,6 +44,10 @@ DEFAULT_PROFILE_VALUES: dict[str, Any] = {
 }
 
 _MISSING = object()
+
+
+class ConcurrentProfileUpdateError(RuntimeError):
+    """Raised when a stored profile changes during a mutating transaction."""
 
 
 @dataclass(frozen=True)
@@ -320,8 +325,8 @@ def _validate_profile(profile: ExperimentProfile) -> ExperimentProfile:
 
 
 def _profile_repository(path: Path) -> Path:
-    for parent in (path.parent, *path.parents):
-        if parent.name == "configs":
+    for parent in path.parents:
+        if parent.name.casefold() == "configs":
             return parent.parent.resolve()
     return path.parent.resolve()
 
@@ -468,7 +473,7 @@ def load_profile(
     root = (
         Path(repo_root).resolve()
         if repo_root is not None
-        else source_path.parent
+        else _profile_repository(source_path)
     )
     document = yaml.safe_load(source_path.read_text(encoding="utf-8")) or {}
     if not isinstance(document, Mapping):
@@ -736,8 +741,19 @@ class ProfileStore:
         document: dict[str, Any],
     ) -> DataCatalog:
         original = catalog.path.read_bytes()
+        expected = yaml.safe_dump(
+            document,
+            sort_keys=False,
+            allow_unicode=True,
+        ).encode("utf-8")
+        expected_with_native_newlines = expected.replace(
+            b"\n",
+            os.linesep.encode("ascii"),
+        )
         try:
             return save_data_catalog(catalog, document)
+        except ConcurrentCatalogUpdateError:
+            raise
         except Exception as exc:
             try:
                 try:
@@ -745,8 +761,13 @@ class ProfileStore:
                 except FileNotFoundError:
                     _atomic_restore_bytes(catalog.path, original)
                 else:
-                    if current != original:
+                    if current in {expected, expected_with_native_newlines}:
                         _atomic_restore_bytes(catalog.path, original)
+                    elif current != original:
+                        exc.add_note(
+                            f"Catalog rollback skipped for {catalog.path}: "
+                            "catalog changed after this operation wrote it"
+                        )
             except Exception as rollback_error:
                 exc.add_note(
                     f"Catalog rollback also failed for {catalog.path}: {rollback_error}"
@@ -771,11 +792,41 @@ class ProfileStore:
         self,
         path: str | Path,
         catalog: DataCatalog,
-    ) -> tuple[Path, ExperimentProfile]:
+    ) -> tuple[Path, ExperimentProfile, bytes]:
         resolved = self._profile_path(path, must_exist=True)
+        original = resolved.read_bytes()
         profile = load_profile(resolved, repo_root=self.repo_root)
+        try:
+            current = resolved.read_bytes()
+        except FileNotFoundError as exc:
+            raise ConcurrentProfileUpdateError(
+                f"Profile changed while it was loaded: {resolved}"
+            ) from exc
+        if current != original:
+            raise ConcurrentProfileUpdateError(
+                f"Profile changed while it was loaded: {resolved}"
+            )
         self._validate_profile_catalog(profile, catalog)
-        return resolved, profile
+        return resolved, profile, original
+
+    @staticmethod
+    def _unlink_profile_if_unchanged(path: Path, expected: bytes) -> None:
+        try:
+            current = path.read_bytes()
+        except FileNotFoundError as exc:
+            raise ConcurrentProfileUpdateError(
+                f"Profile changed before it could be removed: {path}"
+            ) from exc
+        if current != expected:
+            raise ConcurrentProfileUpdateError(
+                f"Profile changed before it could be removed: {path}"
+            )
+        try:
+            path.unlink()
+        except FileNotFoundError as exc:
+            raise ConcurrentProfileUpdateError(
+                f"Profile changed before it could be removed: {path}"
+            ) from exc
 
     def _catalog_profile_path(
         self,
@@ -917,7 +968,7 @@ class ProfileStore:
 
         with catalog_transaction_lock(self.repo_root):
             catalog = self._load_catalog()
-            _, source_profile = self._load_stored_profile(source, catalog)
+            _, source_profile, _ = self._load_stored_profile(source, catalog)
             copied = replace(
                 source_profile,
                 profile_id=profile_id,
@@ -951,7 +1002,10 @@ class ProfileStore:
 
         with catalog_transaction_lock(self.repo_root):
             catalog = self._load_catalog()
-            source_path, source_profile = self._load_stored_profile(source, catalog)
+            source_path, source_profile, source_bytes = self._load_stored_profile(
+                source,
+                catalog,
+            )
             renamed = replace(
                 source_profile,
                 profile_id=profile_id,
@@ -984,7 +1038,7 @@ class ProfileStore:
                         self._relative_profile_path(destination),
                     )
                     saved_catalog = self._save_catalog(catalog, document)
-                source_path.unlink()
+                self._unlink_profile_if_unchanged(source_path, source_bytes)
             except Exception as exc:
                 catalog_restored = saved_catalog is None
                 if saved_catalog is not None:
@@ -1011,7 +1065,7 @@ class ProfileStore:
         with catalog_transaction_lock(self.repo_root):
             catalog = self._load_catalog()
             catalog.scenario(scenario_id)
-            resolved, profile = self._load_stored_profile(profile_path, catalog)
+            resolved, profile, _ = self._load_stored_profile(profile_path, catalog)
             if profile.scenario_id != scenario_id:
                 raise ValueError(
                     f"Profile scenario {profile.scenario_id!r} does not match {scenario_id!r}"
@@ -1034,16 +1088,19 @@ class ProfileStore:
 
         with catalog_transaction_lock(self.repo_root):
             catalog = self._load_catalog()
-            source, profile = self._load_stored_profile(profile_path, catalog)
+            source, profile, source_bytes = self._load_stored_profile(
+                profile_path,
+                catalog,
+            )
             default_path = self._catalog_profile_path(catalog, profile.scenario_id)
             if default_path != source:
-                source.unlink()
+                self._unlink_profile_if_unchanged(source, source_bytes)
                 return
             if replacement_default is None:
                 raise ValueError(
                     "Cannot delete the default profile without a replacement default"
                 )
-            replacement_path, replacement = self._load_stored_profile(
+            replacement_path, replacement, _ = self._load_stored_profile(
                 replacement_default,
                 catalog,
             )
@@ -1060,7 +1117,7 @@ class ProfileStore:
             )
             saved_catalog = self._save_catalog(catalog, document)
             try:
-                source.unlink()
+                self._unlink_profile_if_unchanged(source, source_bytes)
             except Exception as exc:
                 try:
                     save_data_catalog(saved_catalog, deepcopy(catalog.document))

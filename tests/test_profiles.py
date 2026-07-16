@@ -1,4 +1,5 @@
 import re
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 
@@ -6,8 +7,11 @@ import pytest
 import yaml
 
 import lte_scenario_toolkit.profiles as profiles_module
+from lte_scenario_toolkit.config import load_experiment_config
+from lte_scenario_toolkit.data_catalog import ConcurrentCatalogUpdateError
 from lte_scenario_toolkit.profiles import (
     DEFAULT_PROFILE_VALUES,
+    ConcurrentProfileUpdateError,
     ExperimentProfile,
     FigureSettings,
     OutputSettings,
@@ -477,6 +481,35 @@ def test_dump_profile_is_deterministic_atomic_and_round_trips(profile_repository
     assert replace(loaded, source_path=None) == profile
 
 
+def test_repository_profile_loaders_infer_root_from_nested_configs(
+    profile_repository,
+):
+    repo_root, catalog_path = profile_repository
+    saved = ProfileStore(repo_root, catalog_path).save(make_profile(repo_root))
+
+    loaded = load_profile(saved)
+    public_config = load_experiment_config(saved)
+
+    assert loaded.output_root == repo_root / "results"
+    assert public_config["output_root"] == repo_root / "results"
+    assert public_config["repo_root"] == repo_root
+
+
+def test_profile_root_inference_preserves_direct_configs_and_standalone_files(
+    tmp_path,
+):
+    repository = tmp_path / "repository"
+    direct = repository / "configs" / "example.yaml"
+    direct.parent.mkdir(parents=True)
+    write_profile(direct)
+    standalone = tmp_path / "standalone" / "profile.yaml"
+    standalone.parent.mkdir()
+    write_profile(standalone)
+
+    assert load_profile(direct).output_root == repository / "results"
+    assert load_profile(standalone).output_root == standalone.parent / "results"
+
+
 def test_profile_store_save_sets_posix_default_and_refuses_overwrite(
     profile_repository,
 ):
@@ -563,6 +596,66 @@ def test_profile_store_restores_catalog_if_save_deletes_it_then_raises(
     assert catalog_path.read_bytes() == original_catalog
     restored = profiles_module.load_data_catalog(catalog_path, repo_root=repo_root)
     assert restored.scenario("chicago")["config_path"] is None
+
+
+def test_profile_store_preserves_external_catalog_on_concurrent_update(
+    profile_repository,
+    monkeypatch,
+):
+    repo_root, catalog_path = profile_repository
+    store = ProfileStore(repo_root, catalog_path)
+    destination = repo_root / "configs/chicago/chicago-default.yaml"
+    real_save = profiles_module.save_data_catalog
+    external_state = {}
+
+    def write_external_then_attempt_stale_save(catalog, document):
+        external_document = deepcopy(catalog.document)
+        external_document["datasets"][0]["notes"] = "external concurrent update"
+        real_save(catalog, external_document)
+        external_state["bytes"] = catalog.path.read_bytes()
+        return real_save(catalog, document)
+
+    monkeypatch.setattr(
+        profiles_module,
+        "save_data_catalog",
+        write_external_then_attempt_stale_save,
+    )
+
+    with pytest.raises(ConcurrentCatalogUpdateError, match="changed since"):
+        store.save(make_profile(repo_root), set_default=True)
+
+    assert not destination.exists()
+    assert catalog_path.read_bytes() == external_state["bytes"]
+    external_catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    assert external_catalog["datasets"][0]["notes"] == "external concurrent update"
+    assert external_catalog["scenarios"][0]["config_path"] is None
+
+
+def test_profile_store_preserves_external_catalog_after_save_failure(
+    profile_repository,
+    monkeypatch,
+):
+    repo_root, catalog_path = profile_repository
+    store = ProfileStore(repo_root, catalog_path)
+    destination = repo_root / "configs/chicago/chicago-default.yaml"
+    real_save = profiles_module.save_data_catalog
+    external_state = {}
+
+    def write_external_then_fail(catalog, document):
+        external_document = deepcopy(catalog.document)
+        external_document["datasets"][0]["notes"] = "external replacement"
+        real_save(catalog, external_document)
+        external_state["bytes"] = catalog.path.read_bytes()
+        raise OSError("failure after external replacement")
+
+    monkeypatch.setattr(profiles_module, "save_data_catalog", write_external_then_fail)
+
+    with pytest.raises(OSError, match="external replacement") as error:
+        store.save(make_profile(repo_root), set_default=True)
+
+    assert not destination.exists()
+    assert catalog_path.read_bytes() == external_state["bytes"]
+    assert any("rollback skipped" in note for note in error.value.__notes__)
 
 
 def test_profile_store_removes_new_profile_if_dump_writes_then_raises(
@@ -807,6 +900,43 @@ def test_profile_store_rename_rolls_back_new_target_when_catalog_save_fails(
     assert not destination.exists()
 
 
+def test_profile_store_default_rename_preserves_concurrently_changed_source(
+    profile_repository,
+    monkeypatch,
+):
+    repo_root, catalog_path = profile_repository
+    store = ProfileStore(repo_root, catalog_path)
+    source = store.save(make_profile(repo_root), set_default=True)
+    destination = repo_root / "configs/chicago/chicago-renamed.yaml"
+    sentinel = b"external profile owner\n"
+    real_save = profiles_module.save_data_catalog
+    save_calls = 0
+
+    def switch_default_then_change_source(catalog, document):
+        nonlocal save_calls
+        saved = real_save(catalog, document)
+        save_calls += 1
+        if save_calls == 1:
+            source.write_bytes(sentinel)
+        return saved
+
+    monkeypatch.setattr(
+        profiles_module,
+        "save_data_catalog",
+        switch_default_then_change_source,
+    )
+
+    with pytest.raises(ConcurrentProfileUpdateError, match="changed"):
+        store.rename(source, "chicago-renamed", "Chicago renamed")
+
+    assert source.read_bytes() == sentinel
+    assert not destination.exists()
+    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    assert catalog["scenarios"][0]["config_path"] == (
+        "configs/chicago/chicago-default.yaml"
+    )
+
+
 def test_profile_store_set_default_validates_location_and_scenario(
     profile_repository,
     tmp_path,
@@ -864,6 +994,75 @@ def test_profile_store_delete_switches_default_before_removing_source(
     assert catalog["scenarios"][0]["config_path"] == (
         "configs/chicago/chicago-replacement.yaml"
     )
+
+
+def test_profile_store_default_delete_preserves_concurrently_changed_source(
+    profile_repository,
+    monkeypatch,
+):
+    repo_root, catalog_path = profile_repository
+    store = ProfileStore(repo_root, catalog_path)
+    source = store.save(make_profile(repo_root), set_default=True)
+    replacement = store.save(
+        make_profile(
+            repo_root,
+            profile_id="chicago-replacement",
+            display_name="Replacement",
+        )
+    )
+    sentinel = b"external profile owner\n"
+    real_save = profiles_module.save_data_catalog
+    save_calls = 0
+
+    def switch_default_then_change_source(catalog, document):
+        nonlocal save_calls
+        saved = real_save(catalog, document)
+        save_calls += 1
+        if save_calls == 1:
+            source.write_bytes(sentinel)
+        return saved
+
+    monkeypatch.setattr(
+        profiles_module,
+        "save_data_catalog",
+        switch_default_then_change_source,
+    )
+
+    with pytest.raises(ConcurrentProfileUpdateError, match="changed"):
+        store.delete(source, replacement_default=replacement)
+
+    assert source.read_bytes() == sentinel
+    assert replacement.is_file()
+    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    assert catalog["scenarios"][0]["config_path"] == (
+        "configs/chicago/chicago-default.yaml"
+    )
+
+
+def test_profile_store_non_default_delete_preserves_change_during_load(
+    profile_repository,
+    monkeypatch,
+):
+    repo_root, catalog_path = profile_repository
+    store = ProfileStore(repo_root, catalog_path)
+    source = store.save(
+        make_profile(repo_root, profile_id="disposable", display_name="Disposable")
+    )
+    sentinel = b"external profile owner\n"
+    real_load = profiles_module.load_profile
+
+    def load_then_change_source(path, **kwargs):
+        loaded = real_load(path, **kwargs)
+        if Path(path).resolve() == source:
+            source.write_bytes(sentinel)
+        return loaded
+
+    monkeypatch.setattr(profiles_module, "load_profile", load_then_change_source)
+
+    with pytest.raises(ConcurrentProfileUpdateError, match="changed"):
+        store.delete(source)
+
+    assert source.read_bytes() == sentinel
 
 
 def test_profile_store_rejects_invalid_default_replacement(profile_repository):
