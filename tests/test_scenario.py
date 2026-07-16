@@ -2,7 +2,9 @@ import numpy as np
 import pytest
 from shapely.geometry import box
 
+from lte_scenario_toolkit.candidate_scanner import Candidate
 from lte_scenario_toolkit.scenario import (
+    candidate_to_legacy,
     choose_result,
     generate_scan_positions,
     scan_rectangles,
@@ -55,3 +57,25 @@ def test_choose_result_uses_one_based_index_and_rejects_invalid_value():
     assert choose_result(results, 2) == [results[1]]
     with pytest.raises(ValueError, match="select-index"):
         choose_result(results, 0)
+
+
+def test_candidate_to_legacy_preserves_exact_geometry_count_and_coordinates():
+    candidate = Candidate(
+        flat_grid_id=11,
+        point_count=3,
+        left_x=0.123456,
+        bottom_y=1.234567,
+        center_x=2.123456,
+        center_y=3.234567,
+    )
+
+    legacy = candidate_to_legacy(candidate, rectangle_size=4)
+
+    assert legacy == {
+        "geometry": box(0.123456, 1.234567, 4.123456, 5.234567),
+        "pt_count": 3,
+        "left_x": 0.123456,
+        "bottom_y": 1.234567,
+        "center_x": 2.123456,
+        "center_y": 3.234567,
+    }

@@ -9,6 +9,8 @@ import numpy as np
 from shapely.geometry import box
 from shapely.prepared import prep
 
+from .candidate_scanner import Candidate
+
 
 def generate_scan_positions(
     boundary: Any,
@@ -18,7 +20,7 @@ def generate_scan_positions(
     *,
     random_seed: int = 42,
 ) -> np.ndarray:
-    """Generate lower-left rectangle positions using a deterministic grid."""
+    """Compatibility helper that materializes the legacy Cartesian scan grid."""
 
     if rectangle_size <= 0 or step <= 0:
         raise ValueError("rectangle_size and step must be greater than zero")
@@ -56,7 +58,7 @@ def scan_rectangles(
     positions: np.ndarray,
     config: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """Return rectangles satisfying count, spacing, and boundary constraints."""
+    """Compatibility scanner for callers that still supply materialized positions."""
 
     rectangle_size = float(config["rect_size"])
     target_min = int(config["target_count"]) - int(config["tolerance"])
@@ -131,6 +133,27 @@ def choose_result(results: list[dict[str, Any]], one_based_index: int) -> list[d
             f"--select-index must be between 1 and {len(results)}, got {one_based_index}"
         )
     return [results[one_based_index - 1]]
+
+
+def candidate_to_legacy(
+    candidate: Candidate,
+    rectangle_size: float,
+) -> dict[str, Any]:
+    """Convert one row-sweep candidate to the exact legacy result mapping."""
+
+    return {
+        "geometry": box(
+            candidate.left_x,
+            candidate.bottom_y,
+            candidate.left_x + rectangle_size,
+            candidate.bottom_y + rectangle_size,
+        ),
+        "pt_count": candidate.point_count,
+        "left_x": candidate.left_x,
+        "bottom_y": candidate.bottom_y,
+        "center_x": candidate.center_x,
+        "center_y": candidate.center_y,
+    }
 
 
 def verify_results(results, coordinates, rectangle_size):
