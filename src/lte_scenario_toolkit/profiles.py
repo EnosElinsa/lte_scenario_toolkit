@@ -59,6 +59,19 @@ def _catalog_rollback_confirmed(error: Exception) -> bool:
     return getattr(error, _CATALOG_ROLLBACK_CONFIRMED, False) is True
 
 
+def _ensure_catalog_unchanged(catalog: DataCatalog) -> None:
+    try:
+        current_mtime_ns = catalog.path.stat().st_mtime_ns
+    except FileNotFoundError as exc:
+        raise ConcurrentCatalogUpdateError(
+            f"Catalog {catalog.path} changed since it was loaded"
+        ) from exc
+    if current_mtime_ns != catalog.loaded_mtime_ns:
+        raise ConcurrentCatalogUpdateError(
+            f"Catalog {catalog.path} changed since it was loaded"
+        )
+
+
 @dataclass(frozen=True)
 class OutputSettings:
     """Artifact switches owned by an experiment profile."""
@@ -762,7 +775,11 @@ class ProfileStore:
         try:
             return save_data_catalog(catalog, document)
         except ConcurrentCatalogUpdateError as exc:
-            _mark_catalog_rollback(exc, confirmed=True)
+            _mark_catalog_rollback(exc, confirmed=False)
+            exc.add_note(
+                "Catalog rollback was not attempted because concurrent catalog "
+                "state is externally owned"
+            )
             raise
         except Exception as exc:
             try:
@@ -829,7 +846,12 @@ class ProfileStore:
         return resolved, profile, original
 
     @staticmethod
-    def _unlink_profile_if_unchanged(path: Path, expected: bytes) -> None:
+    def _unlink_profile_if_unchanged(
+        path: Path,
+        expected: bytes,
+        catalog: DataCatalog,
+    ) -> None:
+        _ensure_catalog_unchanged(catalog)
         try:
             current = path.read_bytes()
         except FileNotFoundError as exc:
@@ -840,6 +862,7 @@ class ProfileStore:
             raise ConcurrentProfileUpdateError(
                 f"Profile changed before it could be removed: {path}"
             )
+        _ensure_catalog_unchanged(catalog)
         try:
             path.unlink()
         except FileNotFoundError as exc:
@@ -1056,6 +1079,7 @@ class ProfileStore:
                 raise
             saved_catalog: DataCatalog | None = None
             try:
+                unlink_catalog = catalog
                 if is_default:
                     document = self._default_document(
                         catalog,
@@ -1063,7 +1087,22 @@ class ProfileStore:
                         self._relative_profile_path(destination),
                     )
                     saved_catalog = self._save_catalog(catalog, document)
-                self._unlink_profile_if_unchanged(source_path, source_bytes)
+                    if (
+                        self._catalog_profile_path(
+                            saved_catalog,
+                            source_profile.scenario_id,
+                        )
+                        != destination
+                    ):
+                        raise ConcurrentCatalogUpdateError(
+                            f"Catalog {saved_catalog.path} changed since it was loaded"
+                        )
+                    unlink_catalog = saved_catalog
+                self._unlink_profile_if_unchanged(
+                    source_path,
+                    source_bytes,
+                    unlink_catalog,
+                )
             except Exception as exc:
                 catalog_restored = not is_default
                 if is_default and saved_catalog is None:
@@ -1126,7 +1165,7 @@ class ProfileStore:
             )
             default_path = self._catalog_profile_path(catalog, profile.scenario_id)
             if default_path != source:
-                self._unlink_profile_if_unchanged(source, source_bytes)
+                self._unlink_profile_if_unchanged(source, source_bytes, catalog)
                 return
             if replacement_default is None:
                 raise ValueError(
@@ -1149,7 +1188,18 @@ class ProfileStore:
             )
             saved_catalog = self._save_catalog(catalog, document)
             try:
-                self._unlink_profile_if_unchanged(source, source_bytes)
+                if (
+                    self._catalog_profile_path(saved_catalog, profile.scenario_id)
+                    != replacement_path
+                ):
+                    raise ConcurrentCatalogUpdateError(
+                        f"Catalog {saved_catalog.path} changed since it was loaded"
+                    )
+                self._unlink_profile_if_unchanged(
+                    source,
+                    source_bytes,
+                    saved_catalog,
+                )
             except Exception as exc:
                 try:
                     save_data_catalog(saved_catalog, deepcopy(catalog.document))

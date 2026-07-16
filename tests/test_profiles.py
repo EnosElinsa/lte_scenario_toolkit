@@ -1,3 +1,4 @@
+import os
 import re
 from copy import deepcopy
 from dataclasses import replace
@@ -454,6 +455,30 @@ def make_profile(
     )
 
 
+def _write_external_catalog(
+    catalog,
+    save_catalog,
+    *,
+    scenario_id: str,
+    config_path: str,
+    note: str,
+) -> bytes:
+    document = deepcopy(catalog.document)
+    document["datasets"][0]["notes"] = note
+    for scenario in document["scenarios"]:
+        if scenario["scenario_id"] == scenario_id:
+            scenario["config_path"] = config_path
+            break
+    save_catalog(catalog, document)
+    stat = catalog.path.stat()
+    if stat.st_mtime_ns == catalog.loaded_mtime_ns:
+        os.utime(
+            catalog.path,
+            ns=(stat.st_atime_ns, catalog.loaded_mtime_ns + 1_000_000_000),
+        )
+    return catalog.path.read_bytes()
+
+
 def test_dump_profile_is_deterministic_atomic_and_round_trips(profile_repository):
     repo_root, _ = profile_repository
     profile = make_profile(repo_root)
@@ -624,11 +649,53 @@ def test_profile_store_preserves_external_catalog_on_concurrent_update(
     with pytest.raises(ConcurrentCatalogUpdateError, match="changed since"):
         store.save(make_profile(repo_root), set_default=True)
 
-    assert not destination.exists()
+    assert destination.is_file()
+    assert load_profile(destination, repo_root=repo_root).profile_id == (
+        "chicago-default"
+    )
     assert catalog_path.read_bytes() == external_state["bytes"]
     external_catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
     assert external_catalog["datasets"][0]["notes"] == "external concurrent update"
     assert external_catalog["scenarios"][0]["config_path"] is None
+
+
+def test_profile_store_keeps_new_target_referenced_by_concurrent_catalog(
+    profile_repository,
+    monkeypatch,
+):
+    repo_root, catalog_path = profile_repository
+    store = ProfileStore(repo_root, catalog_path)
+    destination = repo_root / "configs/chicago/chicago-default.yaml"
+    relative_destination = "configs/chicago/chicago-default.yaml"
+    real_save = profiles_module.save_data_catalog
+    external_state = {}
+
+    def reference_target_then_attempt_stale_save(catalog, document):
+        external_state["bytes"] = _write_external_catalog(
+            catalog,
+            real_save,
+            scenario_id="chicago",
+            config_path=relative_destination,
+            note="external owner references new target",
+        )
+        return real_save(catalog, document)
+
+    monkeypatch.setattr(
+        profiles_module,
+        "save_data_catalog",
+        reference_target_then_attempt_stale_save,
+    )
+
+    with pytest.raises(ConcurrentCatalogUpdateError, match="changed since"):
+        store.save(make_profile(repo_root), set_default=True)
+
+    assert catalog_path.read_bytes() == external_state["bytes"]
+    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    assert catalog["scenarios"][0]["config_path"] == relative_destination
+    assert destination.is_file()
+    assert load_profile(destination, repo_root=repo_root).profile_id == (
+        "chicago-default"
+    )
 
 
 def test_profile_store_preserves_external_catalog_after_save_failure(
@@ -1053,6 +1120,144 @@ def test_profile_store_default_rename_preserves_concurrently_changed_source(
     )
 
 
+def test_profile_store_keeps_rename_target_referenced_by_concurrent_catalog(
+    profile_repository,
+    monkeypatch,
+):
+    repo_root, catalog_path = profile_repository
+    store = ProfileStore(repo_root, catalog_path)
+    source = store.save(make_profile(repo_root), set_default=True)
+    destination = repo_root / "configs/chicago/chicago-renamed.yaml"
+    relative_destination = "configs/chicago/chicago-renamed.yaml"
+    real_save = profiles_module.save_data_catalog
+    external_state = {}
+
+    def reference_target_then_attempt_stale_save(catalog, document):
+        external_state["bytes"] = _write_external_catalog(
+            catalog,
+            real_save,
+            scenario_id="chicago",
+            config_path=relative_destination,
+            note="external owner references rename target",
+        )
+        return real_save(catalog, document)
+
+    monkeypatch.setattr(
+        profiles_module,
+        "save_data_catalog",
+        reference_target_then_attempt_stale_save,
+    )
+
+    with pytest.raises(ConcurrentCatalogUpdateError, match="changed since"):
+        store.rename(source, "chicago-renamed", "Chicago renamed")
+
+    assert catalog_path.read_bytes() == external_state["bytes"]
+    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    assert catalog["scenarios"][0]["config_path"] == relative_destination
+    assert source.is_file()
+    assert destination.is_file()
+    assert load_profile(destination, repo_root=repo_root).profile_id == (
+        "chicago-renamed"
+    )
+
+
+def test_profile_store_non_default_rename_guards_catalog_before_unlink(
+    profile_repository,
+    monkeypatch,
+):
+    repo_root, catalog_path = profile_repository
+    store = ProfileStore(repo_root, catalog_path)
+    source = store.save(make_profile(repo_root))
+    destination = repo_root / "configs/chicago/chicago-renamed.yaml"
+    relative_source = "configs/chicago/chicago-default.yaml"
+    real_save = profiles_module.save_data_catalog
+    real_guard = getattr(
+        profiles_module,
+        "_ensure_catalog_unchanged",
+        lambda catalog: None,
+    )
+    changed = False
+
+    def make_source_default_then_guard(catalog):
+        nonlocal changed
+        if not changed:
+            _write_external_catalog(
+                catalog,
+                real_save,
+                scenario_id="chicago",
+                config_path=relative_source,
+                note="external owner made rename source default",
+            )
+            changed = True
+        return real_guard(catalog)
+
+    monkeypatch.setattr(
+        profiles_module,
+        "_ensure_catalog_unchanged",
+        make_source_default_then_guard,
+        raising=False,
+    )
+
+    with pytest.raises(ConcurrentCatalogUpdateError, match="changed since"):
+        store.rename(source, "chicago-renamed", "Chicago renamed")
+
+    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    configured = repo_root / catalog["scenarios"][0]["config_path"]
+    assert configured == source
+    assert source.is_file()
+    assert not destination.exists()
+
+
+def test_profile_store_default_rename_guards_saved_catalog_before_unlink(
+    profile_repository,
+    monkeypatch,
+):
+    repo_root, catalog_path = profile_repository
+    store = ProfileStore(repo_root, catalog_path)
+    source = store.save(make_profile(repo_root), set_default=True)
+    destination = repo_root / "configs/chicago/chicago-renamed.yaml"
+    relative_source = "configs/chicago/chicago-default.yaml"
+    real_save = profiles_module.save_data_catalog
+    real_guard = getattr(
+        profiles_module,
+        "_ensure_catalog_unchanged",
+        lambda catalog: None,
+    )
+    changed = False
+
+    def restore_source_default_then_guard(catalog):
+        nonlocal changed
+        if not changed:
+            _write_external_catalog(
+                catalog,
+                real_save,
+                scenario_id="chicago",
+                config_path=relative_source,
+                note="external owner restored rename source",
+            )
+            changed = True
+        return real_guard(catalog)
+
+    monkeypatch.setattr(
+        profiles_module,
+        "_ensure_catalog_unchanged",
+        restore_source_default_then_guard,
+        raising=False,
+    )
+
+    with pytest.raises(ConcurrentCatalogUpdateError, match="changed since"):
+        store.rename(source, "chicago-renamed", "Chicago renamed")
+
+    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    configured = repo_root / catalog["scenarios"][0]["config_path"]
+    assert configured == source
+    assert source.is_file()
+    assert destination.is_file()
+    assert load_profile(destination, repo_root=repo_root).profile_id == (
+        "chicago-renamed"
+    )
+
+
 def test_profile_store_keeps_rename_target_when_catalog_rollback_fails(
     profile_repository,
     monkeypatch,
@@ -1222,6 +1427,106 @@ def test_profile_store_non_default_delete_preserves_change_during_load(
         store.delete(source)
 
     assert source.read_bytes() == sentinel
+
+
+def test_profile_store_non_default_delete_guards_catalog_before_unlink(
+    profile_repository,
+    monkeypatch,
+):
+    repo_root, catalog_path = profile_repository
+    store = ProfileStore(repo_root, catalog_path)
+    source = store.save(
+        make_profile(repo_root, profile_id="disposable", display_name="Disposable")
+    )
+    relative_source = "configs/chicago/disposable.yaml"
+    real_save = profiles_module.save_data_catalog
+    real_guard = getattr(
+        profiles_module,
+        "_ensure_catalog_unchanged",
+        lambda catalog: None,
+    )
+    changed = False
+
+    def make_source_default_then_guard(catalog):
+        nonlocal changed
+        if not changed:
+            _write_external_catalog(
+                catalog,
+                real_save,
+                scenario_id="chicago",
+                config_path=relative_source,
+                note="external owner made delete source default",
+            )
+            changed = True
+        return real_guard(catalog)
+
+    monkeypatch.setattr(
+        profiles_module,
+        "_ensure_catalog_unchanged",
+        make_source_default_then_guard,
+        raising=False,
+    )
+
+    with pytest.raises(ConcurrentCatalogUpdateError, match="changed since"):
+        store.delete(source)
+
+    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    configured = repo_root / catalog["scenarios"][0]["config_path"]
+    assert configured == source
+    assert source.is_file()
+
+
+def test_profile_store_default_delete_guards_saved_catalog_before_unlink(
+    profile_repository,
+    monkeypatch,
+):
+    repo_root, catalog_path = profile_repository
+    store = ProfileStore(repo_root, catalog_path)
+    source = store.save(make_profile(repo_root), set_default=True)
+    replacement = store.save(
+        make_profile(
+            repo_root,
+            profile_id="chicago-replacement",
+            display_name="Replacement",
+        )
+    )
+    relative_source = "configs/chicago/chicago-default.yaml"
+    real_save = profiles_module.save_data_catalog
+    real_guard = getattr(
+        profiles_module,
+        "_ensure_catalog_unchanged",
+        lambda catalog: None,
+    )
+    changed = False
+
+    def restore_source_default_then_guard(catalog):
+        nonlocal changed
+        if not changed:
+            _write_external_catalog(
+                catalog,
+                real_save,
+                scenario_id="chicago",
+                config_path=relative_source,
+                note="external owner restored delete source",
+            )
+            changed = True
+        return real_guard(catalog)
+
+    monkeypatch.setattr(
+        profiles_module,
+        "_ensure_catalog_unchanged",
+        restore_source_default_then_guard,
+        raising=False,
+    )
+
+    with pytest.raises(ConcurrentCatalogUpdateError, match="changed since"):
+        store.delete(source, replacement_default=replacement)
+
+    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    configured = repo_root / catalog["scenarios"][0]["config_path"]
+    assert configured == source
+    assert source.is_file()
+    assert replacement.is_file()
 
 
 def test_profile_store_rejects_invalid_default_replacement(profile_repository):
