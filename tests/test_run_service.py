@@ -1,3 +1,4 @@
+import errno
 import json
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -128,6 +129,19 @@ def test_begin_twice_in_same_second_allocates_unique_run_and_paths(tmp_path):
     assert not first.final_path.exists() and not second.final_path.exists()
 
 
+def test_begin_rejects_symlinked_scenario_before_creating_outside_profile(tmp_path):
+    root = tmp_path / "runs"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _symlink_or_skip(root / "chicago", outside, directory=True)
+
+    with pytest.raises(ValueError, match="parent|symlink|path"):
+        RunService(root).begin("chicago", "default", created_at=CREATED_AT)
+
+    assert not (outside / "default").exists()
+
+
 @pytest.mark.parametrize("status", ["completed", "partial"])
 def test_publish_requires_at_least_one_requested_artifact(tmp_path, status):
     service = RunService(tmp_path)
@@ -207,6 +221,22 @@ def test_publish_rejects_absolute_and_duplicate_artifacts(tmp_path):
         )
 
 
+@pytest.mark.parametrize("manifest_alias", ["RUN.JSON", "Run.Json"])
+def test_publish_rejects_case_insensitive_run_manifest_alias(
+    tmp_path,
+    manifest_alias,
+):
+    service = RunService(tmp_path)
+    run = service.begin("chicago", "default", created_at=CREATED_AT)
+    _write_artifact(run, manifest_alias)
+
+    with pytest.raises(ValueError, match="run.json|reserved"):
+        service.publish(run, status="completed", artifacts=[manifest_alias])
+
+    assert run.path.is_dir()
+    assert not run.final_path.exists()
+
+
 def test_publish_rejects_artifact_symlink_escape(tmp_path):
     service = RunService(tmp_path / "runs")
     run = service.begin("chicago", "default", created_at=CREATED_AT)
@@ -258,6 +288,45 @@ def test_publish_refuses_existing_final_without_overwriting_or_losing_staging(tm
     assert (run.path / "scenario.csv").is_file()
 
 
+def test_publish_refuses_existing_cooperative_claim_without_removing_it(tmp_path):
+    service = RunService(tmp_path)
+    run = _begin_with_artifact(service)
+    claim = run.final_path.parent / f".publish-{run.final_path.name}.lock"
+    claim.write_text("external owner\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="publish|claim|lock|exists"):
+        service.publish(run, status="completed", artifacts=["scenario.csv"])
+
+    assert claim.read_text(encoding="utf-8") == "external owner\n"
+    assert run.path.is_dir()
+    assert (run.path / "scenario.csv").is_file()
+    assert not run.final_path.exists()
+
+
+def test_publish_normalizes_directory_collision_without_losing_staging(
+    tmp_path,
+    monkeypatch,
+):
+    service = RunService(tmp_path)
+    run = _begin_with_artifact(service)
+    original_replace = Path.replace
+
+    def collide_on_publication(path, target):
+        if path == run.path:
+            raise OSError(errno.ENOTEMPTY, "directory collision")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", collide_on_publication)
+
+    with pytest.raises(FileExistsError, match="publish|final|exists"):
+        service.publish(run, status="completed", artifacts=["scenario.csv"])
+
+    claim = run.final_path.parent / f".publish-{run.final_path.name}.lock"
+    assert run.path.is_dir()
+    assert not run.final_path.exists()
+    assert not claim.exists()
+
+
 def test_publish_move_failure_keeps_retryable_staging_and_no_final(tmp_path, monkeypatch):
     service = RunService(tmp_path)
     run = _begin_with_artifact(service)
@@ -275,6 +344,77 @@ def test_publish_move_failure_keeps_retryable_staging_and_no_final(tmp_path, mon
 
     assert run.path.is_dir()
     assert (run.path / "run.json").is_file()
+    assert not run.final_path.exists()
+    claim = run.final_path.parent / f".publish-{run.final_path.name}.lock"
+    assert not claim.exists()
+
+    monkeypatch.setattr(Path, "replace", original_replace)
+    published = service.publish(
+        run,
+        status="completed",
+        artifacts=["scenario.csv"],
+    )
+    assert published == run.final_path
+    assert published.is_dir()
+
+
+def test_publish_and_abandon_reject_equal_but_unowned_staging_value(tmp_path):
+    service = RunService(tmp_path)
+    run = _begin_with_artifact(service)
+    forged = replace(run)
+
+    with pytest.raises(ValueError, match="owned|service|staging"):
+        service.publish(forged, status="completed", artifacts=["scenario.csv"])
+    with pytest.raises(ValueError, match="owned|service|staging"):
+        service.abandon(forged)
+
+    assert run.path.is_dir()
+    assert (run.path / "scenario.csv").is_file()
+    assert not run.final_path.exists()
+
+
+def test_other_service_cannot_publish_or_abandon_staging(tmp_path):
+    owner = RunService(tmp_path)
+    other = RunService(tmp_path)
+    run = _begin_with_artifact(owner)
+
+    with pytest.raises(ValueError, match="owned|service|staging"):
+        other.publish(run, status="completed", artifacts=["scenario.csv"])
+    with pytest.raises(ValueError, match="owned|service|staging"):
+        other.abandon(run)
+
+    assert run.path.is_dir()
+    assert (run.path / "scenario.csv").is_file()
+    assert not run.final_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("metadata", "errors", "field"),
+    [
+        ([], None, "metadata"),
+        (None, {}, "errors"),
+    ],
+)
+def test_publish_rejects_invalid_metadata_and_error_container_types(
+    tmp_path,
+    metadata,
+    errors,
+    field,
+):
+    service = RunService(tmp_path)
+    run = _begin_with_artifact(service)
+
+    with pytest.raises(ValueError, match=field):
+        service.publish(
+            run,
+            status="completed",
+            artifacts=["scenario.csv"],
+            metadata=metadata,
+            errors=errors,
+        )
+
+    assert run.path.is_dir()
+    assert not (run.path / "run.json").exists()
     assert not run.final_path.exists()
 
 

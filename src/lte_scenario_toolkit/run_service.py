@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
 import shutil
 import uuid
 from collections.abc import Iterable, Mapping
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -104,6 +106,35 @@ class RunService:
 
     def __init__(self, output_root: str | Path) -> None:
         self.output_root = Path(output_root).resolve()
+        self._owned_runs: dict[str, StagingRun] = {}
+
+    def _ensure_directory_component(self, path: Path, *, description: str) -> Path:
+        self._assert_contained(path, description=description)
+        if not os.path.lexists(path):
+            try:
+                path.mkdir()
+            except FileExistsError:
+                pass
+        self._assert_contained(path, description=description)
+        if path.is_symlink() or not path.is_dir():
+            raise ValueError(f"{description} path must be a real directory: {path}")
+        return path
+
+    def _prepare_run_parent(self, scenario_id: str, profile_id: str) -> Path:
+        self.output_root.mkdir(parents=True, exist_ok=True)
+        self._assert_contained(self.output_root, description="run output root")
+        if self.output_root.is_symlink() or not self.output_root.is_dir():
+            raise ValueError(
+                f"run output root must be a real directory: {self.output_root}"
+            )
+        scenario_path = self._ensure_directory_component(
+            self.output_root / scenario_id,
+            description="run scenario parent",
+        )
+        return self._ensure_directory_component(
+            scenario_path / profile_id,
+            description="run profile parent",
+        )
 
     def _expected_paths(
         self,
@@ -157,9 +188,11 @@ class RunService:
     ) -> tuple[Path, Path]:
         if not isinstance(run, StagingRun):
             raise ValueError("run must be a StagingRun owned by this service")
+        run_id = _safe_run_id(run.run_id)
+        if self._owned_runs.get(run_id) is not run:
+            raise ValueError("run staging is not owned by this service instance")
         scenario_id = _safe_slug(run.scenario_id, field="scenario_id")
         profile_id = _safe_slug(run.profile_id, field="profile_id")
-        run_id = _safe_run_id(run.run_id)
         canonical_created_at, _ = _normalise_created_at(run.created_at)
         if canonical_created_at != run.created_at:
             raise ValueError("created_at must use canonical UTC Z form")
@@ -209,9 +242,7 @@ class RunService:
         if parent_run_id is not None:
             _safe_run_id(parent_run_id, field="parent_run_id")
 
-        parent = self.output_root / scenario / profile
-        parent.mkdir(parents=True, exist_ok=True)
-        self._assert_contained(parent, description="run parent")
+        parent = self._prepare_run_parent(scenario, profile)
         timestamp_prefix = _timestamp_directory_prefix(parsed_created_at)
         for _ in range(128):
             run_id = uuid.uuid4().hex
@@ -234,7 +265,7 @@ class RunService:
                 except OSError:
                     pass
                 continue
-            return StagingRun(
+            run = StagingRun(
                 run_id=run_id,
                 scenario_id=scenario,
                 profile_id=profile,
@@ -243,6 +274,8 @@ class RunService:
                 final_path=final_path,
                 parent_run_id=parent_run_id,
             )
+            self._owned_runs[run_id] = run
+            return run
         raise FileExistsError(
             f"Could not allocate a unique run directory below {parent}"
         )
@@ -283,7 +316,7 @@ class RunService:
                 canonical_relative = resolved.relative_to(staging).as_posix()
             except ValueError as exc:
                 raise ValueError(f"artifact escapes run staging: {item}") from exc
-            if canonical_relative == "run.json":
+            if canonical_relative.casefold() == "run.json":
                 raise ValueError("run.json is reserved and cannot be an artifact")
             if resolved in seen:
                 raise ValueError(f"duplicate artifact path: {item}")
@@ -302,13 +335,19 @@ class RunService:
         if status not in self.VALID_STATUSES:
             choices = ", ".join(sorted(self.VALID_STATUSES))
             raise ValueError(f"status must be one of: {choices}")
+        if metadata is not None and not isinstance(metadata, Mapping):
+            raise ValueError("metadata must be a mapping")
+        if errors is not None and not isinstance(errors, list):
+            raise ValueError("errors must be a list")
         staging, final_path = self._validate_run(run, require_staging=True)
         if os.path.lexists(final_path):
             raise FileExistsError(final_path)
         relative_artifacts = self._artifact_paths(staging, artifacts)
 
-        safe_metadata = _json_safe(deepcopy({} if metadata is None else metadata))
-        safe_errors = _json_safe(deepcopy([] if errors is None else errors))
+        safe_metadata = _json_safe(
+            deepcopy({} if metadata is None else dict(metadata))
+        )
+        safe_errors = _json_safe(deepcopy([] if errors is None else list(errors)))
         published_at, _ = _normalise_created_at(None)
         payload = {
             "run_id": run.run_id,
@@ -326,10 +365,70 @@ class RunService:
 
         self._validate_run(run, require_staging=True)
         self._artifact_paths(staging, relative_artifacts)
-        if os.path.lexists(final_path):
-            raise FileExistsError(final_path)
-        staging.replace(final_path)
+        with self._publication_claim(final_path):
+            if os.path.lexists(final_path):
+                raise FileExistsError(f"run final path already exists: {final_path}")
+            try:
+                staging.replace(final_path)
+            except OSError as exc:
+                if isinstance(exc, FileExistsError) or exc.errno in {
+                    errno.EEXIST,
+                    errno.ENOTEMPTY,
+                }:
+                    raise FileExistsError(
+                        f"run final path already exists: {final_path}"
+                    ) from exc
+                raise
         return final_path
+
+    @contextmanager
+    def _publication_claim(self, final_path: Path):
+        claim_path = final_path.parent / f".publish-{final_path.name}.lock"
+        self._assert_contained(claim_path, description="publication claim")
+        descriptor: int | None = None
+        created = False
+        operation_error: BaseException | None = None
+        try:
+            try:
+                descriptor = os.open(
+                    claim_path,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                )
+                created = True
+            except OSError as exc:
+                if isinstance(exc, FileExistsError) or exc.errno == errno.EEXIST:
+                    raise FileExistsError(
+                        f"publication claim already exists: {claim_path}"
+                    ) from exc
+                raise
+            os.close(descriptor)
+            descriptor = None
+            yield claim_path
+        except BaseException as exc:
+            operation_error = exc
+            raise
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError as close_error:
+                    if operation_error is None:
+                        raise
+                    operation_error.add_note(
+                        f"Publication claim close also failed: {close_error}"
+                    )
+            if created:
+                try:
+                    claim_path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as unlink_error:
+                    if operation_error is None:
+                        raise
+                    operation_error.add_note(
+                        f"Publication claim cleanup also failed: {unlink_error}"
+                    )
 
     def abandon(self, run: StagingRun) -> None:
         staging, _ = self._validate_run(run, require_staging=False)
