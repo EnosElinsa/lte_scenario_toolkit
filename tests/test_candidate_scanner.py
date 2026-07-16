@@ -141,6 +141,22 @@ def test_count_row_rejects_non_positive_rectangle_size(rectangle_size):
 
 
 @pytest.mark.parametrize(
+    "rectangle_size",
+    [np.nan, np.inf, -np.inf, True, np.bool_(True), "1"],
+)
+def test_count_row_rejects_non_finite_boolean_and_non_numeric_size(
+    rectangle_size,
+):
+    with pytest.raises(ValueError, match="rectangle_size"):
+        count_row(
+            np.asarray([[0.0, 0.0]]),
+            np.asarray([0.0]),
+            y=0,
+            rectangle_size=rectangle_size,
+        )
+
+
+@pytest.mark.parametrize(
     ("rectangle_size", "step", "field"),
     [(0, 1, "rectangle_size"), (-1, 1, "rectangle_size"), (1, 0, "step"), (1, -1, "step")],
 )
@@ -151,6 +167,22 @@ def test_grid_axes_rejects_non_positive_parameters(rectangle_size, step, field):
             rectangle_size=rectangle_size,
             step=step,
         )
+
+
+@pytest.mark.parametrize("field", ["rectangle_size", "step"])
+@pytest.mark.parametrize(
+    "invalid_value",
+    [np.nan, np.inf, -np.inf, True, np.bool_(True), "1"],
+)
+def test_grid_axes_rejects_non_finite_boolean_and_non_numeric_dimensions(
+    field,
+    invalid_value,
+):
+    dimensions = {"rectangle_size": 1, "step": 1}
+    dimensions[field] = invalid_value
+
+    with pytest.raises(ValueError, match=field):
+        grid_axes(box(0, 0, 10, 10), **dimensions)
 
 
 def test_grid_axes_excludes_origins_whose_window_touches_maximum_boundary():
