@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 import math
+import os
 import re
+import tempfile
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from .data_catalog import (
+    CatalogError,
+    DataCatalog,
+    catalog_transaction_lock,
+    load_data_catalog,
+    save_data_catalog,
+)
 
 PROFILE_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]*$")
 WINDOWS_RESERVED = frozenset(
@@ -222,6 +233,19 @@ def _resolve_path(value: str | Path, root: Path) -> Path:
 
 
 def _validate_profile(profile: ExperimentProfile) -> ExperimentProfile:
+    if type(profile.schema_version) is not int or profile.schema_version != 2:
+        raise ValueError("schema_version must be the integer 2")
+    for path, value in (
+        ("profile.id", profile.profile_id),
+        ("profile.display_name", profile.display_name),
+        ("profile.scenario_id", profile.scenario_id),
+        ("inputs.points_dataset_id", profile.points_dataset_id),
+        ("spatial.target_crs", profile.target_crs),
+        ("scan.mode", profile.scan_mode),
+        ("scan.strategy", profile.strategy),
+    ):
+        if type(value) is not str or not value.strip():
+            raise ValueError(f"{path} must be a non-empty string")
     if (
         PROFILE_ID_PATTERN.fullmatch(profile.profile_id) is None
         or profile.profile_id in WINDOWS_RESERVED
@@ -229,10 +253,23 @@ def _validate_profile(profile: ExperimentProfile) -> ExperimentProfile:
         raise ValueError(
             "profile.id must be a safe lowercase slug and not a Windows device name"
         )
+    if PROFILE_ID_PATTERN.fullmatch(profile.scenario_id) is None:
+        raise ValueError("profile.scenario_id must be a safe lowercase slug")
     if profile.scan_mode not in {"fast", "complete"}:
         raise ValueError("scan.mode must be one of: complete, fast")
     if profile.strategy not in {"sequential", "uniform"}:
         raise ValueError("scan.strategy must be one of: sequential, uniform")
+    for path, value in (
+        ("experiment.random_seed", profile.random_seed),
+        ("spatial.rectangle_size_m", profile.rect_size),
+        ("spatial.target_base_station_count", profile.target_count),
+        ("spatial.count_tolerance", profile.tolerance),
+        ("scan.step_m", profile.scan_step),
+        ("scan.max_rectangles", profile.max_rects),
+        ("scan.minimum_center_spacing_m", profile.min_spacing),
+    ):
+        if type(value) is not int:
+            raise ValueError(f"{path} must be an integer")
     for key, value in (
         ("rect_size", profile.rect_size),
         ("scan_step", profile.scan_step),
@@ -243,11 +280,173 @@ def _validate_profile(profile: ExperimentProfile) -> ExperimentProfile:
             raise ValueError(f"{key} must be greater than zero")
     if profile.target_count < 0 or profile.tolerance < 0:
         raise ValueError("target_count and tolerance must be non-negative")
+    if not isinstance(profile.output_root, (str, os.PathLike)):
+        raise ValueError("outputs.root must be a path")
+    if not isinstance(profile.outputs, OutputSettings):
+        raise ValueError("outputs must be OutputSettings")
+    for key, value in vars(profile.outputs).items():
+        if type(value) is not bool:
+            raise ValueError(f"outputs.{key} must be a boolean")
+    if not isinstance(profile.figure, FigureSettings):
+        raise ValueError("figures must be FigureSettings")
+    for key in ("preset", "colormap", "station_color"):
+        value = getattr(profile.figure, key)
+        if type(value) is not str:
+            raise ValueError(f"figures.{key} must be a string")
+    if profile.figure.title is not None and type(profile.figure.title) is not str:
+        raise ValueError("figures.title must be null or a string")
+    if type(profile.figure.dpi) is not int:
+        raise ValueError("figures.dpi must be an integer")
+    for key in (
+        "azimuth_deg",
+        "elevation_deg",
+        "vertical_exaggeration",
+        "station_marker_size",
+    ):
+        value = getattr(profile.figure, key)
+        if type(value) not in {int, float}:
+            raise ValueError(f"figures.{key} must be a finite number")
+        try:
+            finite = math.isfinite(value)
+        except OverflowError as exc:
+            raise ValueError(f"figures.{key} must be a finite number") from exc
+        if not finite:
+            raise ValueError(f"figures.{key} must be a finite number")
     if profile.figure.dpi <= 0:
         raise ValueError("figures.dpi must be greater than zero")
     if profile.figure.vertical_exaggeration <= 0:
         raise ValueError("figures.vertical_exaggeration must be greater than zero")
     return profile
+
+
+def _profile_repository(path: Path) -> Path:
+    for parent in (path.parent, *path.parents):
+        if parent.name == "configs":
+            return parent.parent.resolve()
+    return path.parent.resolve()
+
+
+def _serialized_output_root(profile: ExperimentProfile, path: Path) -> str:
+    output_root = Path(profile.output_root)
+    if not output_root.is_absolute():
+        return output_root.as_posix()
+    repository = _profile_repository(path)
+    try:
+        return output_root.resolve().relative_to(repository).as_posix()
+    except ValueError:
+        return str(output_root.resolve())
+
+
+def _profile_document(profile: ExperimentProfile, path: Path) -> dict[str, Any]:
+    _validate_profile(profile)
+    return {
+        "schema_version": 2,
+        "profile": {
+            "id": profile.profile_id,
+            "display_name": profile.display_name,
+            "scenario_id": profile.scenario_id,
+        },
+        "inputs": {
+            "points_dataset_id": profile.points_dataset_id,
+        },
+        "experiment": {
+            "random_seed": profile.random_seed,
+        },
+        "spatial": {
+            "target_crs": profile.target_crs,
+            "rectangle_size_m": profile.rect_size,
+            "target_base_station_count": profile.target_count,
+            "count_tolerance": profile.tolerance,
+        },
+        "scan": {
+            "mode": profile.scan_mode,
+            "strategy": profile.strategy,
+            "step_m": profile.scan_step,
+            "max_rectangles": profile.max_rects,
+            "minimum_center_spacing_m": profile.min_spacing,
+        },
+        "outputs": {
+            "root": _serialized_output_root(profile, path),
+            "save_csv": profile.outputs.save_csv,
+            "save_preview_png": profile.outputs.save_preview_png,
+            "save_terrain_png": profile.outputs.save_terrain_png,
+            "save_terrain_eps": profile.outputs.save_terrain_eps,
+            "save_terrain_html": profile.outputs.save_terrain_html,
+        },
+        "figures": {
+            "preset": profile.figure.preset,
+            "colormap": profile.figure.colormap,
+            "dpi": profile.figure.dpi,
+            "azimuth_deg": profile.figure.azimuth_deg,
+            "elevation_deg": profile.figure.elevation_deg,
+            "vertical_exaggeration": profile.figure.vertical_exaggeration,
+            "station_color": profile.figure.station_color,
+            "station_marker_size": profile.figure.station_marker_size,
+            "title": profile.figure.title,
+        },
+    }
+
+
+def _atomic_write_profile_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary_path.replace(path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _atomic_restore_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{path.name}.",
+            suffix=".rollback",
+            dir=path.parent,
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary_path.replace(path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def dump_profile(profile: ExperimentProfile, path: str | Path) -> Path:
+    """Validate and atomically write a deterministic schema-version-2 profile."""
+
+    destination = Path(path).resolve()
+    document = _profile_document(profile, destination)
+    text = yaml.safe_dump(
+        document,
+        sort_keys=False,
+        allow_unicode=True,
+    )
+    if not text.endswith("\n"):
+        text += "\n"
+    _atomic_write_profile_text(destination, text)
+    return destination
 
 
 def load_profile(
@@ -459,3 +658,348 @@ def load_profile(
         source_path=source_path,
     )
     return _validate_profile(profile)
+
+
+class ProfileStore:
+    """Discover and mutate repository profiles under one shared catalog lock."""
+
+    def __init__(
+        self,
+        repo_root: str | Path,
+        catalog_path: str | Path,
+    ) -> None:
+        self.repo_root = Path(repo_root).resolve()
+        raw_catalog_path = Path(catalog_path)
+        if not raw_catalog_path.is_absolute():
+            raw_catalog_path = self.repo_root / raw_catalog_path
+        self.catalog_path = raw_catalog_path.resolve()
+        self.configs_root = self.repo_root / "configs"
+
+    def _resolved_configs_root(self) -> Path:
+        resolved = self.configs_root.resolve(strict=False)
+        try:
+            resolved.relative_to(self.repo_root)
+        except ValueError as exc:
+            raise ValueError(
+                f"Profile configs directory is outside repository: {self.configs_root}"
+            ) from exc
+        return resolved
+
+    def _profile_path(
+        self,
+        value: str | Path,
+        *,
+        must_exist: bool,
+    ) -> Path:
+        raw = Path(value)
+        if raw.is_absolute():
+            candidate = raw
+        elif raw.parts and raw.parts[0].casefold() == "configs":
+            candidate = self.repo_root / raw
+        else:
+            candidate = self.configs_root / raw
+        configs_root = self._resolved_configs_root()
+        resolved = candidate.resolve(strict=False)
+        try:
+            resolved.relative_to(configs_root)
+        except ValueError as exc:
+            raise ValueError(
+                f"Profile path must remain inside {self.configs_root}: {value}"
+            ) from exc
+        if candidate.is_symlink():
+            raise ValueError(f"Profile path must not be a symlink: {candidate}")
+        if must_exist and not resolved.is_file():
+            raise FileNotFoundError(resolved)
+        return resolved
+
+    def _destination(self, profile: ExperimentProfile) -> Path:
+        _validate_profile(profile)
+        return self._profile_path(
+            Path(profile.scenario_id) / f"{profile.profile_id}.yaml",
+            must_exist=False,
+        )
+
+    def _load_catalog(self) -> DataCatalog:
+        return load_data_catalog(self.catalog_path, repo_root=self.repo_root)
+
+    def _save_catalog(
+        self,
+        catalog: DataCatalog,
+        document: dict[str, Any],
+    ) -> DataCatalog:
+        original = catalog.path.read_bytes()
+        try:
+            return save_data_catalog(catalog, document)
+        except Exception as exc:
+            try:
+                if catalog.path.read_bytes() != original:
+                    _atomic_restore_bytes(catalog.path, original)
+            except Exception as rollback_error:
+                exc.add_note(
+                    f"Catalog rollback also failed for {catalog.path}: {rollback_error}"
+                )
+            raise
+
+    @staticmethod
+    def _validate_profile_catalog(
+        profile: ExperimentProfile,
+        catalog: DataCatalog,
+    ) -> None:
+        _validate_profile(profile)
+        catalog.scenario(profile.scenario_id)
+        dataset = catalog.dataset(profile.points_dataset_id)
+        if dataset["role"] != "points":
+            raise ValueError(
+                f"Profile points dataset {profile.points_dataset_id!r} "
+                "must have role 'points'"
+            )
+
+    def _load_stored_profile(
+        self,
+        path: str | Path,
+        catalog: DataCatalog,
+    ) -> tuple[Path, ExperimentProfile]:
+        resolved = self._profile_path(path, must_exist=True)
+        profile = load_profile(resolved, repo_root=self.repo_root)
+        self._validate_profile_catalog(profile, catalog)
+        return resolved, profile
+
+    def _catalog_profile_path(
+        self,
+        catalog: DataCatalog,
+        scenario_id: str,
+    ) -> Path | None:
+        config_path = catalog.scenario(scenario_id)["config_path"]
+        if config_path is None:
+            return None
+        return self._profile_path(catalog.resolve(config_path), must_exist=False)
+
+    def _relative_profile_path(self, path: Path) -> str:
+        return path.relative_to(self.repo_root).as_posix()
+
+    @staticmethod
+    def _default_document(
+        catalog: DataCatalog,
+        scenario_id: str,
+        relative_path: str,
+    ) -> dict[str, Any]:
+        document = deepcopy(catalog.document)
+        for scenario in document["scenarios"]:
+            if scenario["scenario_id"] == scenario_id:
+                scenario["config_path"] = relative_path
+                return document
+        raise CatalogError(f"Unknown scenario ID: {scenario_id}")
+
+    @staticmethod
+    def _restore_profile_after_error(
+        path: Path,
+        original: bytes | None,
+        operation_error: Exception,
+    ) -> None:
+        try:
+            if original is None:
+                path.unlink(missing_ok=True)
+            else:
+                _atomic_restore_bytes(path, original)
+        except Exception as rollback_error:
+            operation_error.add_note(
+                f"Profile rollback also failed for {path}: {rollback_error}"
+            )
+
+    def discover(self, scenario_id: str | None = None) -> list[ExperimentProfile]:
+        """Recursively load profiles in stable repository-relative order."""
+
+        configs_root = self._resolved_configs_root()
+        if not configs_root.is_dir():
+            return []
+        paths = sorted(
+            (
+                path
+                for path in configs_root.rglob("*")
+                if path.is_file() and path.suffix.casefold() in {".yaml", ".yml"}
+            ),
+            key=lambda path: path.relative_to(configs_root).as_posix(),
+        )
+        profiles = [
+            load_profile(
+                self._profile_path(path, must_exist=True),
+                repo_root=self.repo_root,
+            )
+            for path in paths
+        ]
+        if scenario_id is None:
+            return profiles
+        return [profile for profile in profiles if profile.scenario_id == scenario_id]
+
+    def save(
+        self,
+        profile: ExperimentProfile,
+        *,
+        overwrite: bool = False,
+        set_default: bool = False,
+    ) -> Path:
+        """Save a profile and optionally update its scenario default atomically."""
+
+        destination = self._destination(profile)
+        with catalog_transaction_lock(self.repo_root):
+            catalog = self._load_catalog()
+            self._validate_profile_catalog(profile, catalog)
+            destination = self._destination(profile)
+            destination_exists = os.path.lexists(destination)
+            if destination_exists and not destination.is_file():
+                raise FileExistsError(destination)
+            if destination_exists and not overwrite:
+                raise FileExistsError(destination)
+            original = destination.read_bytes() if destination_exists else None
+            dump_profile(profile, destination)
+            if not set_default:
+                return destination
+            document = self._default_document(
+                catalog,
+                profile.scenario_id,
+                self._relative_profile_path(destination),
+            )
+            try:
+                self._save_catalog(catalog, document)
+            except Exception as exc:
+                self._restore_profile_after_error(destination, original, exc)
+                raise
+            return destination
+
+    def copy(
+        self,
+        source: str | Path,
+        profile_id: str,
+        display_name: str,
+    ) -> Path:
+        """Create a named copy without changing the source or catalog default."""
+
+        with catalog_transaction_lock(self.repo_root):
+            catalog = self._load_catalog()
+            _, source_profile = self._load_stored_profile(source, catalog)
+            copied = replace(
+                source_profile,
+                profile_id=profile_id,
+                display_name=display_name,
+                source_path=None,
+            )
+            self._validate_profile_catalog(copied, catalog)
+            destination = self._destination(copied)
+            if os.path.lexists(destination):
+                raise FileExistsError(destination)
+            dump_profile(copied, destination)
+            return destination
+
+    def rename(
+        self,
+        source: str | Path,
+        profile_id: str,
+        display_name: str,
+    ) -> Path:
+        """Write a renamed profile before removing its source."""
+
+        with catalog_transaction_lock(self.repo_root):
+            catalog = self._load_catalog()
+            source_path, source_profile = self._load_stored_profile(source, catalog)
+            renamed = replace(
+                source_profile,
+                profile_id=profile_id,
+                display_name=display_name,
+                source_path=None,
+            )
+            self._validate_profile_catalog(renamed, catalog)
+            destination = self._destination(renamed)
+            if destination == source_path or os.path.lexists(destination):
+                raise FileExistsError(destination)
+            default_path = self._catalog_profile_path(catalog, source_profile.scenario_id)
+            is_default = default_path == source_path
+            dump_profile(renamed, destination)
+            saved_catalog: DataCatalog | None = None
+            try:
+                if is_default:
+                    document = self._default_document(
+                        catalog,
+                        source_profile.scenario_id,
+                        self._relative_profile_path(destination),
+                    )
+                    saved_catalog = self._save_catalog(catalog, document)
+                source_path.unlink()
+            except Exception as exc:
+                catalog_restored = saved_catalog is None
+                if saved_catalog is not None:
+                    try:
+                        save_data_catalog(saved_catalog, deepcopy(catalog.document))
+                        catalog_restored = True
+                    except Exception as rollback_error:
+                        exc.add_note(
+                            f"Catalog rollback also failed during rename: {rollback_error}"
+                        )
+                if catalog_restored:
+                    self._restore_profile_after_error(destination, None, exc)
+                raise
+            return destination
+
+    def set_default(self, scenario_id: str, profile_path: str | Path) -> Path:
+        """Set an existing same-scenario profile as the catalog default."""
+
+        with catalog_transaction_lock(self.repo_root):
+            catalog = self._load_catalog()
+            catalog.scenario(scenario_id)
+            resolved, profile = self._load_stored_profile(profile_path, catalog)
+            if profile.scenario_id != scenario_id:
+                raise ValueError(
+                    f"Profile scenario {profile.scenario_id!r} does not match {scenario_id!r}"
+                )
+            document = self._default_document(
+                catalog,
+                scenario_id,
+                self._relative_profile_path(resolved),
+            )
+            self._save_catalog(catalog, document)
+            return resolved
+
+    def delete(
+        self,
+        profile_path: str | Path,
+        *,
+        replacement_default: str | Path | None = None,
+    ) -> None:
+        """Delete a profile, switching a scenario default first when required."""
+
+        with catalog_transaction_lock(self.repo_root):
+            catalog = self._load_catalog()
+            source, profile = self._load_stored_profile(profile_path, catalog)
+            default_path = self._catalog_profile_path(catalog, profile.scenario_id)
+            if default_path != source:
+                source.unlink()
+                return
+            if replacement_default is None:
+                raise ValueError(
+                    "Cannot delete the default profile without a replacement default"
+                )
+            replacement_path, replacement = self._load_stored_profile(
+                replacement_default,
+                catalog,
+            )
+            if replacement_path == source:
+                raise ValueError("Replacement default must be a different profile")
+            if replacement.scenario_id != profile.scenario_id:
+                raise ValueError(
+                    "Replacement default must belong to the same scenario"
+                )
+            document = self._default_document(
+                catalog,
+                profile.scenario_id,
+                self._relative_profile_path(replacement_path),
+            )
+            saved_catalog = self._save_catalog(catalog, document)
+            try:
+                source.unlink()
+            except Exception as exc:
+                try:
+                    save_data_catalog(saved_catalog, deepcopy(catalog.document))
+                except Exception as rollback_error:
+                    exc.add_note(
+                        f"Catalog rollback also failed during delete: {rollback_error}"
+                    )
+                raise

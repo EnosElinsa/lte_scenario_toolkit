@@ -12,8 +12,6 @@ import tempfile
 import urllib.error
 import urllib.request
 import zipfile
-from collections.abc import Iterator
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import unquote, urlsplit, urlunsplit
@@ -25,6 +23,7 @@ from .data_catalog import (
     SCENARIO_ID_PATTERN,
     CatalogError,
     DataCatalog,
+    catalog_transaction_lock,
     load_data_catalog,
     save_data_catalog,
     update_data_manifest,
@@ -234,75 +233,6 @@ def _cleanup_staging(
         raise BoundaryImportError(
             f"Scenario staging cleanup failed: {transaction_dir}"
         ) from exc
-
-
-@contextmanager
-def _catalog_transaction_lock(root: Path) -> Iterator[Path]:
-    """Exclusively serialize catalog, boundary, and manifest transactions."""
-
-    staging_root = _safe_repository_path(root, ".lte-data")
-    lock_path = _safe_repository_path(root, ".lte-data", "catalog.lock")
-    if os.path.lexists(staging_root) and not staging_root.is_dir():
-        raise BoundaryImportError(f"Staging path is not a directory: {staging_root}")
-    staging_root_existed = staging_root.exists()
-    try:
-        staging_root.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise BoundaryImportError(
-            f"Could not create scenario staging directory: {staging_root}"
-        ) from exc
-
-    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-    if hasattr(os, "O_BINARY"):
-        flags |= os.O_BINARY
-    try:
-        descriptor = os.open(lock_path, flags, 0o600)
-    except FileExistsError as exc:
-        raise BoundaryImportError(
-            f"Scenario catalog registration is already in progress; lock exists: {lock_path}"
-        ) from exc
-    except OSError as exc:
-        if not staging_root_existed:
-            try:
-                staging_root.rmdir()
-            except OSError:
-                pass
-        raise BoundaryImportError(
-            f"Could not acquire scenario catalog lock: {lock_path}"
-        ) from exc
-
-    operation_error: Exception | None = None
-    try:
-        yield staging_root
-    except Exception as exc:
-        operation_error = exc
-        raise
-    finally:
-        failures: list[tuple[str, Exception]] = []
-        try:
-            os.close(descriptor)
-        except OSError as exc:
-            failures.append(("close", exc))
-        try:
-            lock_path.unlink()
-        except OSError as exc:
-            failures.append(("remove", exc))
-        if not staging_root_existed:
-            try:
-                staging_root.rmdir()
-            except FileNotFoundError:
-                pass
-            except OSError:
-                # Another registration may acquire the lock before this cleanup.
-                pass
-        if failures:
-            details = "; ".join(f"{action}: {error}" for action, error in failures)
-            release_error = BoundaryImportError(
-                f"Could not release scenario catalog lock {lock_path}: {details}"
-            )
-            if operation_error is None:
-                raise release_error
-            raise operation_error from release_error
 
 
 def _safe_zip_member_path(
@@ -1102,7 +1032,10 @@ def register_scenario(
         if resolved_catalog_path.parent.name == "data"
         else resolved_catalog_path.parent
     )
-    with _catalog_transaction_lock(repo_root) as staging_root:
+    with catalog_transaction_lock(
+        repo_root,
+        error_type=BoundaryImportError,
+    ) as staging_root:
         return _register_scenario_locked(
             resolved_catalog_path,
             repo_root,

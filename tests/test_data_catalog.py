@@ -14,6 +14,7 @@ import lte_scenario_toolkit.data_catalog as data_catalog_module
 from lte_scenario_toolkit.data_catalog import (
     CatalogError,
     ConcurrentCatalogUpdateError,
+    catalog_transaction_lock,
     load_data_catalog,
     save_data_catalog,
     update_data_manifest,
@@ -100,6 +101,20 @@ def create_entrypoints(tmp_path: Path) -> None:
     config = tmp_path / "configs" / "test-city.yaml"
     config.parent.mkdir()
     config.write_text("experiment: test", encoding="utf-8")
+
+
+def test_catalog_transaction_lock_uses_shared_staging_root_and_cleans_up(tmp_path):
+    lock_path = tmp_path / ".lte-data" / "catalog.lock"
+
+    with catalog_transaction_lock(tmp_path) as staging_root:
+        assert staging_root == tmp_path / ".lte-data"
+        assert lock_path.is_file()
+        with pytest.raises(CatalogError, match="lock|progress"):
+            with catalog_transaction_lock(tmp_path):
+                pass
+
+    assert not lock_path.exists()
+    assert not staging_root.exists()
 
 
 def test_load_data_catalog_indexes_entries_and_reports_status_transitions(tmp_path):

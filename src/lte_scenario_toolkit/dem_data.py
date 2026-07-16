@@ -28,7 +28,6 @@ from shapely.geometry import box, mapping
 from shapely.ops import unary_union
 
 from .boundary_data import (
-    _catalog_transaction_lock,
     _optional_bytes,
     _restore_bytes,
     _restore_owned_bytes,
@@ -36,6 +35,7 @@ from .boundary_data import (
 )
 from .data_catalog import (
     DataCatalog,
+    catalog_transaction_lock,
     load_data_catalog,
     save_data_catalog,
     update_data_manifest,
@@ -1201,7 +1201,7 @@ def ingest_dem_shards(
     if not isinstance(catalog, DataCatalog):
         raise DemIngestError("ingest_dem_shards requires a loaded DataCatalog")
     try:
-        with _catalog_transaction_lock(catalog.root) as staging_root:
+        with catalog_transaction_lock(catalog.root) as staging_root:
             # Reload after acquiring the lock: callers may have loaded a stale
             # catalog while another transaction was completing.
             fresh_catalog = load_data_catalog(catalog.path, repo_root=catalog.root)

@@ -6,7 +6,8 @@ import json
 import os
 import re
 import tempfile
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -66,6 +67,119 @@ class CatalogError(ValueError):
 
 class ConcurrentCatalogUpdateError(CatalogError):
     """Raised when a catalog changed after it was loaded."""
+
+
+class CatalogTransactionError(CatalogError):
+    """Raised when the shared catalog transaction lock cannot be managed."""
+
+
+def _catalog_transaction_path(
+    root: Path,
+    *parts: str,
+    error_type: type[Exception],
+) -> Path:
+    """Return a fixed transaction path after rejecting symlink traversal."""
+
+    repository = root.resolve()
+    relative = Path(*parts)
+    candidate = repository / relative
+    current = repository
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            raise error_type(
+                f"Repository transaction path must not use symlinks: {candidate}"
+            )
+    resolved = candidate.resolve(strict=False)
+    try:
+        resolved.relative_to(repository)
+    except ValueError as exc:
+        raise error_type(
+            f"Repository transaction path escapes repository root: {candidate}"
+        ) from exc
+    return candidate
+
+
+@contextmanager
+def catalog_transaction_lock(
+    root: str | Path,
+    *,
+    error_type: type[Exception] = CatalogTransactionError,
+) -> Iterator[Path]:
+    """Exclusively serialize catalog, boundary, DEM, and profile transactions."""
+
+    repository = Path(root).resolve()
+    staging_root = _catalog_transaction_path(
+        repository,
+        ".lte-data",
+        error_type=error_type,
+    )
+    lock_path = _catalog_transaction_path(
+        repository,
+        ".lte-data",
+        "catalog.lock",
+        error_type=error_type,
+    )
+    if os.path.lexists(staging_root) and not staging_root.is_dir():
+        raise error_type(f"Staging path is not a directory: {staging_root}")
+    staging_root_existed = staging_root.exists()
+    try:
+        staging_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise error_type(
+            f"Could not create scenario staging directory: {staging_root}"
+        ) from exc
+
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except FileExistsError as exc:
+        raise error_type(
+            "Scenario catalog registration is already in progress; "
+            f"lock exists: {lock_path}"
+        ) from exc
+    except OSError as exc:
+        if not staging_root_existed:
+            try:
+                staging_root.rmdir()
+            except OSError:
+                pass
+        raise error_type(f"Could not acquire scenario catalog lock: {lock_path}") from exc
+
+    operation_error: Exception | None = None
+    try:
+        yield staging_root
+    except Exception as exc:
+        operation_error = exc
+        raise
+    finally:
+        failures: list[tuple[str, Exception]] = []
+        try:
+            os.close(descriptor)
+        except OSError as exc:
+            failures.append(("close", exc))
+        try:
+            lock_path.unlink()
+        except OSError as exc:
+            failures.append(("remove", exc))
+        if not staging_root_existed:
+            try:
+                staging_root.rmdir()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                # Another registration may acquire the lock before this cleanup.
+                pass
+        if failures:
+            details = "; ".join(f"{action}: {error}" for action, error in failures)
+            release_error = error_type(
+                f"Could not release scenario catalog lock {lock_path}: {details}"
+            )
+            if operation_error is None:
+                raise release_error
+            raise operation_error from release_error
 
 
 @dataclass(frozen=True)
