@@ -1,0 +1,655 @@
+"""Validated scenario sources and previewable terrain-figure workflows."""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import uuid
+from collections.abc import Iterable, Mapping
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+import geopandas as gpd
+import matplotlib
+import numpy as np
+import pandas as pd
+import rasterio
+import yaml
+from matplotlib.colors import is_color_like
+from pyproj import CRS
+
+from . import visualization
+from .data_catalog import load_data_catalog
+from .run_service import RunService
+
+REQUIRED_COLUMNS = frozenset(
+    {
+        "rect_id",
+        "pt_count",
+        "left_x",
+        "bottom_y",
+        "center_x",
+        "center_y",
+        "X",
+        "Y",
+    }
+)
+_RECTANGLE_COLUMNS = (
+    "rect_id",
+    "pt_count",
+    "left_x",
+    "bottom_y",
+    "center_x",
+    "center_y",
+)
+_FORMATS = frozenset({"png", "eps", "html"})
+
+
+@dataclass(frozen=True)
+class FigureSource:
+    """One validated rectangle and its points, without an open raster handle."""
+
+    path: Path
+    csv_path: Path
+    frame: pd.DataFrame
+    rectangle: dict[str, Any]
+    points: gpd.GeoDataFrame
+    target_crs: str
+    rectangle_size_m: float
+    warnings: tuple[str, ...] = ()
+    dem_path: Path | None = None
+    run_id: str | None = None
+    scenario_id: str | None = None
+    profile_id: str | None = None
+
+
+@dataclass(frozen=True)
+class FigureSpec:
+    """Complete, validated terrain-figure styling and sampling settings."""
+
+    preset: str
+    colormap: str
+    dpi: int
+    azimuth: float
+    elevation_angle: float
+    vertical_exaggeration: float
+    station_color: str
+    station_size: float
+    title: str | None
+    max_pixels: int
+
+    @classmethod
+    def from_preset(cls, preset: str) -> FigureSpec:
+        if preset == "preview":
+            return cls(
+                preset="preview",
+                colormap="terrain",
+                dpi=120,
+                azimuth=-60.0,
+                elevation_angle=30.0,
+                vertical_exaggeration=1.0,
+                station_color="red",
+                station_size=20.0,
+                title=None,
+                max_pixels=600,
+            )
+        if preset == "publication":
+            return cls(
+                preset="publication",
+                colormap="terrain",
+                dpi=300,
+                azimuth=-60.0,
+                elevation_angle=30.0,
+                vertical_exaggeration=1.0,
+                station_color="red",
+                station_size=20.0,
+                title=None,
+                max_pixels=1800,
+            )
+        raise ValueError("preset must be one of: preview, publication")
+
+    def validate(self) -> FigureSpec:
+        if self.preset not in {"preview", "publication"}:
+            raise ValueError("figure preset must be one of: preview, publication")
+        if type(self.colormap) is not str or not self.colormap.strip():
+            raise ValueError("figure colormap must be a non-empty string")
+        try:
+            matplotlib.colormaps.get_cmap(self.colormap)
+        except ValueError as exc:
+            raise ValueError(f"Unknown figure colormap: {self.colormap}") from exc
+        if type(self.dpi) is not int or self.dpi <= 0:
+            raise ValueError("Figure DPI must be a positive integer")
+        for name, value in (
+            ("azimuth", self.azimuth),
+            ("elevation angle", self.elevation_angle),
+            ("vertical exaggeration", self.vertical_exaggeration),
+            ("station size", self.station_size),
+        ):
+            if type(value) not in {int, float} or not math.isfinite(float(value)):
+                raise ValueError(f"Figure {name} must be a finite number")
+        if not -90 <= float(self.elevation_angle) <= 90:
+            raise ValueError("Figure elevation angle must be between -90 and 90")
+        if self.vertical_exaggeration <= 0:
+            raise ValueError("Figure vertical exaggeration must be greater than zero")
+        if self.station_size <= 0:
+            raise ValueError("Figure station size must be greater than zero")
+        if type(self.station_color) is not str or not is_color_like(self.station_color):
+            raise ValueError("Figure station color must be a valid Matplotlib color")
+        if self.title is not None and type(self.title) is not str:
+            raise ValueError("Figure title must be null or a string")
+        if type(self.max_pixels) is not int or self.max_pixels <= 0:
+            raise ValueError("Figure max_pixels must be a positive integer")
+        return self
+
+    def resolved_title(self, rectangle_size_m: float, point_count: int) -> str:
+        if self.title is not None:
+            return self.title
+        if self.preset == "publication":
+            return {1000: "DCMOP1", 2000: "DCMOP2", 3000: "DCMOP3"}.get(
+                int(rectangle_size_m),
+                f"{rectangle_size_m:g}m",
+            )
+        return (
+            f"Terrain | {rectangle_size_m:g}m x {rectangle_size_m:g}m | "
+            f"{point_count} stations"
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class FigureResult:
+    """Immutable description of a rendered or published figure result."""
+
+    path: Path
+    artifacts: tuple[Path, ...]
+    errors: tuple[dict[str, str], ...] = ()
+
+
+def _mapping(value: Any, *, description: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{description} must be a mapping")
+    return value
+
+
+def _read_json(path: Path) -> Mapping[str, Any]:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Cannot read run record {path}: {exc}") from exc
+    return _mapping(document, description="run record")
+
+
+def _read_yaml(path: Path) -> Mapping[str, Any]:
+    try:
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise ValueError(f"Cannot read run snapshot {path}: {exc}") from exc
+    return _mapping(document, description="run snapshot")
+
+
+def _contained_regular_file(parent: Path, relative: Any, *, description: str) -> Path:
+    if type(relative) is not str or not relative:
+        raise ValueError(f"{description} must be a contained relative path")
+    candidate_relative = Path(relative)
+    if (
+        candidate_relative.is_absolute()
+        or candidate_relative == Path(".")
+        or ".." in candidate_relative.parts
+    ):
+        raise ValueError(f"{description} must be a contained relative path: {relative}")
+    candidate = parent / candidate_relative
+    if candidate.is_symlink() or not candidate.is_file():
+        raise ValueError(f"{description} must be an existing regular file: {relative}")
+    resolved = candidate.resolve(strict=True)
+    try:
+        resolved.relative_to(parent)
+    except ValueError as exc:
+        raise ValueError(f"{description} escapes its run directory: {relative}") from exc
+    return resolved
+
+
+def _validated_dem_path(value: Any, *, description: str) -> Path:
+    if not isinstance(value, (str, os.PathLike)):
+        raise ValueError(f"{description} must be an absolute path")
+    path = Path(value)
+    if not path.is_absolute():
+        raise ValueError(f"{description} must be an absolute path: {path}")
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{description} must be an existing regular file: {path}")
+    resolved = path.resolve(strict=True)
+    if resolved != path:
+        raise ValueError(f"{description} must be a resolved path: {path}")
+    try:
+        with rasterio.open(resolved) as dem:
+            if dem.crs is None:
+                raise ValueError("DEM has no CRS")
+            if dem.count < 1:
+                raise ValueError("DEM has no raster band")
+    except (OSError, rasterio.errors.RasterioError, ValueError) as exc:
+        raise ValueError(f"{description} is not a readable georeferenced raster: {exc}") from exc
+    return resolved
+
+
+def _catalog_dem_path(catalog_value: Any, dataset_id: str) -> Path:
+    if not isinstance(catalog_value, (str, os.PathLike)):
+        raise ValueError("run DEM catalog_path must be an absolute path")
+    catalog_path = Path(catalog_value)
+    if not catalog_path.is_absolute():
+        raise ValueError(f"run DEM catalog_path must be absolute: {catalog_path}")
+    if catalog_path.is_symlink() or not catalog_path.is_file():
+        raise ValueError(f"run DEM catalog_path must be a regular file: {catalog_path}")
+    catalog_path = catalog_path.resolve(strict=True)
+    try:
+        catalog = load_data_catalog(catalog_path, repo_root=catalog_path.parent.parent)
+        record = catalog.dataset(dataset_id)
+        if record["role"] != "dem":
+            raise ValueError(f"dataset {dataset_id!r} is not a DEM")
+        return _validated_dem_path(
+            catalog.resolve(record["entrypoint"]),
+            description="catalog DEM entrypoint",
+        )
+    except Exception as exc:
+        raise ValueError(
+            f"Cannot resolve DEM dataset {dataset_id!r} from {catalog_path}: {exc}"
+        ) from exc
+
+
+def _run_dem_path(run_dir: Path, record: Mapping[str, Any]) -> Path | None:
+    metadata = record.get("metadata", {})
+    if not isinstance(metadata, Mapping):
+        raise ValueError("run metadata must be a mapping")
+    inputs = metadata.get("inputs", {})
+    if not isinstance(inputs, Mapping):
+        raise ValueError("run metadata inputs must be a mapping")
+    dem = inputs.get("dem")
+    if dem is None:
+        return None
+    if not isinstance(dem, Mapping):
+        raise ValueError("run metadata DEM input must be a mapping")
+    if "path" in dem:
+        return _validated_dem_path(dem["path"], description="run DEM path")
+    catalog_path = dem.get("catalog_path")
+    dataset_id = dem.get("dataset_id")
+    if catalog_path is None:
+        return None
+    if type(dataset_id) is not str or not dataset_id:
+        raise ValueError(
+            "run DEM dataset_id must be a non-empty string when catalog_path is recorded"
+        )
+    return _catalog_dem_path(catalog_path, dataset_id)
+
+
+def _run_source(path: Path) -> tuple[Path, Path, Mapping[str, Any], str, float, Path | None]:
+    run_dir = path.parent if path.name.casefold() == "run.json" else path
+    if run_dir.is_symlink() or not run_dir.is_dir():
+        raise ValueError(f"Figure run source must be a real directory: {run_dir}")
+    run_dir = run_dir.resolve(strict=True)
+    record_path = run_dir / "run.json"
+    if record_path.is_symlink() or not record_path.is_file():
+        raise ValueError(f"Figure run source is missing run.json: {run_dir}")
+    record = _read_json(record_path)
+    artifacts = record.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise ValueError("run artifacts must be a list")
+    csv_artifacts = [
+        item
+        for item in artifacts
+        if type(item) is str and Path(item).suffix.casefold() == ".csv"
+    ]
+    if len(csv_artifacts) != 1:
+        raise ValueError("Figure run must contain exactly one scenario CSV artifact")
+    csv_path = _contained_regular_file(
+        run_dir,
+        csv_artifacts[0],
+        description="scenario CSV artifact",
+    )
+    config_path = run_dir / "run-config.yaml"
+    if config_path.is_symlink() or not config_path.is_file():
+        raise ValueError(f"Figure run source is missing run-config.yaml: {run_dir}")
+    snapshot = _read_yaml(config_path)
+    spatial = _mapping(snapshot.get("spatial"), description="run snapshot spatial section")
+    target_crs = spatial.get("target_crs")
+    if type(target_crs) is not str or not target_crs:
+        raise ValueError("run snapshot spatial.target_crs must be a non-empty string")
+    try:
+        CRS.from_user_input(target_crs)
+    except Exception as exc:
+        raise ValueError(f"Invalid run snapshot target CRS: {target_crs}") from exc
+    rectangle_size = spatial.get("rectangle_size_m")
+    if type(rectangle_size) not in {int, float} or not math.isfinite(rectangle_size):
+        raise ValueError("run snapshot rectangle_size_m must be a finite number")
+    if rectangle_size <= 0:
+        raise ValueError("run snapshot rectangle_size_m must be greater than zero")
+    dem_path = _run_dem_path(run_dir, record)
+    return run_dir, csv_path, record, target_crs, float(rectangle_size), dem_path
+
+
+def _read_frame(csv_path: Path, *, rect_id: Any) -> tuple[pd.DataFrame, dict[str, Any]]:
+    try:
+        frame = pd.read_csv(csv_path)
+    except (OSError, pd.errors.ParserError, UnicodeError) as exc:
+        raise ValueError(f"Cannot read scenario CSV {csv_path}: {exc}") from exc
+    if frame.empty:
+        raise ValueError(f"Scenario CSV is empty: {csv_path}")
+    missing = sorted(REQUIRED_COLUMNS.difference(frame.columns))
+    if missing:
+        raise ValueError(f"Scenario CSV missing required columns: {', '.join(missing)}")
+    numeric_columns = set(REQUIRED_COLUMNS)
+    if "elevation" in frame.columns:
+        numeric_columns.add("elevation")
+    numeric = frame.loc[:, sorted(numeric_columns)].apply(
+        pd.to_numeric,
+        errors="coerce",
+    )
+    if not np.isfinite(numeric.to_numpy(dtype=float)).all():
+        raise ValueError("Scenario CSV required numeric values must be finite")
+    frame = frame.copy()
+    frame.loc[:, sorted(numeric_columns)] = numeric
+    rectangle_ids = frame["rect_id"].drop_duplicates().tolist()
+    if rect_id is None:
+        if len(rectangle_ids) != 1:
+            raise ValueError("Scenario CSV has multiple rect_id values; choose rect_id explicitly")
+        selected_id = rectangle_ids[0]
+    else:
+        try:
+            selected_numeric = float(rect_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"rect_id must be numeric: {rect_id!r}") from exc
+        matching_ids = [value for value in rectangle_ids if float(value) == selected_numeric]
+        if len(matching_ids) != 1:
+            raise ValueError(f"rect_id {rect_id!r} is not present in the scenario CSV")
+        selected_id = matching_ids[0]
+    selected = frame.loc[frame["rect_id"] == selected_id].copy().reset_index(drop=True)
+    rectangle: dict[str, Any] = {}
+    for column in _RECTANGLE_COLUMNS:
+        values = selected[column].drop_duplicates().tolist()
+        if len(values) != 1:
+            raise ValueError(f"Scenario CSV rectangle column {column} is inconsistent")
+        value = values[0]
+        rectangle[column] = value.item() if hasattr(value, "item") else value
+    return selected, rectangle
+
+
+def _infer_rectangle_size(rectangle: Mapping[str, Any]) -> float:
+    width = 2.0 * (float(rectangle["center_x"]) - float(rectangle["left_x"]))
+    height = 2.0 * (float(rectangle["center_y"]) - float(rectangle["bottom_y"]))
+    if not math.isfinite(width) or not math.isfinite(height) or width <= 0 or height <= 0:
+        raise ValueError("Scenario CSV cannot infer a positive rectangle size")
+    if not math.isclose(width, height, rel_tol=1e-9, abs_tol=1e-6):
+        raise ValueError("Scenario CSV rectangle is not square")
+    return width
+
+
+def _temporary_sibling(path: Path) -> Path:
+    return path.with_name(f".{path.stem}.{uuid.uuid4().hex}.tmp{path.suffix}")
+
+
+def _promote_nonempty(temporary: Path, destination: Path) -> Path:
+    if temporary.is_symlink() or not temporary.is_file() or temporary.stat().st_size <= 0:
+        raise ValueError(f"Rendered figure is missing or empty: {temporary}")
+    temporary.replace(destination)
+    return destination
+
+
+def _complete_staging(run_path: Path, artifacts: Iterable[str]) -> bool:
+    try:
+        paths = (run_path / "run.json", *(run_path / name for name in artifacts))
+        return all(
+            not path.is_symlink()
+            and path.is_file()
+            and path.stat().st_size > 0
+            for path in paths
+        )
+    except OSError:
+        return False
+
+
+def _normalise_formats(formats: Iterable[str]) -> tuple[str, ...]:
+    if isinstance(formats, (str, bytes, os.PathLike)):
+        raise ValueError("formats must be a non-empty collection")
+    try:
+        values = tuple(formats)
+    except TypeError as exc:
+        raise ValueError("formats must be a non-empty collection") from exc
+    if not values:
+        raise ValueError("formats must be a non-empty collection")
+    normalised: list[str] = []
+    for value in values:
+        if type(value) is not str:
+            raise ValueError("figure format must be text")
+        token = value.casefold().removeprefix(".")
+        if token not in _FORMATS:
+            raise ValueError("figure format must be one of: eps, html, png")
+        if token in normalised:
+            raise ValueError(f"duplicate figure format: {token}")
+        normalised.append(token)
+    return tuple(normalised)
+
+
+def _require_dem(source: FigureSource) -> Path:
+    if source.dem_path is None:
+        raise ValueError(
+            "A DEM path has not been resolved for this figure source; load a selection "
+            "run with recorded DEM provenance or use the legacy config workflow"
+        )
+    return _validated_dem_path(source.dem_path, description="figure source DEM path")
+
+
+class FigureService:
+    """Load, preview, and publish figures through one reusable service."""
+
+    @staticmethod
+    def load_source(path: str | Path, rect_id: Any = None) -> FigureSource:
+        source_path = Path(path)
+        if not source_path.exists():
+            raise FileNotFoundError(f"Figure source does not exist: {source_path}")
+        warnings: tuple[str, ...]
+        dem_path: Path | None
+        record: Mapping[str, Any]
+        if source_path.is_dir() or source_path.name.casefold() == "run.json":
+            root, csv_path, record, target_crs, rectangle_size, dem_path = _run_source(
+                source_path
+            )
+            warnings = ()
+        elif source_path.is_file() and source_path.suffix.casefold() == ".csv":
+            if source_path.is_symlink():
+                raise ValueError(f"Scenario CSV must be a regular file: {source_path}")
+            resolved_csv = source_path.resolve(strict=True)
+            sibling_record = source_path.parent / "run.json"
+            sibling_snapshot = source_path.parent / "run-config.yaml"
+            if sibling_record.is_file() or sibling_snapshot.is_file():
+                (
+                    root,
+                    csv_path,
+                    record,
+                    target_crs,
+                    rectangle_size,
+                    dem_path,
+                ) = _run_source(source_path.parent)
+                if csv_path != resolved_csv:
+                    raise ValueError(
+                        "Selected CSV is not the scenario CSV recorded by its sibling run.json"
+                    )
+                warnings = ()
+            else:
+                root = resolved_csv
+                csv_path = root
+                record = {}
+                target_crs = "EPSG:3857"
+                rectangle_size = 0.0
+                dem_path = None
+                warnings = (
+                    "Legacy scenario CSV has no run snapshot; assuming EPSG:3857.",
+                )
+        else:
+            raise ValueError("Figure source must be a run directory, run.json, or CSV")
+
+        frame, rectangle = _read_frame(csv_path, rect_id=rect_id)
+        if rectangle_size == 0:
+            rectangle_size = _infer_rectangle_size(rectangle)
+        geometry = gpd.points_from_xy(frame["X"], frame["Y"])
+        points = gpd.GeoDataFrame(frame.copy(), geometry=geometry, crs=target_crs)
+        return FigureSource(
+            path=root,
+            csv_path=csv_path,
+            frame=frame,
+            rectangle=rectangle,
+            points=points,
+            target_crs=target_crs,
+            rectangle_size_m=rectangle_size,
+            warnings=warnings,
+            dem_path=dem_path,
+            run_id=record.get("run_id") if type(record.get("run_id")) is str else None,
+            scenario_id=(
+                record.get("scenario_id")
+                if type(record.get("scenario_id")) is str
+                else None
+            ),
+            profile_id=(
+                record.get("profile_id")
+                if type(record.get("profile_id")) is str
+                else None
+            ),
+        )
+
+    @staticmethod
+    def preview(source: FigureSource, spec: FigureSpec, output: str | Path) -> Path:
+        if not isinstance(source, FigureSource):
+            raise ValueError("source must be a FigureSource")
+        if not isinstance(spec, FigureSpec):
+            raise ValueError("spec must be a FigureSpec")
+        spec.validate()
+        dem_path = _require_dem(source)
+        destination = Path(output).resolve()
+        if destination.suffix.casefold() != ".png":
+            raise ValueError("preview output must use a .png suffix")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = _temporary_sibling(destination)
+        try:
+            with rasterio.open(dem_path) as dem:
+                visualization.render_3d_terrain(
+                    source.rectangle,
+                    source.points,
+                    dem,
+                    spec,
+                    rectangle_size=source.rectangle_size_m,
+                    target_crs=source.target_crs,
+                    png_path=temporary,
+                )
+            return _promote_nonempty(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def render(
+        source: FigureSource,
+        spec: FigureSpec,
+        run_service: RunService,
+        formats: Iterable[str],
+        parent_run_id: str | None = None,
+    ) -> Path:
+        if not isinstance(source, FigureSource):
+            raise ValueError("source must be a FigureSource")
+        if not isinstance(spec, FigureSpec):
+            raise ValueError("spec must be a FigureSpec")
+        if not isinstance(run_service, RunService):
+            raise ValueError("run_service must be a RunService")
+        spec.validate()
+        requested = _normalise_formats(formats)
+        dem_path = _require_dem(source)
+        with rasterio.open(dem_path) as dem:
+            terrain_arrays = visualization.prepare_terrain_arrays(
+                source.rectangle,
+                source.points,
+                dem,
+                source.rectangle_size_m,
+                source.target_crs,
+                max_pixels=spec.max_pixels,
+            )
+        scenario_id = source.scenario_id or "legacy"
+        profile_id = source.profile_id or "figures"
+        run = run_service.begin(
+            scenario_id,
+            profile_id,
+            parent_run_id=parent_run_id,
+        )
+        artifacts: list[str] = []
+        errors: list[dict[str, str]] = []
+        publishing = False
+        try:
+            for token in requested:
+                name = f"terrain.{token}"
+                destination = run.path / name
+                temporary = _temporary_sibling(destination)
+                paths = {
+                    "png_path": temporary if token == "png" else None,
+                    "eps_path": temporary if token == "eps" else None,
+                    "html_path": temporary if token == "html" else None,
+                }
+                try:
+                    visualization.render_3d_terrain(
+                        source.rectangle,
+                        source.points,
+                        None,
+                        spec,
+                        rectangle_size=source.rectangle_size_m,
+                        target_crs=source.target_crs,
+                        terrain_arrays=terrain_arrays,
+                        **paths,
+                    )
+                    _promote_nonempty(temporary, destination)
+                    artifacts.append(name)
+                except Exception as exc:
+                    errors.append(
+                        {
+                            "artifact": token,
+                            "code": f"figure.{token}.failed",
+                            "message": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+                finally:
+                    temporary.unlink(missing_ok=True)
+            if not artifacts:
+                raise ValueError("No requested figure format was rendered successfully")
+            metadata = {
+                "schema_version": 1,
+                "run_kind": "figure",
+                "source": {
+                    "path": str(source.path),
+                    "csv": str(source.csv_path),
+                    "run_id": source.run_id,
+                },
+                "target_crs": source.target_crs,
+                "rectangle_size_m": source.rectangle_size_m,
+                "rect_id": source.rectangle["rect_id"],
+                "figure_spec": spec.as_dict(),
+                "requested_formats": list(requested),
+                "artifact_paths": {
+                    Path(name).suffix.removeprefix("."): name for name in artifacts
+                },
+                "warnings": list(source.warnings),
+            }
+            publishing = True
+            return run_service.publish(
+                run,
+                status="completed" if not errors else "partial",
+                artifacts=artifacts,
+                metadata=metadata,
+                errors=errors,
+            )
+        except Exception as exc:
+            if publishing:
+                if _complete_staging(run.path, artifacts):
+                    exc.add_note(f"Figure run staging retained for recovery: {run.path}")
+                else:
+                    run_service.abandon(run)
+            else:
+                run_service.abandon(run)
+            raise
+
+
+__all__ = ["FigureResult", "FigureService", "FigureSource", "FigureSpec"]

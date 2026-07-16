@@ -1227,6 +1227,7 @@ class SelectionService:
                     "dem": {
                         "dataset_id": dataset_ids["dem"],
                         "fingerprint": preflight.dem_fingerprint,
+                        "path": str(preflight.dem_path.resolve()),
                     },
                 },
                 "parameters": {

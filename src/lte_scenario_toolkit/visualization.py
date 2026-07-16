@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -122,8 +125,23 @@ def interactive_select(points_gdf, boundary, results, config):
     return [] if selected_index[0] is None else [results[selected_index[0]]]
 
 
-def _terrain_arrays(rectangle, selected_points, dem, rectangle_size, target_crs):
+def prepare_terrain_arrays(
+    rectangle,
+    selected_points,
+    dem,
+    rectangle_size,
+    target_crs,
+    *,
+    max_pixels,
+):
+    """Read and project one DEM window with its largest dimension bounded."""
+
+    if type(max_pixels) is not int or max_pixels <= 0:
+        raise ValueError("max_pixels must be a positive integer")
     from pyproj import Transformer
+    from rasterio import Affine
+    from rasterio.enums import Resampling
+    from rasterio.warp import transform_bounds
     from rasterio.windows import from_bounds
 
     left = float(rectangle["left_x"])
@@ -135,22 +153,48 @@ def _terrain_arrays(rectangle, selected_points, dem, rectangle_size, target_crs)
         raise ValueError("DEM requires a CRS for terrain rendering")
 
     if str(dem.crs) != target_crs:
-        to_dem = Transformer.from_crs(target_crs, dem.crs, always_xy=True)
-        left_dem, bottom_dem = to_dem.transform(left, bottom)
-        right_dem, top_dem = to_dem.transform(right, top)
+        left_dem, bottom_dem, right_dem, top_dem = transform_bounds(
+            target_crs,
+            dem.crs,
+            left,
+            bottom,
+            right,
+            top,
+            densify_pts=21,
+        )
     else:
         left_dem, bottom_dem, right_dem, top_dem = left, bottom, right, top
     window = from_bounds(left_dem, bottom_dem, right_dem, top_dem, dem.transform)
-    elevation = dem.read(1, window=window)
+    source_rows = max(1, int(math.ceil(abs(float(window.height)))))
+    source_columns = max(1, int(math.ceil(abs(float(window.width)))))
+    scale = min(1.0, max_pixels / max(source_rows, source_columns))
+    output_rows = max(1, min(max_pixels, int(math.ceil(source_rows * scale))))
+    output_columns = max(
+        1,
+        min(max_pixels, int(math.ceil(source_columns * scale))),
+    )
+    elevation = dem.read(
+        1,
+        window=window,
+        out_shape=(output_rows, output_columns),
+        resampling=Resampling.bilinear,
+        masked=True,
+    )
     if elevation.size == 0:
         raise ValueError("DEM window is empty for the selected rectangle")
-    elevation = elevation.astype(float)
+    if np.ma.isMaskedArray(elevation):
+        elevation = elevation.astype(float).filled(np.nan)
+    else:
+        elevation = elevation.astype(float)
     if dem.nodata is not None:
         elevation[np.isclose(elevation, dem.nodata, equal_nan=True)] = np.nan
     if not np.isfinite(elevation).any():
         raise ValueError("DEM window contains no valid elevation values")
 
-    transform = dem.window_transform(window)
+    transform = dem.window_transform(window) * Affine.scale(
+        float(window.width) / output_columns,
+        float(window.height) / output_rows,
+    )
     rows, columns = elevation.shape
     column_grid, row_grid = np.meshgrid(np.arange(columns), np.arange(rows))
     x_grid = (
@@ -185,88 +229,196 @@ def _terrain_arrays(rectangle, selected_points, dem, rectangle_size, target_crs)
     }
 
 
-def render_3d_terrain(
-    rectangle: dict[str, Any],
-    selected_points,
-    dem,
-    config: dict[str, Any],
-    *,
-    publication_style: bool = False,
-) -> list[Path]:
-    """Render static and interactive terrain outputs from a selected rectangle."""
+def _terrain_arrays(rectangle, selected_points, dem, rectangle_size, target_crs):
+    """Compatibility alias for callers that used the former private helper."""
 
-    import matplotlib.pyplot as plt
-    import plotly.graph_objects as go
-
-    rectangle_size = float(config["rect_size"])
-    arrays = _terrain_arrays(
+    return prepare_terrain_arrays(
         rectangle,
         selected_points,
         dem,
         rectangle_size,
-        config.get("target_crs", "EPSG:3857"),
+        target_crs,
+        max_pixels=1800,
+    )
+
+
+def _legacy_render_request(config, *, publication_style):
+    from .figure_service import FigureSpec
+
+    preset = "publication" if publication_style else "preview"
+    spec = FigureSpec.from_preset(preset)
+    updates = {
+        "colormap": config.get("colormap", spec.colormap),
+        "dpi": config.get("dpi", spec.dpi),
+        "azimuth": config.get("azimuth", config.get("azimuth_deg", spec.azimuth)),
+        "elevation_angle": config.get(
+            "elevation_angle",
+            config.get("elevation_deg", spec.elevation_angle),
+        ),
+        "vertical_exaggeration": config.get(
+            "vertical_exaggeration",
+            spec.vertical_exaggeration,
+        ),
+        "station_color": config.get("station_color", spec.station_color),
+        "station_size": config.get(
+            "station_size",
+            config.get("station_marker_size", spec.station_size),
+        ),
+        "title": config.get("title", spec.title),
+    }
+    spec = replace(spec, **updates).validate()
+    png_path = None
+    eps_path = None
+    html_path = None
+    if config.get("save_terrain_png", True):
+        png_path = Path(config["output_3d_png"])
+        if config.get("save_terrain_eps", False):
+            eps_path = png_path.with_suffix(".eps")
+    if config.get("save_terrain_html", True):
+        html_path = Path(config["output_3d_html"])
+    return (
+        spec,
+        float(config["rect_size"]),
+        str(config.get("target_crs", "EPSG:3857")),
+        png_path,
+        eps_path,
+        html_path,
+    )
+
+
+def render_3d_terrain(
+    rectangle: dict[str, Any],
+    selected_points,
+    dem,
+    spec,
+    *,
+    rectangle_size: float | None = None,
+    target_crs: str | None = None,
+    png_path: str | Path | None = None,
+    eps_path: str | Path | None = None,
+    html_path: str | Path | None = None,
+    terrain_arrays: Mapping[str, np.ndarray] | None = None,
+    publication_style: bool = False,
+) -> list[Path]:
+    """Render requested outputs from validated style and explicit paths.
+
+    A mapping in the fourth positional argument is accepted as a compatibility
+    adapter for the pre-service selection exporter.
+    """
+
+    import matplotlib.pyplot as plt
+    import plotly.graph_objects as go
+
+    if isinstance(spec, Mapping):
+        (
+            spec,
+            rectangle_size,
+            target_crs,
+            png_path,
+            eps_path,
+            html_path,
+        ) = _legacy_render_request(spec, publication_style=publication_style)
+    else:
+        from .figure_service import FigureSpec
+
+        if not isinstance(spec, FigureSpec):
+            raise ValueError("spec must be a FigureSpec")
+        spec.validate()
+    if rectangle_size is None or not math.isfinite(float(rectangle_size)):
+        raise ValueError("rectangle_size must be a finite positive number")
+    rectangle_size = float(rectangle_size)
+    if rectangle_size <= 0:
+        raise ValueError("rectangle_size must be a finite positive number")
+    if type(target_crs) is not str or not target_crs:
+        raise ValueError("target_crs must be a non-empty string")
+    png_path = None if png_path is None else Path(png_path)
+    eps_path = None if eps_path is None else Path(eps_path)
+    html_path = None if html_path is None else Path(html_path)
+    if png_path is None and eps_path is None and html_path is None:
+        raise ValueError("At least one explicit terrain output path is required")
+    arrays = (
+        dict(terrain_arrays)
+        if terrain_arrays is not None
+        else prepare_terrain_arrays(
+            rectangle,
+            selected_points,
+            dem,
+            rectangle_size,
+            target_crs,
+            max_pixels=spec.max_pixels,
+        )
     )
     z_range = max(float(np.nanmax(arrays["z"]) - np.nanmin(arrays["z"])), 0.1)
-    z_aspect = 5 * z_range / rectangle_size
+    z_aspect = max(
+        spec.vertical_exaggeration * z_range / rectangle_size,
+        0.01,
+    )
     valid_points = np.isfinite(arrays["point_z"])
     offset = z_range * 0.02
-    title = (
-        {1000: "DCMOP1", 2000: "DCMOP2", 3000: "DCMOP3"}.get(
-            int(rectangle_size), f"{rectangle_size:g}m"
-        )
-        if publication_style
-        else f"Terrain | {rectangle_size:g}m x {rectangle_size:g}m | {rectangle['pt_count']} stations"
+    title = spec.resolved_title(
+        rectangle_size,
+        int(rectangle["pt_count"]),
     )
     outputs: list[Path] = []
 
-    if config.get("save_terrain_png", True):
-        png_path = Path(config["output_3d_png"])
-        png_path.parent.mkdir(parents=True, exist_ok=True)
+    if png_path is not None or eps_path is not None:
+        static_parent = png_path.parent if png_path is not None else eps_path.parent
+        static_parent.mkdir(parents=True, exist_ok=True)
         figure = plt.figure(figsize=(14, 10))
-        axis = figure.add_subplot(111, projection="3d")
-        row_step = max(1, arrays["z"].shape[0] // 300)
-        column_step = max(1, arrays["z"].shape[1] // 300)
-        surface = axis.plot_surface(
-            arrays["x"][::row_step, ::column_step],
-            arrays["y"][::row_step, ::column_step],
-            arrays["z"][::row_step, ::column_step],
-            cmap="RdYlGn_r",
-            alpha=0.85,
-            linewidth=0,
-            antialiased=True,
-        )
-        axis.scatter(
-            arrays["point_x"][valid_points],
-            arrays["point_y"][valid_points],
-            arrays["point_z"][valid_points] + offset,
-            c="red",
-            s=20,
-            label=f"Stations ({int(valid_points.sum())})",
-        )
-        axis.set_xlabel("X (m)")
-        axis.set_ylabel("Y (m)")
-        axis.set_zlabel("Elevation (m)")
-        axis.set_title(title, fontfamily="Times New Roman" if publication_style else None)
-        axis.set_box_aspect((1, 1, z_aspect))
-        if valid_points.any():
-            axis.legend()
-        figure.colorbar(surface, ax=axis, shrink=0.5, label="Elevation (m)")
-        figure.savefig(png_path, dpi=300 if publication_style else 150, bbox_inches="tight")
-        outputs.append(png_path)
-        if config.get("save_terrain_eps", False):
-            eps_path = png_path.with_suffix(".eps")
-            figure.savefig(eps_path, format="eps", dpi=300, bbox_inches="tight")
-            outputs.append(eps_path)
-        plt.close(figure)
+        try:
+            axis = figure.add_subplot(111, projection="3d")
+            surface = axis.plot_surface(
+                arrays["x"],
+                arrays["y"],
+                arrays["z"],
+                cmap=spec.colormap,
+                alpha=0.85,
+                linewidth=0,
+                antialiased=True,
+            )
+            axis.scatter(
+                arrays["point_x"][valid_points],
+                arrays["point_y"][valid_points],
+                arrays["point_z"][valid_points] + offset,
+                c=spec.station_color,
+                s=spec.station_size,
+                label=f"Stations ({int(valid_points.sum())})",
+            )
+            axis.set_xlabel("X (m)")
+            axis.set_ylabel("Y (m)")
+            axis.set_zlabel("Elevation (m)")
+            axis.set_title(
+                title,
+                fontfamily="Times New Roman" if spec.preset == "publication" else None,
+            )
+            axis.view_init(elev=spec.elevation_angle, azim=spec.azimuth)
+            axis.set_box_aspect((1, 1, z_aspect))
+            if valid_points.any():
+                axis.legend()
+            figure.colorbar(surface, ax=axis, shrink=0.5, label="Elevation (m)")
+            if png_path is not None:
+                png_path.parent.mkdir(parents=True, exist_ok=True)
+                figure.savefig(png_path, dpi=spec.dpi, bbox_inches="tight")
+                outputs.append(png_path)
+            if eps_path is not None:
+                eps_path.parent.mkdir(parents=True, exist_ok=True)
+                figure.savefig(
+                    eps_path,
+                    format="eps",
+                    dpi=spec.dpi,
+                    bbox_inches="tight",
+                )
+                outputs.append(eps_path)
+        finally:
+            plt.close(figure)
 
-    if config.get("save_terrain_html", True):
-        html_path = Path(config["output_3d_html"])
+    if html_path is not None:
         html_path.parent.mkdir(parents=True, exist_ok=True)
         surface = go.Surface(
             x=arrays["x"],
             y=arrays["y"],
             z=arrays["z"],
-            colorscale="RdYlGn_r",
+            colorscale=_plotly_colorscale(spec.colormap),
             opacity=0.9,
             name="Terrain",
         )
@@ -275,7 +427,11 @@ def render_3d_terrain(
             y=arrays["point_y"][valid_points],
             z=arrays["point_z"][valid_points] + offset,
             mode="markers",
-            marker={"size": 4, "color": "red", "symbol": "diamond"},
+            marker={
+                "size": max(1.0, spec.station_size / 5.0),
+                "color": spec.station_color,
+                "symbol": "diamond",
+            },
             name=f"Stations ({int(valid_points.sum())})",
         )
         figure = go.Figure(data=[surface, stations])
@@ -292,3 +448,13 @@ def render_3d_terrain(
         figure.write_html(str(html_path), include_plotlyjs=True)
         outputs.append(html_path)
     return outputs
+
+
+def _plotly_colorscale(colormap: str):
+    """Convert a validated Matplotlib colormap to a Plotly colorscale."""
+
+    import matplotlib
+    from matplotlib.colors import to_hex
+
+    cmap = matplotlib.colormaps.get_cmap(colormap)
+    return [[index / 10, to_hex(cmap(index / 10))] for index in range(11)]

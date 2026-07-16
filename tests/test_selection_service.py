@@ -22,6 +22,7 @@ from lte_scenario_toolkit.candidate_scanner import (
     ScanCancelled,
     ScanResult,
 )
+from lte_scenario_toolkit.figure_service import FigureService
 from lte_scenario_toolkit.profiles import ExperimentProfile, FigureSettings, OutputSettings
 from lte_scenario_toolkit.selection_service import (
     PreparedSelection,
@@ -664,6 +665,7 @@ def test_export_publishes_traceable_csv_preview_and_exact_run_schemas(
             "dem": {
                 "dataset_id": "dem",
                 "fingerprint": "dem-a",
+                "path": str(preflight.dem_path.resolve()),
             },
         },
         "parameters": {
@@ -701,6 +703,8 @@ def test_export_publishes_traceable_csv_preview_and_exact_run_schemas(
     assert Path(profile_snapshot["outputs"]["root"]).resolve() == (
         preflight.output_root.resolve()
     )
+    figure_source = FigureService.load_source(run_dir)
+    assert figure_source.dem_path == preflight.dem_path.resolve()
     assert not list(run_dir.glob(".*.tmp-*"))
 
 
