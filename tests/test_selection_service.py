@@ -593,11 +593,13 @@ def test_export_publishes_traceable_csv_preview_and_exact_run_schemas(
         "scenario_id",
         "profile_id",
         "candidate_id",
+        "target_crs",
         "scan",
         "candidates",
     }
     assert selection["run_id"] == run_record["run_id"]
     assert selection["candidate_id"] == "candidate-0001"
+    assert selection["target_crs"] == "EPSG:3857"
     assert selection["scan"] == {
         "algorithm_version": "row-sweep-v1",
         "cache_key": run_record["metadata"]["cache"]["key"],
@@ -609,6 +611,7 @@ def test_export_publishes_traceable_csv_preview_and_exact_run_schemas(
     selected_candidate = selection["candidates"][0]
     assert selected_candidate.keys() == {
         "candidate_id",
+        "candidate_index",
         "flat_grid_id",
         "point_count",
         "left_x",
@@ -618,11 +621,14 @@ def test_export_publishes_traceable_csv_preview_and_exact_run_schemas(
         "bounds",
         "geometry",
         "dem_statistics",
+        "selected_station_id_field",
         "selected_station_ids",
     }
+    assert selected_candidate["candidate_index"] == 1
     assert selected_candidate["bounds"] == [0.0, 0.0, 2.0, 2.0]
     assert selected_candidate["geometry"]["type"] == "Polygon"
     assert selected_candidate["selected_station_ids"] == [7, 8]
+    assert selected_candidate["selected_station_id_field"] == "cell"
     assert selected_candidate["dem_statistics"]["valid_pixel_count"] == 4
 
     assert run_record["status"] == "completed"
@@ -696,6 +702,82 @@ def test_export_publishes_traceable_csv_preview_and_exact_run_schemas(
         preflight.output_root.resolve()
     )
     assert not list(run_dir.glob(".*.tmp-*"))
+
+
+def test_export_csv_xy_matches_non_web_mercator_profile_crs(tmp_path):
+    points_path = tmp_path / "points.geojson"
+    boundary_path = tmp_path / "boundary.geojson"
+    dem_path = tmp_path / "dem.tif"
+    gpd.GeoDataFrame(
+        {"cell": [7]},
+        geometry=[Point(500_000, 4_500_000)],
+        crs="EPSG:32618",
+    ).to_file(points_path, driver="GeoJSON")
+    gpd.GeoDataFrame(
+        {"name": ["city"]},
+        geometry=[box(499_999, 4_499_999, 500_003, 4_500_003)],
+        crs="EPSG:32618",
+    ).to_file(boundary_path, driver="GeoJSON")
+    with rasterio.open(
+        dem_path,
+        "w",
+        driver="GTiff",
+        width=4,
+        height=4,
+        count=1,
+        dtype="float32",
+        crs="EPSG:32618",
+        transform=from_origin(499_999, 4_500_003, 1, 1),
+    ) as dem:
+        dem.write(np.ones((4, 4), dtype="float32"), 1)
+    output_root = tmp_path / "runs"
+    profile = _profile(
+        tmp_path,
+        target_crs="EPSG:32618",
+        target_count=1,
+        max_rects=1,
+        output_root=output_root,
+    )
+    preflight = SelectionPreflight(
+        scenario_id="chicago",
+        profile=profile,
+        points_path=points_path,
+        boundary_path=boundary_path,
+        dem_path=dem_path,
+        output_root=output_root,
+        boundary_fingerprint="boundary-utm",
+        points_fingerprint="points-utm",
+        dem_fingerprint="dem-utm",
+        boundary_dataset_id="boundary",
+        dem_dataset_id="dem",
+    )
+    candidate = Candidate(
+        0,
+        1,
+        500_000,
+        4_500_000,
+        500_001,
+        4_500_001,
+    )
+    result = ScanResult((candidate,), 1, 1, True, "row-sweep-v1")
+    service = SelectionService(SimpleNamespace(root=tmp_path))
+
+    run_dir = service.export(
+        preflight,
+        result,
+        candidate,
+        output_root=output_root,
+        artifacts={"csv"},
+    )
+
+    frame = pd.read_csv(next(run_dir.glob("*.csv")))
+    assert frame.loc[0, "X"] == pytest.approx(500_000)
+    assert frame.loc[0, "Y"] == pytest.approx(4_500_000)
+    assert frame.loc[0, "center_x"] == pytest.approx(500_001)
+    metadata = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))[
+        "metadata"
+    ]
+    assert metadata["parameters"]["target_crs"] == "EPSG:32618"
 
 
 @pytest.mark.parametrize(
@@ -1107,3 +1189,34 @@ def test_export_allocates_unique_runs_for_two_same_second_publications(
 
     assert first != second
     assert first.is_dir() and second.is_dir()
+
+
+def test_export_retains_complete_staging_when_final_publication_move_fails(
+    selection_export_fixture,
+    monkeypatch,
+):
+    service, preflight, result, candidate, _ = selection_export_fixture
+    original_replace = Path.replace
+
+    def fail_final_move(source, destination):
+        if source.name.startswith(".staging-"):
+            raise OSError("simulated final publication move failure")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(Path, "replace", fail_final_move)
+
+    with pytest.raises(SelectionExportError, match="publication move failure"):
+        service.export(
+            preflight,
+            result,
+            candidate,
+            output_root=preflight.output_root,
+            artifacts={"csv"},
+        )
+
+    staging = list(preflight.output_root.rglob(".staging-*"))
+    assert len(staging) == 1
+    assert (staging[0] / "run.json").stat().st_size > 0
+    assert (staging[0] / "run-config.yaml").stat().st_size > 0
+    assert (staging[0] / "selection.json").stat().st_size > 0
+    assert next(staging[0].glob("*.csv")).stat().st_size > 0

@@ -435,16 +435,20 @@ def main(argv=None) -> int:
     ]
     print(_shared_cache_message(scan_result, cache_progress))
 
-    scenario.verify_results(results, coordinates, config["rect_size"])
-    if args.select_index is None:
-        chosen = visualization.interactive_select(points_gdf, boundary, results, config)
-    else:
-        chosen = scenario.choose_result(results, args.select_index)
-    if not chosen:
-        print("No rectangle selected", file=sys.stderr)
-        return 2
-
     try:
+        scenario.verify_results(results, coordinates, config["rect_size"])
+        if args.select_index is None:
+            chosen = visualization.interactive_select(
+                points_gdf,
+                boundary,
+                results,
+                config,
+            )
+        else:
+            chosen = scenario.choose_result(results, args.select_index)
+        if not chosen:
+            print("No rectangle selected", file=sys.stderr)
+            return 2
         selected_candidate = _chosen_candidate(chosen, scan_result)
         run_dir = selection_service.export(
             preflight,

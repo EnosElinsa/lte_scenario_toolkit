@@ -638,6 +638,113 @@ def test_main_reports_the_legacy_shared_cache_message_on_success(
     assert "Run record:" in captured.out
 
 
+def test_main_maps_out_of_range_select_index_to_exit_code_two(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    output = tmp_path / "output"
+    config_path = tmp_path / "profile.yaml"
+    config_path.write_text("profile", encoding="utf-8")
+    config = {
+        "repo_root": tmp_path,
+        "config_path": config_path,
+        "output_root": output,
+        "rect_size": 2,
+        "target_count": 1,
+        "tolerance": 0,
+        "scan_step": 1,
+        "max_rects": 1,
+        "min_spacing": 2,
+        "strategy": "sequential",
+        "random_seed": 7,
+        "target_crs": "EPSG:3857",
+    }
+    points_path = tmp_path / "points.geojson"
+    boundary_path = tmp_path / "boundary.geojson"
+    dem_path = tmp_path / "dem.tif"
+    paths = {
+        "registered_scenario_id": "chicago",
+        "output_dir": output,
+        "output_csv": output / "scenario.csv",
+        "output_3d_png": output / "terrain.png",
+        "output_3d_html": output / "terrain.html",
+        "preview_png": output / "preview.png",
+        "points_shp": points_path,
+        "boundary_shp": boundary_path,
+        "dem_path": dem_path,
+        "boundary_folder": "Chicago",
+        "boundary_layer": "Chicago_Boundary",
+    }
+    candidate = Candidate(0, 1, 0, 0, 1, 1)
+    scan_result = ScanResult((candidate,), 1, 1, True, "row-sweep-v1")
+    preflight = SimpleNamespace(
+        points_path=points_path,
+        boundary_path=boundary_path,
+        dem_path=dem_path,
+        output_root=output,
+    )
+    points = gpd.GeoDataFrame(
+        {"cell": [1]},
+        geometry=[Point(1, 1)],
+        crs="EPSG:3857",
+    )
+
+    class Service:
+        @staticmethod
+        def preflight(profile, output_root):
+            del profile
+            assert output_root == output
+            return preflight
+
+        @staticmethod
+        def scan(received, *, progress):
+            assert received is preflight
+            progress(
+                SelectionProgress(
+                    phase="completed",
+                    checked_positions=1,
+                    total_positions=1,
+                    candidate_count=1,
+                    elapsed_seconds=0,
+                    added_candidates=(candidate,),
+                    removed_flat_grid_ids=(),
+                    cache_status="hit",
+                    cache_key="a" * 64,
+                )
+            )
+            return scan_result
+
+        @staticmethod
+        def prepared_selection(received):
+            assert received is preflight
+            return SimpleNamespace(
+                points=points,
+                boundary=box(0, 0, 2, 2),
+                coordinates=np.asarray([[1.0, 1.0]]),
+            )
+
+    monkeypatch.setattr(select_sites, "load_experiment_config", lambda *args, **kwargs: config)
+    monkeypatch.setattr(
+        select_sites,
+        "resolve_selection_io_paths",
+        lambda received, *, create_output: paths,
+    )
+    monkeypatch.setattr(select_sites, "load_data_catalog", lambda *args, **kwargs: object())
+    monkeypatch.setattr(select_sites, "_selection_profile", lambda *args: object())
+    monkeypatch.setattr(select_sites, "SelectionService", lambda catalog: Service())
+
+    exit_code = select_sites.main(
+        ["--config", str(config_path), "--select-index", "2"]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "ERROR:" in captured.err
+    assert "--select-index must be between 1 and 1" in captured.err
+    assert not output.exists()
+
+
 def test_main_runs_shared_preflight_before_creating_output(tmp_path, monkeypatch, capsys):
     output = tmp_path / "output"
     config_path = tmp_path / "profile.yaml"

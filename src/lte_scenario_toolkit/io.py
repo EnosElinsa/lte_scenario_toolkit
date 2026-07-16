@@ -32,6 +32,7 @@ def build_output_dataframe(
     scenario_id: str | None = None,
     profile_id: str | None = None,
     candidate_id: str | None = None,
+    target_crs: str | None = None,
 ) -> pd.DataFrame:
     """Build the stable CSV schema used by downstream figure generation."""
 
@@ -55,7 +56,10 @@ def build_output_dataframe(
     else:
         frame["range"] = np.nan
 
-    projected = selected if points_crs.to_epsg() == 3857 else selected.to_crs(epsg=3857)
+    if target_crs is None:
+        projected = selected if points_crs.to_epsg() == 3857 else selected.to_crs(epsg=3857)
+    else:
+        projected = selected.to_crs(target_crs)
     frame["X"] = projected.geometry.x.to_numpy()
     frame["Y"] = projected.geometry.y.to_numpy()
     frame["rect_id"] = rect_id

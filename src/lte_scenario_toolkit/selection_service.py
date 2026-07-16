@@ -1068,6 +1068,8 @@ class SelectionService:
 
         service = RunService(resolved_output)
         run = None
+        publication_started = False
+        published_files: tuple[str, ...] = ()
         try:
             run = service.begin(
                 preflight.scenario_id,
@@ -1094,6 +1096,7 @@ class SelectionService:
                 scenario_id=preflight.scenario_id,
                 profile_id=preflight.profile.profile_id,
                 candidate_id=candidate_id,
+                target_crs=preflight.profile.target_crs,
             )
             selection_document = {
                 "schema_version": 1,
@@ -1101,6 +1104,7 @@ class SelectionService:
                 "scenario_id": preflight.scenario_id,
                 "profile_id": preflight.profile.profile_id,
                 "candidate_id": candidate_id,
+                "target_crs": preflight.profile.target_crs,
                 "scan": {
                     "algorithm_version": scan_result.algorithm_version,
                     "cache_key": key,
@@ -1111,10 +1115,12 @@ class SelectionService:
                 "candidates": [
                     {
                         "candidate_id": candidate_id,
+                        "candidate_index": candidate_index + 1,
                         **asdict(candidate),
                         "bounds": list(geometry.bounds),
                         "geometry": mapping(geometry),
                         "dem_statistics": asdict(statistics),
+                        "selected_station_id_field": "cell",
                         "selected_station_ids": frame["cell"].tolist(),
                     }
                 ],
@@ -1247,15 +1253,38 @@ class SelectionService:
                 "entrypoint": command,
             }
             status = "completed" if not errors else "partial"
+            published_files = tuple(artifact_paths.values())
+            publication_started = True
             return service.publish(
                 run,
                 status=status,
-                artifacts=artifact_paths.values(),
+                artifacts=published_files,
                 metadata=metadata,
                 errors=errors,
             )
         except Exception as exc:
-            if run is not None:
+            retain_staging = False
+            if (
+                run is not None
+                and publication_started
+                and run.path.is_dir()
+            ):
+                try:
+                    for relative in (
+                        "run.json",
+                        "run-config.yaml",
+                        "selection.json",
+                        *published_files,
+                    ):
+                        _require_nonempty_regular_file(run.path / relative)
+                except (OSError, ValueError):
+                    pass
+                else:
+                    retain_staging = True
+                    exc.add_note(
+                        f"Complete run staging retained for recovery: {run.path}"
+                    )
+            if run is not None and run.path.is_dir() and not retain_staging:
                 try:
                     service.abandon(run)
                 except Exception as cleanup_error:

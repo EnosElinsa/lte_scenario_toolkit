@@ -99,6 +99,31 @@ def test_build_output_dataframe_adds_optional_traceability_without_legacy_regres
     ]
 
 
+def test_build_output_dataframe_uses_authoritative_target_crs_for_xy():
+    selected = gpd.GeoDataFrame(
+        {"cell": [10]},
+        geometry=[Point(500_000, 4_500_000)],
+        crs="EPSG:32618",
+    )
+
+    frame = build_output_dataframe(
+        selected,
+        selected.crs,
+        rect_id=1,
+        pt_count=1,
+        left_x=499_000,
+        bottom_y=4_499_000,
+        center_x=500_000,
+        center_y=4_500_000,
+        rect_size=2000,
+        target_crs="EPSG:32618",
+    )
+
+    assert frame.loc[0, "X"] == 500_000
+    assert frame.loc[0, "Y"] == 4_500_000
+    assert frame.loc[0, "center_x"] == 500_000
+
+
 def test_dataset_record_includes_sha256_and_spatial_metadata(tmp_path):
     source = tmp_path / "data.bin"
     source.write_bytes(b"abc")
