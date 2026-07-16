@@ -590,6 +590,33 @@ def test_schema_v2_linked_profile_uses_catalog_owned_boundary_and_dem(tmp_path):
     assert not drifted.ok
     assert any(message.code == "manifest.size" for message in drifted.messages)
 
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    points_record = next(
+        record for record in manifest["datasets"] if record["dataset_id"] == "points"
+    )
+    for file_record in points_record["files"]:
+        if file_record["path"].endswith("points.dbf"):
+            file_record["size_bytes"] = points_dbf.stat().st_size
+    points_shp = tmp_path / "points_shp" / "points" / "points.shp"
+    points_record["files"] = [
+        file_record
+        for file_record in points_record["files"]
+        if file_record["path"] != points_shp.relative_to(tmp_path).as_posix()
+    ]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    points_shp.unlink()
+
+    missing_entrypoint = validate_scenario_data(
+        catalog,
+        "city",
+        dataset_ids=("points",),
+    )
+    assert not missing_entrypoint.ok
+    assert any(
+        message.code == "manifest.entrypoint"
+        for message in missing_entrypoint.messages
+    )
+
 
 def test_validate_cli_single_all_and_argument_errors(tmp_path, capsys):
     catalog_path, _ = _write_catalog(tmp_path, second_city=True)

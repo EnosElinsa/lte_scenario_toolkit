@@ -447,6 +447,15 @@ def test_main_reports_the_legacy_shared_cache_message_on_success(
             )
             return scan_result
 
+        @staticmethod
+        def prepared_selection(received):
+            assert received is preflight
+            return SimpleNamespace(
+                points=points,
+                boundary=box(0, 0, 2, 2),
+                coordinates=np.asarray([[1.0, 1.0]]),
+            )
+
     points = gpd.GeoDataFrame(
         {"cell": [1]},
         geometry=[Point(1, 1)],
@@ -464,7 +473,9 @@ def test_main_reports_the_legacy_shared_cache_message_on_success(
     monkeypatch.setattr(
         select_sites.spatial,
         "load_and_prepare",
-        lambda received: (points, box(0, 0, 2, 2), np.asarray([[1.0, 1.0]])),
+        lambda received: (_ for _ in ()).throw(
+            AssertionError("CLI must reuse the service vector snapshot")
+        ),
     )
     monkeypatch.setattr(select_sites.scenario, "verify_results", lambda *args: None)
     monkeypatch.setattr(
@@ -615,3 +626,52 @@ def test_main_schema_v2_profile_resolves_inputs_only_through_preflight(
     assert captured.out == ""
     assert "profile preflight rejected" in captured.err
     assert not output.exists()
+
+
+def test_selection_profile_reuses_the_loader_snapshot(tmp_path, monkeypatch):
+    profile_path = tmp_path / "configs" / "default.yaml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 2,
+                "profile": {
+                    "id": "default",
+                    "display_name": "Default",
+                    "scenario_id": "chicago",
+                },
+                "inputs": {"points_dataset_id": "points"},
+                "experiment": {"random_seed": 7},
+                "spatial": {
+                    "target_crs": "EPSG:3857",
+                    "rectangle_size_m": 2,
+                    "target_base_station_count": 1,
+                    "count_tolerance": 0,
+                },
+                "scan": {
+                    "mode": "fast",
+                    "strategy": "sequential",
+                    "step_m": 1,
+                    "max_rectangles": 1,
+                    "minimum_center_spacing_m": 2,
+                },
+                "outputs": {"root": "results"},
+                "figures": {"preset": "publication"},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    config = load_experiment_config(profile_path, repo_root=tmp_path)
+    monkeypatch.setattr(
+        select_sites,
+        "load_profile",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("profile must not be parsed twice")
+        ),
+    )
+
+    profile = select_sites._selection_profile(config, object(), "chicago")
+
+    assert profile.profile_id == "default"
+    assert profile.source_path == profile_path

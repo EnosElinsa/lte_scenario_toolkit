@@ -50,7 +50,9 @@ def _selection_profile(
     """Build the typed service profile used by legacy and schema-v2 CLIs."""
 
     if config.get("profile_id") is not None:
-        profile = load_profile(config["config_path"], repo_root=config["repo_root"])
+        profile = getattr(config, "profile_snapshot", None)
+        if not isinstance(profile, ExperimentProfile):
+            profile = load_profile(config["config_path"], repo_root=config["repo_root"])
         return replace(
             profile,
             rect_size=config["rect_size"],
@@ -366,7 +368,10 @@ def main(argv=None) -> int:
         scan_result = selection_service.scan(preflight, progress=capture_progress)
         if cache_progress is None:
             raise ValueError("Selection scan did not report cache status")
-        points_gdf, boundary, coordinates = spatial.load_and_prepare(config)
+        prepared = selection_service.prepared_selection(preflight)
+        points_gdf = prepared.points
+        boundary = prepared.boundary
+        coordinates = prepared.coordinates
     except (ValueError, FileNotFoundError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2

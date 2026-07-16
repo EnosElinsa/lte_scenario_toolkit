@@ -86,6 +86,16 @@ class SelectionPreflight:
 
 
 @dataclass(frozen=True)
+class PreparedSelection:
+    """One prepared vector snapshot shared by scan, selector, and export."""
+
+    preflight: SelectionPreflight
+    points: gpd.GeoDataFrame
+    boundary: Any
+    coordinates: np.ndarray
+
+
+@dataclass(frozen=True)
 class SelectionProgress:
     """Cache-aware immutable progress emitted by the selection service."""
 
@@ -312,6 +322,7 @@ class SelectionService:
     def __init__(self, catalog: Any) -> None:
         self.catalog = catalog
         self.cache = CandidateCache(catalog.root)
+        self._prepared: PreparedSelection | None = None
 
     def preflight(
         self,
@@ -511,6 +522,58 @@ class SelectionService:
             algorithm_version=SCANNER_ALGORITHM_VERSION,
         )
 
+    def _prepare_selection(
+        self,
+        preflight: SelectionPreflight,
+        *,
+        refresh: bool,
+    ) -> PreparedSelection:
+        if not isinstance(preflight, SelectionPreflight):
+            raise SelectionScanError(
+                "scan.request",
+                "preflight must be a SelectionPreflight",
+            )
+        if (
+            not refresh
+            and self._prepared is not None
+            and self._prepared.preflight is preflight
+        ):
+            return self._prepared
+        try:
+            points = gpd.read_file(preflight.points_path)
+            boundaries = gpd.read_file(preflight.boundary_path)
+            selected, boundary, coordinates = prepare_spatial_data(
+                points,
+                boundaries,
+                target_crs=preflight.profile.target_crs,
+            )
+        except Exception as exc:
+            raise SelectionScanError(
+                "scan.inputs",
+                f"Cannot load selection vector inputs: {exc}",
+                details={
+                    "points_path": str(preflight.points_path),
+                    "boundary_path": str(preflight.boundary_path),
+                },
+            ) from exc
+        coordinates.setflags(write=False)
+        prepared = PreparedSelection(
+            preflight=preflight,
+            points=selected,
+            boundary=boundary,
+            coordinates=coordinates,
+        )
+        self._prepared = prepared
+        return prepared
+
+    def prepared_selection(
+        self,
+        preflight: SelectionPreflight,
+    ) -> PreparedSelection:
+        """Return the one vector snapshot associated with this selection run."""
+
+        return self._prepare_selection(preflight, refresh=False)
+
     def scan(
         self,
         preflight: SelectionPreflight,
@@ -534,23 +597,6 @@ class SelectionService:
             ) from exc
         if cancelled:
             raise ScanCancelled("Candidate scan was cancelled")
-        try:
-            points = gpd.read_file(preflight.points_path)
-            boundaries = gpd.read_file(preflight.boundary_path)
-            _, boundary, coordinates = prepare_spatial_data(
-                points,
-                boundaries,
-                target_crs=preflight.profile.target_crs,
-            )
-        except Exception as exc:
-            raise SelectionScanError(
-                "scan.inputs",
-                f"Cannot load selection vector inputs: {exc}",
-                details={
-                    "points_path": str(preflight.points_path),
-                    "boundary_path": str(preflight.boundary_path),
-                },
-            ) from exc
         try:
             request = self._request(preflight.profile)
             key = cache_key(
@@ -592,6 +638,7 @@ class SelectionService:
                         )
                     )
                 return cached
+        prepared = self._prepare_selection(preflight, refresh=force)
         cache_status = "forced" if force else "miss"
         if progress is not None:
             progress(
@@ -621,8 +668,8 @@ class SelectionService:
         try:
             result = scan_candidates(
                 request,
-                boundary,
-                coordinates,
+                prepared.boundary,
+                prepared.coordinates,
                 progress=forward_progress if progress is not None else None,
                 cancel=cancel,
             )
@@ -688,6 +735,7 @@ class SelectionService:
 
 __all__ = [
     "DemStatistics",
+    "PreparedSelection",
     "SCANNER_ALGORITHM_VERSION",
     "SelectionError",
     "SelectionPreflight",

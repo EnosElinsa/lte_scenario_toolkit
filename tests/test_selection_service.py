@@ -20,6 +20,7 @@ from lte_scenario_toolkit.candidate_scanner import (
 )
 from lte_scenario_toolkit.profiles import ExperimentProfile, FigureSettings, OutputSettings
 from lte_scenario_toolkit.selection_service import (
+    PreparedSelection,
     SelectionPreflight,
     SelectionPreflightError,
     SelectionProgress,
@@ -392,6 +393,11 @@ def test_scan_uses_shared_cache_and_force_bypasses_reads(tmp_path, monkeypatch):
     assert miss_events
     assert {event.cache_status for event in miss_events} == {"miss"}
     assert all(event.cache_key for event in miss_events)
+    prepared = service.prepared_selection(preflight)
+    assert isinstance(prepared, PreparedSelection)
+    assert prepared.preflight is preflight
+    assert prepared.points.geometry.x.tolist() == [1.5]
+    assert prepared.coordinates.tolist() == [[1.5, 1.5]]
     monkeypatch.setattr(
         "lte_scenario_toolkit.selection_service.scan_candidates",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("cache miss")),
@@ -403,6 +409,16 @@ def test_scan_uses_shared_cache_and_force_bypasses_reads(tmp_path, monkeypatch):
     assert len(hit_events) == 1
     assert hit_events[0].cache_status == "hit"
     assert hit_events[0].cache_key == miss_events[0].cache_key
+
+    fresh_service = SelectionService(SimpleNamespace(root=tmp_path))
+    with monkeypatch.context() as context:
+        context.setattr(
+            "lte_scenario_toolkit.selection_service.gpd.read_file",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("cache hit must not load vectors")
+            ),
+        )
+        assert fresh_service.scan(preflight) == first
     cancel = Event()
     cancel.set()
     with pytest.raises(ScanCancelled) as captured:
@@ -413,7 +429,7 @@ def test_scan_uses_shared_cache_and_force_bypasses_reads(tmp_path, monkeypatch):
 
     missing_points = replace(preflight, points_path=tmp_path / "missing.geojson")
     with pytest.raises(SelectionScanError) as captured:
-        service.scan(missing_points)
+        service.scan(missing_points, force=True)
     assert captured.value.code == "scan.inputs"
 
 

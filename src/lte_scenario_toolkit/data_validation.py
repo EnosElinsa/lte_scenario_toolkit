@@ -590,14 +590,13 @@ def _validate_manifest(
                 f"Manifest is missing requested dataset: {dataset_id}",
             )
             continue
-        entrypoint = catalog.resolve(dataset.get("entrypoint", ""))
         _manifest_record(
             catalog,
             dataset,
             record,
             report,
             full_checksum=full_checksum,
-            require_entrypoint=entrypoint.is_file(),
+            require_entrypoint=True,
             shape_valid=shape_valid.get(dataset_id, False),
         )
     return records

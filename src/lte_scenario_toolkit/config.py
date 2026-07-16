@@ -8,9 +8,22 @@ from typing import Any
 
 import yaml
 
-from .profiles import _profile_repository, load_profile
+from .profiles import ExperimentProfile, _profile_repository, load_profile
 
 VALID_SCAN_STRATEGIES = {"sequential", "uniform"}
+
+
+class ExperimentConfig(dict[str, Any]):
+    """Legacy-compatible mapping that retains one parsed profile snapshot."""
+
+    def __init__(
+        self,
+        *args: Any,
+        profile_snapshot: ExperimentProfile | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.profile_snapshot = profile_snapshot
 
 
 def _required(mapping: Mapping[str, Any], key: str, section: str) -> Any:
@@ -78,7 +91,10 @@ def load_experiment_config(
                     f"{profile.scenario_id!r}"
                 )
 
-        config = profile.runtime_values()
+        config = ExperimentConfig(
+            profile.runtime_values(),
+            profile_snapshot=profile,
+        )
         config["repo_root"] = root
         if output_dir is not None:
             config["output_root"] = _resolve_path(output_dir, root)
