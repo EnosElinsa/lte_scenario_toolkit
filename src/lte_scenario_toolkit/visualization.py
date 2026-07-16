@@ -178,6 +178,7 @@ def prepare_terrain_arrays(
         window=window,
         out_shape=(output_rows, output_columns),
         resampling=Resampling.bilinear,
+        boundless=True,
         masked=True,
     )
     if elevation.size == 0:
@@ -188,6 +189,7 @@ def prepare_terrain_arrays(
         elevation = elevation.astype(float)
     if dem.nodata is not None:
         elevation[np.isclose(elevation, dem.nodata, equal_nan=True)] = np.nan
+    elevation[~np.isfinite(elevation)] = np.nan
     if not np.isfinite(elevation).any():
         raise ValueError("DEM window contains no valid elevation values")
 
@@ -443,6 +445,10 @@ def render_3d_terrain(
                 "zaxis_title": "Elevation (m)",
                 "aspectmode": "manual",
                 "aspectratio": {"x": 1, "y": 1, "z": z_aspect},
+                "camera": _plotly_camera(
+                    spec.azimuth,
+                    spec.elevation_angle,
+                ),
             },
         )
         figure.write_html(str(html_path), include_plotlyjs=True)
@@ -458,3 +464,25 @@ def _plotly_colorscale(colormap: str):
 
     cmap = matplotlib.colormaps.get_cmap(colormap)
     return [[index / 10, to_hex(cmap(index / 10))] for index in range(11)]
+
+
+def _plotly_camera(azimuth: float, elevation_angle: float) -> dict[str, Any]:
+    """Map Matplotlib-style view angles to a deterministic Plotly camera."""
+
+    radius = 1.5
+    azimuth_radians = math.radians(float(azimuth))
+    elevation_radians = math.radians(float(elevation_angle))
+    horizontal = radius * math.cos(elevation_radians)
+
+    def stable(value: float) -> float:
+        return 0.0 if abs(value) < 1e-12 else value
+
+    return {
+        "eye": {
+            "x": stable(horizontal * math.cos(azimuth_radians)),
+            "y": stable(horizontal * math.sin(azimuth_radians)),
+            "z": stable(radius * math.sin(elevation_radians)),
+        },
+        "center": {"x": 0.0, "y": 0.0, "z": 0.0},
+        "up": {"x": 0.0, "y": 0.0, "z": 1.0},
+    }

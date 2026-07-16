@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
@@ -11,6 +12,7 @@ import rasterio
 import yaml
 from rasterio.transform import from_origin
 
+from lte_scenario_toolkit import io
 from lte_scenario_toolkit.figure_service import FigureResult, FigureService, FigureSpec
 from lte_scenario_toolkit.run_service import RunService
 
@@ -115,6 +117,42 @@ def write_figure_run(
         encoding="utf-8",
     )
     return run_dir
+
+
+def write_current_selection_run(tmp_path: Path) -> tuple[Path, Path]:
+    dem_path = write_dem(tmp_path)
+    run_dir = write_figure_run(
+        tmp_path,
+        target_crs="EPSG:3857",
+        dem_path=dem_path,
+    )
+    run_id = "a" * 32
+    frame = pd.DataFrame(
+        [
+            {
+                **REQUIRED_ROW,
+                "run_id": run_id,
+                "scenario_id": "city",
+                "profile_id": "fixture",
+                "candidate_id": "candidate-0001",
+            }
+        ]
+    )
+    frame.to_csv(run_dir / "scenario.csv", index=False)
+    record = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    record["metadata"].update(
+        {
+            "run_kind": "selection",
+            "candidate": {
+                "candidate_id": "candidate-0001",
+                "point_count": 1,
+                "center_x": 500.0,
+                "center_y": 500.0,
+            },
+        }
+    )
+    (run_dir / "run.json").write_text(json.dumps(record), encoding="utf-8")
+    return run_dir, dem_path
 
 
 def test_legacy_multi_rectangle_csv_requires_rect_id(tmp_path):
@@ -235,6 +273,100 @@ def test_source_rejects_non_finite_required_numeric_values(tmp_path, column, val
         FigureService.load_source(path)
 
 
+@pytest.mark.parametrize("point_count", [-1, 1.5, 2, True])
+def test_source_requires_integer_nonnegative_matching_point_count(tmp_path, point_count):
+    path = write_single_csv(
+        tmp_path,
+        row={**REQUIRED_ROW, "pt_count": point_count},
+    )
+
+    with pytest.raises(ValueError, match="pt_count"):
+        FigureService.load_source(path)
+
+
+def test_current_selection_run_cross_checks_matching_snapshots_and_trace_columns(tmp_path):
+    run_dir, dem_path = write_current_selection_run(tmp_path)
+
+    source = FigureService.load_source(run_dir)
+
+    assert source.run_id == "a" * 32
+    assert source.dem_path == dem_path.resolve()
+    assert source.dem_fingerprint == "fixture"
+
+
+def test_selection_trace_ids_preserve_leading_zeroes(tmp_path):
+    run_dir, _ = write_current_selection_run(tmp_path)
+    run_id = "0" * 31 + "1"
+    record = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    record["run_id"] = run_id
+    (run_dir / "run.json").write_text(json.dumps(record), encoding="utf-8")
+    frame = pd.read_csv(run_dir / "scenario.csv", dtype={"run_id": "string"})
+    frame.loc[:, "run_id"] = run_id
+    frame.to_csv(run_dir / "scenario.csv", index=False)
+
+    source = FigureService.load_source(run_dir)
+
+    assert source.run_id == run_id
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "snapshot-profile",
+        "snapshot-profile-section",
+        "csv-run-id",
+        "csv-scenario-id",
+        "candidate-id",
+        "candidate-count",
+        "candidate-center",
+        "candidate-section",
+    ],
+)
+def test_current_selection_run_rejects_cross_source_drift(tmp_path, case):
+    run_dir, _ = write_current_selection_run(tmp_path)
+    if case == "snapshot-profile":
+        snapshot = yaml.safe_load(
+            (run_dir / "run-config.yaml").read_text(encoding="utf-8")
+        )
+        snapshot["profile"]["id"] = "other-profile"
+        (run_dir / "run-config.yaml").write_text(
+            yaml.safe_dump(snapshot),
+            encoding="utf-8",
+        )
+    elif case == "snapshot-profile-section":
+        snapshot = yaml.safe_load(
+            (run_dir / "run-config.yaml").read_text(encoding="utf-8")
+        )
+        snapshot["profile"] = None
+        (run_dir / "run-config.yaml").write_text(
+            yaml.safe_dump(snapshot),
+            encoding="utf-8",
+        )
+    elif case.startswith("csv-") or case == "candidate-id":
+        frame = pd.read_csv(run_dir / "scenario.csv")
+        column = {
+            "csv-run-id": "run_id",
+            "csv-scenario-id": "scenario_id",
+            "candidate-id": "candidate_id",
+        }[case]
+        frame.loc[:, column] = "mismatch"
+        frame.to_csv(run_dir / "scenario.csv", index=False)
+    else:
+        record = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        if case == "candidate-section":
+            record["metadata"]["candidate"] = "invalid"
+        else:
+            candidate = record["metadata"]["candidate"]
+            if case == "candidate-count":
+                candidate["point_count"] = 2
+            else:
+                candidate["center_x"] = 999.0
+        (run_dir / "run.json").write_text(json.dumps(record), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="match|mismatch|mapping"):
+        FigureService.load_source(run_dir)
+
+
 def test_figure_models_are_immutable_and_presets_are_validated(tmp_path):
     preview = FigureSpec.from_preset("preview")
     publication = FigureSpec.from_preset("publication")
@@ -305,6 +437,18 @@ def test_render_publishes_full_spec_parent_and_self_contained_outputs(tmp_path):
     assert record["metadata"]["figure_spec"] == spec.as_dict()
     assert record["metadata"]["requested_formats"] == ["png", "html"]
     assert record["metadata"]["run_kind"] == "figure"
+    inputs = record["metadata"]["inputs"]
+    assert inputs["csv"] == {
+        "path": str(source.csv_path.resolve()),
+        "size_bytes": source.csv_path.stat().st_size,
+        "sha256": hashlib.sha256(source.csv_path.read_bytes()).hexdigest(),
+    }
+    assert inputs["dem"] == {
+        "path": str(dem_path.resolve()),
+        "size_bytes": dem_path.stat().st_size,
+        "fingerprint": hashlib.sha256(dem_path.read_bytes()).hexdigest(),
+        "fingerprint_source": "sha256",
+    }
     assert set(record["artifacts"]) == {"terrain.png", "terrain.html"}
     html = (run_dir / "terrain.html").read_text(encoding="utf-8")
     assert "plotly.js" in html.lower()
@@ -460,3 +604,58 @@ def test_render_abandons_incomplete_staging_when_publish_fails_early(
         )
 
     assert not list(output_root.glob("*/*/.staging-*"))
+
+
+def test_render_reuses_recorded_dem_fingerprint_and_hashes_csv(tmp_path, monkeypatch):
+    dem_path = write_dem(tmp_path)
+    run_dir = write_figure_run(
+        tmp_path,
+        target_crs="EPSG:3857",
+        dem_path=dem_path,
+    )
+    source = FigureService.load_source(run_dir)
+    calls = []
+    actual_sha256 = io.sha256_file
+
+    def record_hash(path):
+        calls.append(Path(path).resolve())
+        return actual_sha256(path)
+
+    monkeypatch.setattr(io, "sha256_file", record_hash)
+
+    figure_run = FigureService.render(
+        source,
+        FigureSpec.from_preset("preview"),
+        RunService(tmp_path / "figure-runs"),
+        ("png",),
+    )
+
+    metadata = json.loads((figure_run / "run.json").read_text(encoding="utf-8"))[
+        "metadata"
+    ]
+    assert metadata["inputs"]["dem"]["fingerprint"] == "fixture"
+    assert calls == [source.csv_path.resolve()]
+
+
+def test_input_identity_failure_happens_before_run_begin(tmp_path, monkeypatch):
+    dem_path = write_dem(tmp_path)
+    source = replace(
+        FigureService.load_source(write_single_csv(tmp_path)),
+        dem_path=dem_path,
+    )
+    output_root = tmp_path / "runs"
+    monkeypatch.setattr(
+        io,
+        "sha256_file",
+        lambda path: (_ for _ in ()).throw(OSError("identity failed")),
+    )
+
+    with pytest.raises(OSError, match="identity failed"):
+        FigureService.render(
+            source,
+            FigureSpec.from_preset("preview"),
+            RunService(output_root),
+            ("png",),
+        )
+
+    assert not output_root.exists()

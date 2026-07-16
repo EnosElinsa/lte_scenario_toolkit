@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -157,17 +158,28 @@ def _latest_profile_run(
     scenario_id: str,
     profile_id: str,
 ) -> FigureSource:
-    run_records = sorted(
-        (output_root / scenario_id / profile_id).glob("*/run.json"),
-        key=lambda path: (path.stat().st_mtime_ns, path.as_posix()),
-        reverse=True,
-    )
-    errors: list[str] = []
-    for record in run_records:
+    service = RunService(output_root)
+    discovery = service.discover()
+    errors = [item["error"] for item in discovery.diagnostics]
+    for record in reversed(discovery.records):
+        metadata = record.get("metadata", {})
+        if (
+            record["scenario_id"] != scenario_id
+            or record["profile_id"] != profile_id
+            or not isinstance(metadata, Mapping)
+            or metadata.get("run_kind") != "selection"
+        ):
+            continue
         try:
-            return FigureService.load_source(record.parent)
+            _, final_path = service._expected_paths(
+                scenario_id=record["scenario_id"],
+                profile_id=record["profile_id"],
+                created_at=record["created_at"],
+                run_id=record["run_id"],
+            )
+            return FigureService.load_source(final_path)
         except (FileNotFoundError, ValueError) as exc:
-            errors.append(f"{record}: {exc}")
+            errors.append(f"{record['run_id']}: {exc}")
     suffix = f" Checked: {'; '.join(errors)}" if errors else ""
     raise ValueError(
         "No compatible selection run was found for this profile; provide --csv "

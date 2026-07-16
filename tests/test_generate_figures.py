@@ -1,3 +1,5 @@
+import json
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -11,6 +13,7 @@ from rasterio.transform import from_origin
 from lte_scenario_toolkit import generate_figures
 from lte_scenario_toolkit.figure_service import FigureService
 from lte_scenario_toolkit.generate_figures import load_scenario_csv
+from lte_scenario_toolkit.run_service import RunService
 
 REQUIRED_ROW = {
     "rect_id": 1,
@@ -446,3 +449,85 @@ figures:
     assert source.profile_id == "test-default"
     assert output_root == (tmp_path / "runs").resolve()
     assert formats == ("png",)
+
+
+def test_latest_profile_run_uses_published_created_at_not_mtime_or_staging(tmp_path):
+    service = RunService(tmp_path / "runs")
+
+    def publish(created_at: str, center_x: float):
+        run = service.begin(
+            "city",
+            "profile",
+            created_at=created_at,
+        )
+        pd.DataFrame([{**REQUIRED_ROW, "center_x": center_x}]).to_csv(
+            run.path / "scenario.csv",
+            index=False,
+        )
+        (run.path / "run-config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "profile": {"id": "profile", "scenario_id": "city"},
+                    "spatial": {
+                        "target_crs": "EPSG:3857",
+                        "rectangle_size_m": 1000,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        path = service.publish(
+            run,
+            status="completed",
+            artifacts=("scenario.csv", "run-config.yaml"),
+            metadata={"run_kind": "selection"},
+        )
+        return run, path
+
+    old_run, old_path = publish("2026-01-01T00:00:00Z", 500.0)
+    new_run, _ = publish("2026-02-01T00:00:00Z", 600.0)
+    future = 4_102_444_800_000_000_000
+    os.utime(old_path / "run.json", ns=(future, future))
+
+    staging = service.begin(
+        "city",
+        "profile",
+        created_at="2027-01-01T00:00:00Z",
+    )
+    pd.DataFrame([{**REQUIRED_ROW, "center_x": 700.0}]).to_csv(
+        staging.path / "scenario.csv",
+        index=False,
+    )
+    (staging.path / "run-config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "profile": {"id": "profile", "scenario_id": "city"},
+                "spatial": {
+                    "target_crs": "EPSG:3857",
+                    "rectangle_size_m": 1000,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (staging.path / "run.json").write_text(
+        json.dumps(
+            {
+                "run_id": staging.run_id,
+                "scenario_id": "city",
+                "profile_id": "profile",
+                "artifacts": ["scenario.csv", "run-config.yaml"],
+                "metadata": {"run_kind": "selection"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    source = generate_figures._latest_profile_run(
+        service.output_root,
+        "city",
+        "profile",
+    )
+
+    assert source.run_id == new_run.run_id
+    assert source.run_id != old_run.run_id

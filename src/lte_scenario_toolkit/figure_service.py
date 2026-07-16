@@ -20,7 +20,7 @@ import yaml
 from matplotlib.colors import is_color_like
 from pyproj import CRS
 
-from . import visualization
+from . import io, visualization
 from .data_catalog import load_data_catalog
 from .run_service import RunService
 
@@ -63,6 +63,7 @@ class FigureSource:
     run_id: str | None = None
     scenario_id: str | None = None
     profile_id: str | None = None
+    dem_fingerprint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -258,7 +259,10 @@ def _catalog_dem_path(catalog_value: Any, dataset_id: str) -> Path:
         ) from exc
 
 
-def _run_dem_path(run_dir: Path, record: Mapping[str, Any]) -> Path | None:
+def _run_dem_path(
+    run_dir: Path,
+    record: Mapping[str, Any],
+) -> tuple[Path | None, str | None]:
     metadata = record.get("metadata", {})
     if not isinstance(metadata, Mapping):
         raise ValueError("run metadata must be a mapping")
@@ -267,23 +271,39 @@ def _run_dem_path(run_dir: Path, record: Mapping[str, Any]) -> Path | None:
         raise ValueError("run metadata inputs must be a mapping")
     dem = inputs.get("dem")
     if dem is None:
-        return None
+        return None, None
     if not isinstance(dem, Mapping):
         raise ValueError("run metadata DEM input must be a mapping")
+    fingerprint = dem.get("fingerprint")
+    if fingerprint is not None and (type(fingerprint) is not str or not fingerprint):
+        raise ValueError("run DEM fingerprint must be a non-empty string")
     if "path" in dem:
-        return _validated_dem_path(dem["path"], description="run DEM path")
+        return (
+            _validated_dem_path(dem["path"], description="run DEM path"),
+            fingerprint,
+        )
     catalog_path = dem.get("catalog_path")
     dataset_id = dem.get("dataset_id")
     if catalog_path is None:
-        return None
+        return None, fingerprint
     if type(dataset_id) is not str or not dataset_id:
         raise ValueError(
             "run DEM dataset_id must be a non-empty string when catalog_path is recorded"
         )
-    return _catalog_dem_path(catalog_path, dataset_id)
+    return _catalog_dem_path(catalog_path, dataset_id), fingerprint
 
 
-def _run_source(path: Path) -> tuple[Path, Path, Mapping[str, Any], str, float, Path | None]:
+def _run_source(
+    path: Path,
+) -> tuple[
+    Path,
+    Path,
+    Mapping[str, Any],
+    str,
+    float,
+    Path | None,
+    str | None,
+]:
     run_dir = path.parent if path.name.casefold() == "run.json" else path
     if run_dir.is_symlink() or not run_dir.is_dir():
         raise ValueError(f"Figure run source must be a real directory: {run_dir}")
@@ -311,6 +331,21 @@ def _run_source(path: Path) -> tuple[Path, Path, Mapping[str, Any], str, float, 
     if config_path.is_symlink() or not config_path.is_file():
         raise ValueError(f"Figure run source is missing run-config.yaml: {run_dir}")
     snapshot = _read_yaml(config_path)
+    if "profile" in snapshot:
+        profile = _mapping(
+            snapshot["profile"],
+            description="run snapshot profile section",
+        )
+        for snapshot_field, record_field in (
+            ("id", "profile_id"),
+            ("scenario_id", "scenario_id"),
+        ):
+            if snapshot_field in profile and record_field in record:
+                if profile[snapshot_field] != record[record_field]:
+                    raise ValueError(
+                        f"run snapshot profile.{snapshot_field} does not match "
+                        f"run.json {record_field}"
+                    )
     spatial = _mapping(snapshot.get("spatial"), description="run snapshot spatial section")
     target_crs = spatial.get("target_crs")
     if type(target_crs) is not str or not target_crs:
@@ -324,13 +359,29 @@ def _run_source(path: Path) -> tuple[Path, Path, Mapping[str, Any], str, float, 
         raise ValueError("run snapshot rectangle_size_m must be a finite number")
     if rectangle_size <= 0:
         raise ValueError("run snapshot rectangle_size_m must be greater than zero")
-    dem_path = _run_dem_path(run_dir, record)
-    return run_dir, csv_path, record, target_crs, float(rectangle_size), dem_path
+    dem_path, dem_fingerprint = _run_dem_path(run_dir, record)
+    return (
+        run_dir,
+        csv_path,
+        record,
+        target_crs,
+        float(rectangle_size),
+        dem_path,
+        dem_fingerprint,
+    )
 
 
 def _read_frame(csv_path: Path, *, rect_id: Any) -> tuple[pd.DataFrame, dict[str, Any]]:
     try:
-        frame = pd.read_csv(csv_path)
+        frame = pd.read_csv(
+            csv_path,
+            dtype={
+                "run_id": "string",
+                "scenario_id": "string",
+                "profile_id": "string",
+                "candidate_id": "string",
+            },
+        )
     except (OSError, pd.errors.ParserError, UnicodeError) as exc:
         raise ValueError(f"Cannot read scenario CSV {csv_path}: {exc}") from exc
     if frame.empty:
@@ -371,7 +422,79 @@ def _read_frame(csv_path: Path, *, rect_id: Any) -> tuple[pd.DataFrame, dict[str
             raise ValueError(f"Scenario CSV rectangle column {column} is inconsistent")
         value = values[0]
         rectangle[column] = value.item() if hasattr(value, "item") else value
+    point_count_value = rectangle["pt_count"]
+    if isinstance(point_count_value, (bool, np.bool_)):
+        raise ValueError("Scenario CSV pt_count must be a non-negative integer")
+    point_count = float(point_count_value)
+    if point_count < 0 or not point_count.is_integer():
+        raise ValueError("Scenario CSV pt_count must be a non-negative integer")
+    if int(point_count) != len(selected):
+        raise ValueError(
+            "Scenario CSV pt_count must match the selected rectangle row count"
+        )
+    rectangle["pt_count"] = int(point_count)
     return selected, rectangle
+
+
+def _selection_run_consistency(
+    record: Mapping[str, Any],
+    frame: pd.DataFrame,
+    rectangle: Mapping[str, Any],
+) -> None:
+    metadata = record.get("metadata", {})
+    if not isinstance(metadata, Mapping) or metadata.get("run_kind") != "selection":
+        return
+
+    for column, record_field in (
+        ("run_id", "run_id"),
+        ("scenario_id", "scenario_id"),
+        ("profile_id", "profile_id"),
+    ):
+        if column not in frame.columns or record_field not in record:
+            continue
+        values = frame[column].drop_duplicates().tolist()
+        if len(values) != 1 or values[0] != record[record_field]:
+            raise ValueError(
+                f"Scenario CSV {column} does not match run.json {record_field}"
+            )
+
+    if "candidate" not in metadata:
+        return
+    candidate = _mapping(
+        metadata["candidate"],
+        description="run metadata candidate",
+    )
+    if "candidate_id" in frame.columns and "candidate_id" in candidate:
+        values = frame["candidate_id"].drop_duplicates().tolist()
+        if len(values) != 1 or values[0] != candidate["candidate_id"]:
+            raise ValueError(
+                "Scenario CSV candidate_id does not match run metadata candidate_id"
+            )
+    if "point_count" in candidate:
+        try:
+            point_count = float(candidate["point_count"])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("run metadata candidate point_count is invalid") from exc
+        if not math.isfinite(point_count) or point_count != rectangle["pt_count"]:
+            raise ValueError(
+                "run metadata candidate point_count does not match Scenario CSV pt_count"
+            )
+    for name in ("center_x", "center_y"):
+        if name not in candidate:
+            continue
+        try:
+            value = float(candidate[name])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"run metadata candidate {name} is invalid") from exc
+        if not math.isfinite(value) or not math.isclose(
+            value,
+            float(rectangle[name]),
+            rel_tol=1e-9,
+            abs_tol=1e-6,
+        ):
+            raise ValueError(
+                f"run metadata candidate {name} does not match Scenario CSV {name}"
+            )
 
 
 def _infer_rectangle_size(rectangle: Mapping[str, Any]) -> float:
@@ -439,6 +562,30 @@ def _require_dem(source: FigureSource) -> Path:
     return _validated_dem_path(source.dem_path, description="figure source DEM path")
 
 
+def _input_metadata(source: FigureSource, dem_path: Path) -> dict[str, Any]:
+    csv_path = source.csv_path.resolve(strict=True)
+    csv_stat = csv_path.stat()
+    dem_stat = dem_path.stat()
+    dem_fingerprint = source.dem_fingerprint
+    fingerprint_source = "run"
+    if dem_fingerprint is None:
+        dem_fingerprint = io.sha256_file(dem_path)
+        fingerprint_source = "sha256"
+    return {
+        "csv": {
+            "path": str(csv_path),
+            "size_bytes": csv_stat.st_size,
+            "sha256": io.sha256_file(csv_path),
+        },
+        "dem": {
+            "path": str(dem_path),
+            "size_bytes": dem_stat.st_size,
+            "fingerprint": dem_fingerprint,
+            "fingerprint_source": fingerprint_source,
+        },
+    }
+
+
 class FigureService:
     """Load, preview, and publish figures through one reusable service."""
 
@@ -451,9 +598,15 @@ class FigureService:
         dem_path: Path | None
         record: Mapping[str, Any]
         if source_path.is_dir() or source_path.name.casefold() == "run.json":
-            root, csv_path, record, target_crs, rectangle_size, dem_path = _run_source(
-                source_path
-            )
+            (
+                root,
+                csv_path,
+                record,
+                target_crs,
+                rectangle_size,
+                dem_path,
+                dem_fingerprint,
+            ) = _run_source(source_path)
             warnings = ()
         elif source_path.is_file() and source_path.suffix.casefold() == ".csv":
             if source_path.is_symlink():
@@ -469,6 +622,7 @@ class FigureService:
                     target_crs,
                     rectangle_size,
                     dem_path,
+                    dem_fingerprint,
                 ) = _run_source(source_path.parent)
                 if csv_path != resolved_csv:
                     raise ValueError(
@@ -482,6 +636,7 @@ class FigureService:
                 target_crs = "EPSG:3857"
                 rectangle_size = 0.0
                 dem_path = None
+                dem_fingerprint = None
                 warnings = (
                     "Legacy scenario CSV has no run snapshot; assuming EPSG:3857.",
                 )
@@ -489,6 +644,7 @@ class FigureService:
             raise ValueError("Figure source must be a run directory, run.json, or CSV")
 
         frame, rectangle = _read_frame(csv_path, rect_id=rect_id)
+        _selection_run_consistency(record, frame, rectangle)
         if rectangle_size == 0:
             rectangle_size = _infer_rectangle_size(rectangle)
         geometry = gpd.points_from_xy(frame["X"], frame["Y"])
@@ -514,6 +670,7 @@ class FigureService:
                 if type(record.get("profile_id")) is str
                 else None
             ),
+            dem_fingerprint=dem_fingerprint,
         )
 
     @staticmethod
@@ -561,6 +718,7 @@ class FigureService:
         spec.validate()
         requested = _normalise_formats(formats)
         dem_path = _require_dem(source)
+        inputs = _input_metadata(source, dem_path)
         with rasterio.open(dem_path) as dem:
             terrain_arrays = visualization.prepare_terrain_arrays(
                 source.rectangle,
@@ -623,6 +781,7 @@ class FigureService:
                     "csv": str(source.csv_path),
                     "run_id": source.run_id,
                 },
+                "inputs": inputs,
                 "target_crs": source.target_crs,
                 "rectangle_size_m": source.rectangle_size_m,
                 "rect_id": source.rectangle["rect_id"],
