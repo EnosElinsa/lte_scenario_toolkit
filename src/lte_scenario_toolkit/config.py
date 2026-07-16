@@ -8,6 +8,8 @@ from typing import Any
 
 import yaml
 
+from .profiles import load_profile
+
 VALID_SCAN_STRATEGIES = {"sequential", "uniform"}
 
 
@@ -47,17 +49,48 @@ def load_experiment_config(
     if not isinstance(document, Mapping):
         raise ValueError("The experiment configuration must be a YAML mapping")
 
-    experiment = document.get("experiment", {})
-    inputs = document.get("inputs", {})
-    spatial = document.get("spatial", {})
-    scan = document.get("scan", {})
-    outputs = document.get("outputs", {})
     root = (
         Path(repo_root).resolve()
         if repo_root is not None
         else _infer_project_root(path)
     )
+    if document.get("schema_version") == 2:
+        profile = load_profile(path, repo_root=root)
+        if city is not None:
+            resolved_city = city
+            catalog_path = root / "data" / "datasets.yaml"
+            if catalog_path.is_file():
+                from .data_catalog import load_data_catalog
 
+                catalog = load_data_catalog(catalog_path, repo_root=root)
+                if city in catalog.scenarios_by_id:
+                    resolved_city = city
+                else:
+                    matches = [
+                        scenario_id
+                        for scenario_id, scenario in catalog.scenarios_by_id.items()
+                        if str(scenario["display_name"]).casefold() == city.casefold()
+                    ]
+                    if len(matches) == 1:
+                        resolved_city = matches[0]
+            if resolved_city != profile.scenario_id:
+                raise ValueError(
+                    f"--city {city!r} does not match profile scenario_id "
+                    f"{profile.scenario_id!r}"
+                )
+
+        config = profile.runtime_values()
+        config["repo_root"] = root
+        if output_dir is not None:
+            config["output_root"] = _resolve_path(output_dir, root)
+            config["output_dir_is_final"] = True
+        return config
+
+    experiment = document.get("experiment", {})
+    inputs = document.get("inputs", {})
+    spatial = document.get("spatial", {})
+    scan = document.get("scan", {})
+    outputs = document.get("outputs", {})
     strategy = str(_required(scan, "strategy", "scan"))
     if strategy not in VALID_SCAN_STRATEGIES:
         choices = ", ".join(sorted(VALID_SCAN_STRATEGIES))

@@ -89,3 +89,45 @@ def test_config_in_configs_directory_infers_external_project_root(tmp_path):
 
     assert config["repo_root"] == project
     assert config["points_root"] == project / "points"
+
+
+def test_public_loader_supports_schema_version_2_profiles(tmp_path):
+    profile_path = tmp_path / "profile.yaml"
+    profile_path.write_text(
+        """
+schema_version: 2
+profile:
+  id: chicago-default
+  display_name: Chicago default
+  scenario_id: chicago
+inputs:
+  points_dataset_id: points
+experiment:
+  random_seed: 7
+spatial:
+  target_crs: EPSG:3857
+  rectangle_size_m: 2000
+  target_base_station_count: 20
+  count_tolerance: 1
+scan:
+  mode: complete
+  strategy: uniform
+  step_m: 25
+  max_rectangles: 40
+  minimum_center_spacing_m: 1500
+outputs:
+  root: results
+  save_csv: true
+figures:
+  preset: publication
+  dpi: 300
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_experiment_config(profile_path, repo_root=tmp_path)
+
+    assert config["profile_id"] == "chicago-default"
+    assert config["scenario_id"] == "chicago"
+    assert config["rect_size"] == 2000
+    assert config["scan_mode"] == "complete"
