@@ -1,0 +1,438 @@
+import json
+from dataclasses import replace
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
+
+from lte_scenario_toolkit.run_service import RunService, StagingRun
+
+CREATED_AT = "2026-07-16T10:00:00Z"
+
+
+def _write_artifact(run: StagingRun, name: str = "scenario.csv") -> Path:
+    artifact = run.path / name
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text("cell,lon,lat\n1,0,0\n", encoding="utf-8")
+    return artifact
+
+
+def _begin_with_artifact(
+    service: RunService,
+    *,
+    created_at: str = CREATED_AT,
+    parent_run_id: str | None = None,
+) -> StagingRun:
+    run = service.begin(
+        "chicago",
+        "default",
+        created_at=created_at,
+        parent_run_id=parent_run_id,
+    )
+    _write_artifact(run)
+    return run
+
+
+def _record_payload(run_id: str, **overrides):
+    payload = {
+        "run_id": run_id,
+        "scenario_id": "chicago",
+        "profile_id": "default",
+        "created_at": CREATED_AT,
+        "parent_run_id": None,
+        "status": "completed",
+        "artifacts": ["scenario.csv"],
+        "metadata": {},
+        "errors": [],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _manual_record(
+    root: Path,
+    index: int,
+    payload,
+    *,
+    raw_text: str | None = None,
+    create_artifact: bool = True,
+) -> Path:
+    run_id = f"{index:08x}" + "0" * 24
+    run_dir = root / "chicago" / "default" / f"20260716-100000-{run_id[:8]}"
+    run_dir.mkdir(parents=True)
+    if create_artifact:
+        (run_dir / "scenario.csv").write_text("ok\n", encoding="utf-8")
+    record_path = run_dir / "run.json"
+    if raw_text is None:
+        record_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    else:
+        record_path.write_text(raw_text, encoding="utf-8")
+    return record_path
+
+
+def _symlink_or_skip(link: Path, target: Path, *, directory: bool = False) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+
+
+def test_begin_publish_writes_completed_run_record_and_atomically_moves_directory(
+    tmp_path,
+    monkeypatch,
+):
+    service = RunService(tmp_path)
+    run = service.begin("chicago", "default", created_at=CREATED_AT)
+    _write_artifact(run)
+    moves = []
+    original_replace = Path.replace
+
+    def tracking_replace(path, target):
+        moves.append((path, Path(target)))
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", tracking_replace)
+
+    published = service.publish(
+        run,
+        status="completed",
+        artifacts=["scenario.csv"],
+    )
+
+    assert published == run.final_path
+    assert published.is_dir()
+    assert not run.path.exists()
+    assert published.name.startswith("20260716-100000-")
+    assert (run.path, run.final_path) in moves
+    payload = json.loads((published / "run.json").read_text(encoding="utf-8"))
+    assert payload["run_id"] == run.run_id
+    assert payload["status"] == "completed"
+    assert payload["artifacts"] == ["scenario.csv"]
+
+
+def test_begin_twice_in_same_second_allocates_unique_run_and_paths(tmp_path):
+    service = RunService(tmp_path)
+
+    first = service.begin("chicago", "default", created_at=CREATED_AT)
+    second = service.begin("chicago", "default", created_at=CREATED_AT)
+
+    assert first.run_id != second.run_id
+    assert first.path != second.path
+    assert first.final_path != second.final_path
+    assert first.path.name == f".staging-{first.run_id}"
+    assert second.path.name == f".staging-{second.run_id}"
+    assert first.path.is_dir() and second.path.is_dir()
+    assert not first.final_path.exists() and not second.final_path.exists()
+
+
+@pytest.mark.parametrize("status", ["completed", "partial"])
+def test_publish_requires_at_least_one_requested_artifact(tmp_path, status):
+    service = RunService(tmp_path)
+    run = service.begin("chicago", "default", created_at=CREATED_AT)
+
+    with pytest.raises(ValueError, match="artifact"):
+        service.publish(
+            run,
+            status=status,
+            artifacts=[],
+            errors=[{"artifact": "figure", "error": "figure.failed"}],
+        )
+
+    assert run.path.is_dir()
+    assert not run.final_path.exists()
+
+
+def test_parent_run_is_preserved_and_discovery_is_stably_sorted(tmp_path):
+    service = RunService(tmp_path)
+    parent = _begin_with_artifact(service, created_at="2026-07-16T10:00:01Z")
+    service.publish(parent, status="completed", artifacts=["scenario.csv"])
+    child = _begin_with_artifact(
+        service,
+        created_at="2026-07-16T10:00:02Z",
+        parent_run_id=parent.run_id,
+    )
+    service.publish(child, status="partial", artifacts=["scenario.csv"])
+
+    discovered = service.discover()
+
+    assert len(discovered.records) == 2
+    assert list(discovered.records) == sorted(
+        discovered.records,
+        key=lambda record: (record["created_at"], record["run_id"]),
+    )
+    by_id = {record["run_id"]: record for record in discovered.records}
+    assert by_id[parent.run_id]["parent_run_id"] is None
+    assert by_id[child.run_id]["parent_run_id"] == parent.run_id
+    assert discovered.diagnostics == ()
+
+
+def test_publish_rejects_unknown_status(tmp_path):
+    service = RunService(tmp_path)
+    run = _begin_with_artifact(service)
+
+    with pytest.raises(ValueError, match="status"):
+        service.publish(run, status="failed", artifacts=["scenario.csv"])
+
+
+@pytest.mark.parametrize("artifact", ["missing.csv", "directory", "../outside.csv"])
+def test_publish_rejects_missing_directory_and_traversal_artifacts(tmp_path, artifact):
+    service = RunService(tmp_path / "runs")
+    run = service.begin("chicago", "default", created_at=CREATED_AT)
+    (run.path / "directory").mkdir()
+    (run.path.parent / "outside.csv").write_text("outside\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="artifact"):
+        service.publish(run, status="completed", artifacts=[artifact])
+
+    assert run.path.is_dir()
+    assert not run.final_path.exists()
+
+
+def test_publish_rejects_absolute_and_duplicate_artifacts(tmp_path):
+    service = RunService(tmp_path / "runs")
+    run = _begin_with_artifact(service)
+    outside = tmp_path / "outside.csv"
+    outside.write_text("outside\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="artifact"):
+        service.publish(run, status="completed", artifacts=[outside])
+    with pytest.raises(ValueError, match="duplicate"):
+        service.publish(
+            run,
+            status="completed",
+            artifacts=["scenario.csv", "scenario.csv"],
+        )
+
+
+def test_publish_rejects_artifact_symlink_escape(tmp_path):
+    service = RunService(tmp_path / "runs")
+    run = service.begin("chicago", "default", created_at=CREATED_AT)
+    outside = tmp_path / "outside.csv"
+    outside.write_text("outside\n", encoding="utf-8")
+    _symlink_or_skip(run.path / "linked.csv", outside)
+
+    with pytest.raises(ValueError, match="artifact|symlink|outside"):
+        service.publish(run, status="completed", artifacts=["linked.csv"])
+
+    assert outside.read_text(encoding="utf-8") == "outside\n"
+    assert not run.final_path.exists()
+
+
+def test_publish_serializes_safe_copies_of_metadata_and_errors(tmp_path):
+    service = RunService(tmp_path)
+    run = _begin_with_artifact(service)
+    marker = tmp_path / "metadata.txt"
+    metadata = {"path": marker, "nested": [{"value": 1}]}
+    errors = [{"artifact": marker, "failed_at": datetime(2026, 7, 16, tzinfo=timezone.utc)}]
+
+    final = service.publish(
+        run,
+        status="partial",
+        artifacts=["scenario.csv"],
+        metadata=metadata,
+        errors=errors,
+    )
+    metadata["nested"][0]["value"] = 2
+    errors[0]["artifact"] = "changed"
+
+    payload = json.loads((final / "run.json").read_text(encoding="utf-8"))
+    assert payload["metadata"] == {"path": str(marker), "nested": [{"value": 1}]}
+    assert payload["errors"][0]["artifact"] == str(marker)
+    assert payload["errors"][0]["failed_at"] == "2026-07-16T00:00:00+00:00"
+
+
+def test_publish_refuses_existing_final_without_overwriting_or_losing_staging(tmp_path):
+    service = RunService(tmp_path)
+    run = _begin_with_artifact(service)
+    run.final_path.mkdir()
+    sentinel = run.final_path / "sentinel.txt"
+    sentinel.write_text("external owner\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        service.publish(run, status="completed", artifacts=["scenario.csv"])
+
+    assert sentinel.read_text(encoding="utf-8") == "external owner\n"
+    assert (run.path / "scenario.csv").is_file()
+
+
+def test_publish_move_failure_keeps_retryable_staging_and_no_final(tmp_path, monkeypatch):
+    service = RunService(tmp_path)
+    run = _begin_with_artifact(service)
+    original_replace = Path.replace
+
+    def fail_publication(path, target):
+        if path == run.path:
+            raise OSError("publication failed")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_publication)
+
+    with pytest.raises(OSError, match="publication failed"):
+        service.publish(run, status="completed", artifacts=["scenario.csv"])
+
+    assert run.path.is_dir()
+    assert (run.path / "run.json").is_file()
+    assert not run.final_path.exists()
+
+
+def test_publish_and_abandon_reject_forged_paths_outside_service_root(tmp_path):
+    root = tmp_path / "runs"
+    service = RunService(root)
+    run = _begin_with_artifact(service)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("keep\n", encoding="utf-8")
+    forged = replace(run, path=outside, final_path=outside / "final")
+
+    with pytest.raises(ValueError, match="staging|service|path"):
+        service.publish(forged, status="completed", artifacts=["sentinel.txt"])
+    with pytest.raises(ValueError, match="staging|service|path"):
+        service.abandon(forged)
+
+    assert sentinel.read_text(encoding="utf-8") == "keep\n"
+    assert run.path.is_dir()
+
+
+def test_abandon_is_idempotent_and_never_removes_published_final(tmp_path):
+    service = RunService(tmp_path)
+    abandoned = service.begin("chicago", "default", created_at=CREATED_AT)
+
+    assert service.abandon(abandoned) is None
+    assert service.abandon(abandoned) is None
+    assert not abandoned.path.exists()
+
+    published = _begin_with_artifact(
+        service,
+        created_at="2026-07-16T10:00:01Z",
+    )
+    final = service.publish(published, status="completed", artifacts=["scenario.csv"])
+    service.abandon(published)
+
+    assert final.is_dir()
+    assert (final / "scenario.csv").is_file()
+
+
+def test_abandon_rejects_staging_symlink_without_deleting_target(tmp_path):
+    service = RunService(tmp_path / "runs")
+    run = service.begin("chicago", "default", created_at=CREATED_AT)
+    run.path.rmdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("keep\n", encoding="utf-8")
+    _symlink_or_skip(run.path, outside, directory=True)
+
+    with pytest.raises(ValueError, match="staging|symlink|path"):
+        service.abandon(run)
+
+    assert sentinel.read_text(encoding="utf-8") == "keep\n"
+
+
+def test_discover_reports_bad_records_and_keeps_valid_history_unchanged(tmp_path):
+    service = RunService(tmp_path)
+    valid = _begin_with_artifact(service, created_at="2026-07-16T10:00:03Z")
+    valid_final = service.publish(valid, status="completed", artifacts=["scenario.csv"])
+
+    bad_paths = []
+    bad_paths.append(
+        _manual_record(
+            tmp_path,
+            1,
+            None,
+            raw_text="{not json",
+        )
+    )
+    bad_paths.append(_manual_record(tmp_path, 2, ["not", "a", "mapping"]))
+    missing = _record_payload(f"{3:08x}" + "0" * 24)
+    missing.pop("status")
+    bad_paths.append(_manual_record(tmp_path, 3, missing))
+    bad_paths.append(
+        _manual_record(
+            tmp_path,
+            4,
+            _record_payload(f"{4:08x}" + "0" * 24, status="failed"),
+        )
+    )
+    bad_paths.append(
+        _manual_record(
+            tmp_path,
+            5,
+            _record_payload(
+                f"{5:08x}" + "0" * 24,
+                artifacts=["../outside.csv"],
+            ),
+        )
+    )
+    bad_paths.append(
+        _manual_record(
+            tmp_path,
+            6,
+            _record_payload(f"{6:08x}" + "0" * 24, artifacts=["missing.csv"]),
+            create_artifact=False,
+        )
+    )
+    all_records = bad_paths + [valid_final / "run.json"]
+    before = {path: path.read_bytes() for path in all_records}
+
+    discovered = service.discover()
+
+    assert [record["run_id"] for record in discovered.records] == [valid.run_id]
+    assert len(discovered.diagnostics) == 6
+    assert [item["path"] for item in discovered.diagnostics] == sorted(
+        item["path"] for item in discovered.diagnostics
+    )
+    assert all(item["error"] for item in discovered.diagnostics)
+    assert {path: path.read_bytes() for path in all_records} == before
+
+
+def test_begin_normalizes_aware_times_to_utc_and_defaults_to_utc_z(tmp_path):
+    service = RunService(tmp_path)
+
+    converted = service.begin(
+        "chicago",
+        "default",
+        created_at="2026-07-16T18:00:00+08:00",
+    )
+    generated = service.begin("chicago", "default")
+
+    assert converted.created_at == CREATED_AT
+    assert converted.final_path.name.startswith("20260716-100000-")
+    assert generated.created_at.endswith("Z")
+    parsed = datetime.fromisoformat(generated.created_at.replace("Z", "+00:00"))
+    assert parsed.utcoffset() == timezone.utc.utcoffset(parsed)
+
+
+@pytest.mark.parametrize(
+    "created_at",
+    ["2026-07-16T10:00:00", "not-a-time", "2026-07-16"],
+)
+def test_begin_rejects_naive_and_invalid_times(tmp_path, created_at):
+    with pytest.raises(ValueError, match="created_at|timezone"):
+        RunService(tmp_path).begin(
+            "chicago",
+            "default",
+            created_at=created_at,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("scenario_id", "../escape"),
+        ("scenario_id", "con"),
+        ("scenario_id", "Chicago"),
+        ("profile_id", ".."),
+        ("profile_id", "lpt1"),
+        ("profile_id", "Default Profile"),
+    ],
+)
+def test_begin_rejects_unsafe_scenario_and_profile_slugs(tmp_path, field, value):
+    values = {"scenario_id": "chicago", "profile_id": "default"}
+    values[field] = value
+
+    with pytest.raises(ValueError, match=field):
+        RunService(tmp_path).begin(**values, created_at=CREATED_AT)

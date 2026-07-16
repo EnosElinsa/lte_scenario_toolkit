@@ -6,6 +6,7 @@ import hashlib
 import json
 import platform
 import subprocess
+import uuid
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from importlib import metadata
@@ -121,6 +122,30 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
+def atomic_write_json(path: str | Path, payload: Any) -> Path:
+    """Atomically replace one UTF-8 JSON document from a sibling temporary file."""
+
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        f".{destination.name}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        temporary.write_text(
+            json.dumps(
+                _json_safe(payload),
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
+
+
 def create_data_manifest(
     metadata_path: str | Path,
     output_path: str | Path,
@@ -191,6 +216,4 @@ def write_run_record(
         "software": software_versions(),
         "outputs": [str(Path(path)) for path in outputs],
     }
-    path = directory / filename
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return path
+    return atomic_write_json(directory / filename, payload)

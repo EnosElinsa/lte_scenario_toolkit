@@ -1,10 +1,15 @@
 import hashlib
 import json
+from datetime import date, datetime, timezone
+from pathlib import Path
 
 import geopandas as gpd
+import numpy as np
 from shapely.geometry import Point
 
+import lte_scenario_toolkit.io as io_module
 from lte_scenario_toolkit.io import (
+    atomic_write_json,
     build_dataset_record,
     build_output_dataframe,
     create_data_manifest,
@@ -85,6 +90,101 @@ def test_write_run_record_captures_config_inputs_outputs_and_versions(tmp_path):
     assert payload["outputs"] == [str(tmp_path / "result.csv")]
     assert "python" in payload["software"]
     assert output.name == "run-select-sites.json"
+
+
+def test_atomic_write_json_replaces_from_sibling_temp_and_serializes_json_safe_values(
+    tmp_path,
+    monkeypatch,
+):
+    destination = tmp_path / "record.json"
+    destination.write_text("old content\n", encoding="utf-8")
+    replacements = []
+    original_replace = Path.replace
+
+    def tracking_replace(path, target):
+        replacements.append((path, Path(target)))
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", tracking_replace)
+
+    returned = atomic_write_json(
+        destination,
+        {
+            "label": "Café",
+            "path": tmp_path / "résumé.csv",
+            "date": date(2026, 7, 16),
+            "timestamp": datetime(2026, 7, 16, 10, tzinfo=timezone.utc),
+            "count": np.int64(3),
+        },
+    )
+
+    assert returned == destination
+    payload = json.loads(destination.read_text(encoding="utf-8"))
+    assert payload == {
+        "label": "Café",
+        "path": str(tmp_path / "résumé.csv"),
+        "date": "2026-07-16",
+        "timestamp": "2026-07-16T10:00:00+00:00",
+        "count": 3,
+    }
+    assert destination.read_bytes().endswith(b"\n")
+    temporary, target = replacements[-1]
+    assert target == destination
+    assert temporary.parent == destination.parent
+    assert temporary.name.startswith(f".{destination.name}.")
+    assert not temporary.exists()
+
+
+def test_write_run_record_preserves_payload_contract_and_uses_atomic_helper(
+    tmp_path,
+    monkeypatch,
+):
+    captured = {}
+
+    def fake_atomic_write_json(path, payload):
+        captured["path"] = Path(path)
+        captured["payload"] = payload
+        return Path(path)
+
+    monkeypatch.setattr(io_module, "atomic_write_json", fake_atomic_write_json)
+    monkeypatch.setattr(io_module, "_git_commit", lambda repository: "abc123")
+    monkeypatch.setattr(io_module, "software_versions", lambda: {"python": "3.test"})
+    config = {"experiment_name": "fixture", "repo_root": tmp_path}
+    inputs = [{"name": "stations", "path": tmp_path / "stations.geojson"}]
+    outputs = [tmp_path / "scenario.csv"]
+
+    returned = write_run_record(
+        tmp_path / "run-output",
+        config=config,
+        inputs=inputs,
+        outputs=outputs,
+        command=["lte-select-sites", "--city", "chicago"],
+        timestamp="2026-07-16T10:00:00Z",
+        filename="run-select-sites.json",
+    )
+
+    expected_path = tmp_path / "run-output" / "run-select-sites.json"
+    assert returned == expected_path
+    assert captured == {
+        "path": expected_path,
+        "payload": {
+            "timestamp": "2026-07-16T10:00:00Z",
+            "command": ["lte-select-sites", "--city", "chicago"],
+            "git_commit": "abc123",
+            "config": {
+                "experiment_name": "fixture",
+                "repo_root": str(tmp_path),
+            },
+            "inputs": [
+                {
+                    "name": "stations",
+                    "path": str(tmp_path / "stations.geojson"),
+                }
+            ],
+            "software": {"python": "3.test"},
+            "outputs": [str(tmp_path / "scenario.csv")],
+        },
+    }
 
 
 def test_create_data_manifest_combines_provenance_with_file_checksums(tmp_path):
