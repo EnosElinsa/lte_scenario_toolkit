@@ -281,3 +281,17 @@ def test_load_profile_accepts_finite_figure_numbers_and_real_booleans(tmp_path):
         save_terrain_eps=True,
         save_terrain_html=False,
     )
+
+
+def test_load_profile_normalizes_numeric_overflow_with_field_location(tmp_path):
+    profile_path = tmp_path / "profile.yaml"
+    write_profile(profile_path)
+    document = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    document["figures"]["vertical_exaggeration"] = 10**1000
+    profile_path.write_text(yaml.safe_dump(document), encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match=r"^figures\.vertical_exaggeration must be a finite number$",
+    ):
+        load_profile(profile_path, repo_root=tmp_path)

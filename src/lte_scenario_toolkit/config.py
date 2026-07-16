@@ -54,7 +54,7 @@ def load_experiment_config(
         if repo_root is not None
         else _infer_project_root(path)
     )
-    if document.get("schema_version") == 2:
+    if "schema_version" in document:
         profile = load_profile(path, repo_root=root)
         if city is not None:
             resolved_city = city

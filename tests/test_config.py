@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+import yaml
 
 from lte_scenario_toolkit.config import load_experiment_config
 
@@ -67,6 +68,24 @@ def test_load_experiment_config_rejects_unknown_scan_strategy(tmp_path):
     write_config(config_path, strategy="random")
 
     with pytest.raises(ValueError, match="strategy"):
+        load_experiment_config(config_path, repo_root=tmp_path)
+
+
+@pytest.mark.parametrize("bad_version", [3, "2", True, 2.0])
+def test_load_experiment_config_rejects_explicit_invalid_schema_versions(
+    tmp_path,
+    bad_version,
+):
+    config_path = tmp_path / "experiment.yaml"
+    write_config(config_path)
+    document = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    document["schema_version"] = bad_version
+    config_path.write_text(yaml.safe_dump(document), encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match=r"^schema_version must be the integer 2$",
+    ):
         load_experiment_config(config_path, repo_root=tmp_path)
 
 

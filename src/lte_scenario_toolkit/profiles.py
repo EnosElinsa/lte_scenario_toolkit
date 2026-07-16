@@ -207,7 +207,10 @@ def _finite_float_value(
     value = _value(mapping, key, path, default=default)
     if type(value) not in {int, float}:
         raise ValueError(f"{path} must be a finite number")
-    result = float(value)
+    try:
+        result = float(value)
+    except OverflowError as exc:
+        raise ValueError(f"{path} must be a finite number") from exc
     if not math.isfinite(result):
         raise ValueError(f"{path} must be a finite number")
     return result
