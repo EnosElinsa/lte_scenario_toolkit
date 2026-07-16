@@ -257,8 +257,13 @@ def _validate_scan_inputs(
     points = np.asarray(coordinates)
     if points.ndim != 2 or points.shape[1] < 2:
         raise ValueError("coordinates must be an N-by-at-least-2 array")
-    if not np.issubdtype(points.dtype, np.number):
-        raise ValueError("coordinates must contain numeric values")
+    if not np.issubdtype(points.dtype, np.number) or np.issubdtype(
+        points.dtype,
+        np.complexfloating,
+    ):
+        raise ValueError("coordinates must contain real numeric values")
+    if not bool(np.isfinite(points[:, :2]).all()):
+        raise ValueError("coordinates must contain finite real values")
     if progress is not None and not callable(progress):
         raise ValueError("progress must be callable or None")
     if cancel is not None and not callable(getattr(cancel, "is_set", None)):
@@ -407,6 +412,7 @@ def scan_candidates(
             selected.append(candidate)
             added_this_row.append(candidate)
             if len(selected) >= request.max_candidates:
+                _raise_if_cancelled(cancel)
                 event = ScanProgress(
                     phase="completed",
                     checked_positions=checked_positions,
@@ -417,7 +423,6 @@ def scan_candidates(
                 )
                 if progress is not None:
                     progress(event)
-                _raise_if_cancelled(cancel)
                 # Complete-mode replacement and ranking are intentionally Task 6.
                 return ScanResult(
                     candidates=tuple(selected),
@@ -428,6 +433,8 @@ def scan_candidates(
                 )
 
         final_row = traversal_y_index == len(y_origins) - 1
+        if final_row:
+            _raise_if_cancelled(cancel)
         event = ScanProgress(
             phase="completed" if final_row else "scanning",
             checked_positions=checked_positions,
@@ -438,7 +445,8 @@ def scan_candidates(
         )
         if progress is not None:
             progress(event)
-        _raise_if_cancelled(cancel)
+        if not final_row:
+            _raise_if_cancelled(cancel)
 
     return ScanResult(
         candidates=tuple(selected),

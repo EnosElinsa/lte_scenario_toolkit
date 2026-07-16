@@ -373,6 +373,56 @@ def test_progress_callback_can_cancel_after_one_completed_row():
     assert len(progress_events) == 1
     assert progress_events[0].phase == "scanning"
     assert progress_events[0].checked_positions > 0
+    assert all(event.phase != "completed" for event in progress_events)
+
+
+def test_fast_limit_completed_progress_is_terminal_before_callback_cancel():
+    cancel = Event()
+    progress_events = []
+
+    def cancel_on_completed(event):
+        progress_events.append(event)
+        if event.phase == "completed":
+            cancel.set()
+
+    result = scan_candidates(
+        make_request(),
+        box(-1, -1, 10, 8),
+        np.asarray([[1, 1], [2, 2], [5, 1], [6, 2]], dtype=float),
+        progress=cancel_on_completed,
+        cancel=cancel,
+    )
+
+    assert result.completed is True
+    assert len(result.candidates) == 2
+    assert cancel.is_set()
+    assert sum(event.phase == "completed" for event in progress_events) == 1
+    assert progress_events[-1].phase == "completed"
+
+
+def test_exhausted_scan_completed_progress_is_terminal_before_callback_cancel():
+    cancel = Event()
+    progress_events = []
+
+    def cancel_on_completed(event):
+        progress_events.append(event)
+        if event.phase == "completed":
+            cancel.set()
+
+    result = scan_candidates(
+        make_request(target_count=999),
+        box(-1, -1, 10, 8),
+        np.asarray([[1.0, 1.0]]),
+        progress=cancel_on_completed,
+        cancel=cancel,
+    )
+
+    assert result.completed is True
+    assert result.candidates == ()
+    assert result.checked_positions == result.total_positions
+    assert cancel.is_set()
+    assert sum(event.phase == "completed" for event in progress_events) == 1
+    assert progress_events[-1].phase == "completed"
 
 
 def test_uniform_flat_grid_id_uses_original_axis_indices_and_coordinates():
@@ -566,3 +616,32 @@ def test_scan_validates_coordinates_progress_cancel_and_boundary_inputs():
         scan_candidates(request, boundary, np.empty((0, 2)), cancel=object())
     with pytest.raises(ValueError, match="boundary"):
         scan_candidates(request, object(), np.empty((0, 2)))
+
+
+@pytest.mark.parametrize(
+    "coordinates",
+    [
+        np.asarray([[np.nan, 1.0]]),
+        np.asarray([[1.0, np.inf]]),
+        np.asarray([[-np.inf, 1.0]]),
+        np.asarray([[1.0 + 0.0j, 2.0 + 0.0j]]),
+    ],
+)
+def test_scan_rejects_non_finite_and_complex_real_world_coordinates(coordinates):
+    with pytest.raises(ValueError, match="coordinates|finite|real"):
+        scan_candidates(
+            make_request(target_count=0),
+            box(-1, -1, 10, 8),
+            coordinates,
+        )
+
+
+def test_scan_accepts_empty_real_coordinate_array_on_non_empty_grid():
+    result = scan_candidates(
+        make_request(target_count=0, max_candidates=1),
+        box(-1, -1, 10, 8),
+        np.empty((0, 2), dtype=float),
+    )
+
+    assert result.completed is True
+    assert len(result.candidates) == 1
