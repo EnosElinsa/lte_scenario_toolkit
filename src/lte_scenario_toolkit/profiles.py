@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -77,8 +77,8 @@ class ExperimentProfile:
     max_rects: int
     min_spacing: int
     output_root: Path
-    outputs: OutputSettings
-    figure: FigureSettings
+    outputs: OutputSettings = field(default_factory=OutputSettings)
+    figure: FigureSettings = field(default_factory=FigureSettings)
     source_path: Path | None = None
 
     def runtime_values(self) -> dict[str, Any]:
@@ -108,7 +108,11 @@ class ExperimentProfile:
         }
 
 
-def _mapping(value: Any, section: str) -> Mapping[str, Any]:
+def _mapping(
+    document: Mapping[str, Any],
+    section: str,
+) -> Mapping[str, Any]:
+    value = document.get(section, {})
     if not isinstance(value, Mapping):
         raise ValueError(f"Configuration section {section} must be a mapping")
     return value
@@ -128,7 +132,7 @@ def _resolve_path(value: str | Path, root: Path) -> Path:
     return path.resolve() if path.is_absolute() else (root / path).resolve()
 
 
-def _validate_profile(profile: ExperimentProfile) -> None:
+def _validate_profile(profile: ExperimentProfile) -> ExperimentProfile:
     if (
         PROFILE_ID_PATTERN.fullmatch(profile.profile_id) is None
         or profile.profile_id in WINDOWS_RESERVED
@@ -154,6 +158,7 @@ def _validate_profile(profile: ExperimentProfile) -> None:
         raise ValueError("figures.dpi must be greater than zero")
     if profile.figure.vertical_exaggeration <= 0:
         raise ValueError("figures.vertical_exaggeration must be greater than zero")
+    return profile
 
 
 def load_profile(
@@ -173,13 +178,13 @@ def load_profile(
     if not isinstance(document, Mapping) or document.get("schema_version") != 2:
         raise ValueError("Expected a schema-version-2 experiment profile")
 
-    profile_section = _mapping(document.get("profile"), "profile")
-    inputs = _mapping(document.get("inputs"), "inputs")
-    experiment = _mapping(document.get("experiment", {}), "experiment")
-    spatial = _mapping(document.get("spatial", {}), "spatial")
-    scan = _mapping(document.get("scan", {}), "scan")
-    outputs = _mapping(document.get("outputs"), "outputs")
-    figures = _mapping(document.get("figures", {}), "figures")
+    profile_section = _mapping(document, "profile")
+    inputs = _mapping(document, "inputs")
+    experiment = _mapping(document, "experiment")
+    spatial = _mapping(document, "spatial")
+    scan = _mapping(document, "scan")
+    outputs = _mapping(document, "outputs")
+    figures = _mapping(document, "figures")
 
     output_defaults = OutputSettings()
     output_settings = OutputSettings(
@@ -236,37 +241,22 @@ def load_profile(
         random_seed=int(
             experiment.get("random_seed", DEFAULT_PROFILE_VALUES["random_seed"])
         ),
-        target_crs=str(
-            spatial.get("target_crs", DEFAULT_PROFILE_VALUES["target_crs"])
-        ),
-        rect_size=int(
-            spatial.get("rectangle_size_m", DEFAULT_PROFILE_VALUES["rect_size"])
-        ),
+        target_crs=str(_required(spatial, "target_crs", "spatial")),
+        rect_size=int(_required(spatial, "rectangle_size_m", "spatial")),
         target_count=int(
-            spatial.get(
-                "target_base_station_count",
-                DEFAULT_PROFILE_VALUES["target_count"],
-            )
+            _required(spatial, "target_base_station_count", "spatial")
         ),
-        tolerance=int(
-            spatial.get("count_tolerance", DEFAULT_PROFILE_VALUES["tolerance"])
-        ),
+        tolerance=int(_required(spatial, "count_tolerance", "spatial")),
         scan_mode=str(scan.get("mode", DEFAULT_PROFILE_VALUES["scan_mode"])),
-        strategy=str(scan.get("strategy", DEFAULT_PROFILE_VALUES["strategy"])),
-        scan_step=int(scan.get("step_m", DEFAULT_PROFILE_VALUES["scan_step"])),
-        max_rects=int(
-            scan.get("max_rectangles", DEFAULT_PROFILE_VALUES["max_rects"])
-        ),
+        strategy=str(_required(scan, "strategy", "scan")),
+        scan_step=int(_required(scan, "step_m", "scan")),
+        max_rects=int(_required(scan, "max_rectangles", "scan")),
         min_spacing=int(
-            scan.get(
-                "minimum_center_spacing_m",
-                DEFAULT_PROFILE_VALUES["min_spacing"],
-            )
+            _required(scan, "minimum_center_spacing_m", "scan")
         ),
-        output_root=_resolve_path(_required(outputs, "root", "outputs"), root),
+        output_root=_resolve_path(outputs.get("root", "results"), root),
         outputs=output_settings,
         figure=figure_settings,
         source_path=source_path,
     )
-    _validate_profile(profile)
-    return profile
+    return _validate_profile(profile)

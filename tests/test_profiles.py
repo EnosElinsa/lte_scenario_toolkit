@@ -1,10 +1,13 @@
 from pathlib import Path
 
 import pytest
+import yaml
 
 from lte_scenario_toolkit.profiles import (
     DEFAULT_PROFILE_VALUES,
     ExperimentProfile,
+    FigureSettings,
+    OutputSettings,
     load_profile,
 )
 
@@ -102,6 +105,90 @@ def test_default_profile_values_are_explicit_and_stable():
     assert DEFAULT_PROFILE_VALUES["tolerance"] == 0
     assert DEFAULT_PROFILE_VALUES["scan_mode"] == "fast"
     assert DEFAULT_PROFILE_VALUES["max_rects"] == 100
+
+
+def test_experiment_profile_uses_fresh_default_output_and_figure_settings():
+    profile = ExperimentProfile(
+        schema_version=2,
+        profile_id="chicago-default",
+        display_name="Chicago default",
+        scenario_id="chicago",
+        points_dataset_id="points",
+        random_seed=42,
+        target_crs="EPSG:3857",
+        rect_size=3000,
+        target_count=30,
+        tolerance=0,
+        scan_mode="fast",
+        strategy="uniform",
+        scan_step=10,
+        max_rects=100,
+        min_spacing=3000,
+        output_root=Path("results"),
+    )
+
+    assert profile.outputs == OutputSettings()
+    assert profile.figure == FigureSettings()
+
+
+@pytest.mark.parametrize("outputs_section", [{}, None])
+def test_load_profile_defaults_outputs_when_root_is_omitted(
+    tmp_path,
+    outputs_section,
+):
+    profile_path = tmp_path / "profile.yaml"
+    write_profile(profile_path)
+    document = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    if outputs_section is None:
+        document.pop("outputs")
+    else:
+        document["outputs"] = outputs_section
+    profile_path.write_text(yaml.safe_dump(document), encoding="utf-8")
+
+    profile = load_profile(profile_path, repo_root=tmp_path)
+
+    assert profile.output_root == tmp_path / "results"
+    assert profile.outputs == OutputSettings()
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "path"),
+    [
+        ("spatial", "target_crs", "spatial.target_crs"),
+        ("spatial", "rectangle_size_m", "spatial.rectangle_size_m"),
+        (
+            "spatial",
+            "target_base_station_count",
+            "spatial.target_base_station_count",
+        ),
+        ("spatial", "count_tolerance", "spatial.count_tolerance"),
+        ("scan", "strategy", "scan.strategy"),
+        ("scan", "step_m", "scan.step_m"),
+        ("scan", "max_rectangles", "scan.max_rectangles"),
+        (
+            "scan",
+            "minimum_center_spacing_m",
+            "scan.minimum_center_spacing_m",
+        ),
+    ],
+)
+def test_load_profile_requires_explicit_spatial_and_scan_values(
+    tmp_path,
+    section,
+    key,
+    path,
+):
+    profile_path = tmp_path / "profile.yaml"
+    write_profile(profile_path)
+    document = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    document[section].pop(key)
+    profile_path.write_text(yaml.safe_dump(document), encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match=rf"^Missing required configuration value: {path}$",
+    ):
+        load_profile(profile_path, repo_root=tmp_path)
 
 
 @pytest.mark.parametrize("bad_id", ["Chicago Default", "../escape", "con"])
