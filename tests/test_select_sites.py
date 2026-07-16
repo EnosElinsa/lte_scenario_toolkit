@@ -1,9 +1,10 @@
+import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import geopandas as gpd
 import numpy as np
-import pandas as pd
 import pytest
 import rasterio
 import yaml
@@ -353,6 +354,70 @@ def test_shared_cache_message_preserves_legacy_loaded_and_saved_text(
     assert message.endswith(f"{'a' * 64}.json")
 
 
+def test_cli_maps_one_legacy_choice_and_builds_exact_artifact_tokens():
+    selected = Candidate(4, 1, 0, 0, 1, 1)
+    other = Candidate(7, 2, 2, 0, 3, 1)
+    result = ScanResult((selected, other), 2, 2, True, "row-sweep-v1")
+
+    assert select_sites._chosen_candidate(
+        [{"flat_grid_id": 4}],
+        result,
+    ) is selected
+    assert select_sites._export_artifacts(
+        {
+            "save_csv": True,
+            "save_preview_png": False,
+            "save_terrain_png": True,
+            "save_terrain_eps": False,
+            "save_terrain_html": True,
+        }
+    ) == ("csv", "terrain_png", "terrain_html")
+
+    with pytest.raises(ValueError, match="exactly one"):
+        select_sites._chosen_candidate(
+            [{"flat_grid_id": 4}],
+            replace(
+                result,
+                candidates=(selected, replace(selected, point_count=9)),
+            ),
+        )
+
+
+def test_cli_reports_published_artifacts_partial_errors_and_run_record(
+    tmp_path,
+    capsys,
+):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    csv_name = "chicago_2m_target1_tol0.csv"
+    (run_dir / csv_name).write_text("cell\n1\n", encoding="utf-8")
+    (run_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "status": "partial",
+                "artifacts": [csv_name],
+                "errors": [
+                    {
+                        "artifact": "preview_png",
+                        "code": "artifact.preview_png.failed",
+                        "message": "RuntimeError: preview boom",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    select_sites._report_published_run(run_dir)
+
+    captured = capsys.readouterr()
+    assert f"Scenario CSV: {run_dir / csv_name}" in captured.out
+    assert f"Run record: {run_dir / 'run.json'}" in captured.out
+    assert (
+        "WARNING: preview_png: RuntimeError: preview boom" in captured.err
+    )
+
+
 @pytest.mark.parametrize(
     ("cache_status", "expected"),
     [("hit", "Loaded 1 cached candidates:"), ("miss", "Saved 1 candidates:")],
@@ -393,7 +458,7 @@ def test_main_reports_the_legacy_shared_cache_message_on_success(
         "strategy": "sequential",
         "random_seed": 7,
         "target_crs": "EPSG:3857",
-        "save_csv": False,
+        "save_csv": True,
         "save_preview_png": False,
         "save_terrain_png": False,
         "save_terrain_eps": False,
@@ -420,7 +485,9 @@ def test_main_reports_the_legacy_shared_cache_message_on_success(
         points_path=points_path,
         boundary_path=boundary_path,
         dem_path=dem_path,
+        output_root=output,
     )
+    export_calls = []
 
     class Service:
         @staticmethod
@@ -456,6 +523,45 @@ def test_main_reports_the_legacy_shared_cache_message_on_success(
                 coordinates=np.asarray([[1.0, 1.0]]),
             )
 
+        @staticmethod
+        def export(
+            received,
+            completed,
+            selected_candidate,
+            *,
+            output_root,
+            artifacts,
+            entrypoint,
+        ):
+            assert received is preflight
+            assert completed is scan_result
+            assert selected_candidate is candidate
+            assert output_root == output
+            assert set(artifacts) == {"csv"}
+            assert entrypoint == [
+                "lte-select-sites",
+                "--config",
+                str(config_path),
+                "--select-index",
+                "1",
+            ]
+            export_calls.append(selected_candidate)
+            run_dir = output / "chicago" / "default" / "run-1"
+            run_dir.mkdir(parents=True)
+            artifact = "chicago_2m_target1_tol0.csv"
+            (run_dir / artifact).write_text("cell\n1\n", encoding="utf-8")
+            (run_dir / "run.json").write_text(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "artifacts": [artifact],
+                        "errors": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return run_dir
+
     points = gpd.GeoDataFrame(
         {"cell": [1]},
         geometry=[Point(1, 1)],
@@ -483,18 +589,40 @@ def test_main_reports_the_legacy_shared_cache_message_on_success(
         "choose_result",
         lambda results, index: [results[index - 1]],
     )
-    monkeypatch.setattr(select_sites.terrain, "validate_dem_path", lambda path: path)
+    monkeypatch.setattr(
+        select_sites.terrain,
+        "validate_dem_path",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("CLI export must not validate the DEM a second time")
+        ),
+    )
     monkeypatch.setattr(
         select_sites,
         "process_selected_rectangles",
-        lambda *args: (pd.DataFrame({"cell": [1]}), points),
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("CLI must delegate extraction to SelectionService.export")
+        ),
     )
-    monkeypatch.setattr(select_sites.visualization, "render_3d_terrain", lambda *args: [])
-    monkeypatch.setattr(select_sites.io, "build_dataset_record", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        select_sites.visualization,
+        "save_preview",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("CLI must delegate preview export")
+        ),
+    )
+    monkeypatch.setattr(
+        select_sites.visualization,
+        "render_3d_terrain",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("CLI must delegate terrain export")
+        ),
+    )
     monkeypatch.setattr(
         select_sites.io,
         "write_run_record",
-        lambda *args, **kwargs: output / "run-select-sites.json",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("CLI must not write a second run record")
+        ),
     )
 
     exit_code = select_sites.main(
@@ -503,8 +631,11 @@ def test_main_reports_the_legacy_shared_cache_message_on_success(
 
     captured = capsys.readouterr()
     assert exit_code == 0
+    assert export_calls == [candidate]
     assert expected in captured.out
     assert f"{'a' * 64}.json" in captured.out
+    assert "Scenario CSV:" in captured.out
+    assert "Run record:" in captured.out
 
 
 def test_main_runs_shared_preflight_before_creating_output(tmp_path, monkeypatch, capsys):

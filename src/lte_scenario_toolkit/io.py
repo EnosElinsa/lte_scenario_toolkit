@@ -28,6 +28,10 @@ def build_output_dataframe(
     center_x,
     center_y,
     rect_size,
+    run_id: str | None = None,
+    scenario_id: str | None = None,
+    profile_id: str | None = None,
+    candidate_id: str | None = None,
 ) -> pd.DataFrame:
     """Build the stable CSV schema used by downstream figure generation."""
 
@@ -62,6 +66,14 @@ def build_output_dataframe(
     frame["center_y"] = center_y
     if "elevation" in selected.columns:
         frame["elevation"] = selected["elevation"].to_numpy()
+    for column, value in (
+        ("run_id", run_id),
+        ("scenario_id", scenario_id),
+        ("profile_id", profile_id),
+        ("candidate_id", candidate_id),
+    ):
+        if value is not None:
+            frame[column] = value
     return frame.reset_index(drop=True)
 
 
@@ -182,13 +194,16 @@ def software_versions() -> dict[str, str]:
 
 
 def _git_commit(repository: Path) -> str | None:
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=repository,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repository,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
     return result.stdout.strip() if result.returncode == 0 else None
 
 

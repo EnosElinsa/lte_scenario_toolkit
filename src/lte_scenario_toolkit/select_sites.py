@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from dataclasses import replace
@@ -11,7 +12,6 @@ from typing import Any
 
 import geopandas as gpd
 import pandas as pd
-import rasterio
 from shapely.geometry import box
 
 from . import io, scenario, spatial, terrain, visualization
@@ -147,6 +147,60 @@ def _shared_cache_message(result: ScanResult, progress: SelectionProgress) -> st
     if progress.cache_status == "hit":
         return f"Loaded {len(result.candidates)} cached candidates: {cache_name}"
     return f"Saved {len(result.candidates)} candidates: {cache_name}"
+
+
+def _chosen_candidate(
+    chosen: list[dict[str, Any]],
+    scan_result: ScanResult,
+) -> Candidate:
+    """Map one legacy selector result back to one scanned candidate."""
+
+    if len(chosen) != 1 or not isinstance(chosen[0], dict):
+        raise ValueError("Selection must contain exactly one legacy candidate")
+    flat_grid_id = chosen[0].get("flat_grid_id")
+    matches = [
+        candidate
+        for candidate in scan_result.candidates
+        if candidate.flat_grid_id == flat_grid_id
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            "Selected flat_grid_id must match exactly one completed scan candidate"
+        )
+    return matches[0]
+
+
+def _export_artifacts(config: dict[str, Any]) -> tuple[str, ...]:
+    """Translate legacy output flags to the service's stable artifact tokens."""
+
+    flags = (
+        ("save_csv", "csv"),
+        ("save_preview_png", "preview_png"),
+        ("save_terrain_png", "terrain_png"),
+        ("save_terrain_eps", "terrain_eps"),
+        ("save_terrain_html", "terrain_html"),
+    )
+    return tuple(token for flag, token in flags if config.get(flag, True))
+
+
+def _report_published_run(run_dir: Path) -> None:
+    """Print legacy output labels from the authoritative published run record."""
+
+    run_record_path = run_dir / "run.json"
+    record = json.loads(run_record_path.read_text(encoding="utf-8"))
+    for artifact in record.get("artifacts", []):
+        path = run_dir / artifact
+        if artifact.endswith(".csv"):
+            print(f"Scenario CSV: {path}")
+        elif artifact.endswith(".png") and not artifact.endswith("_3d.png"):
+            print(f"Preview: {path}")
+    for error in record.get("errors", []):
+        print(
+            f"WARNING: {error.get('artifact', 'artifact')}: "
+            f"{error.get('message', 'export failed')}",
+            file=sys.stderr,
+        )
+    print(f"Run record: {run_record_path}")
 
 
 def _linked_catalog_scenario(
@@ -391,96 +445,19 @@ def main(argv=None) -> int:
         return 2
 
     try:
-        dem_path = terrain.validate_dem_path(config["dem_path"])
-    except FileNotFoundError as exc:
+        selected_candidate = _chosen_candidate(chosen, scan_result)
+        run_dir = selection_service.export(
+            preflight,
+            scan_result,
+            selected_candidate,
+            output_root=preflight.output_root,
+            artifacts=_export_artifacts(config),
+            entrypoint=(
+                sys.argv if argv is None else ["lte-select-sites", *argv]
+            ),
+        )
+        _report_published_run(run_dir)
+    except (ValueError, FileNotFoundError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
-
-    Path(config["output_dir"]).mkdir(parents=True, exist_ok=True)
-    with rasterio.open(dem_path) as dem:
-        dem_crs = str(dem.crs)
-        dem_resolution_m = float(abs(dem.res[0]))
-        final_frame, selected_points = process_selected_rectangles(
-            chosen, points_gdf, dem, config
-        )
-        if final_frame is None or final_frame.empty:
-            print("No station data extracted", file=sys.stderr)
-            return 2
-
-        if config.get("save_csv", True):
-            final_frame.to_csv(config["output_csv"], index=False, encoding="utf-8-sig")
-            print(f"Scenario CSV: {config['output_csv']}")
-        try:
-            visualization.render_3d_terrain(chosen[0], selected_points, dem, config)
-        except Exception as exc:
-            print(f"WARNING: terrain rendering failed: {exc}", file=sys.stderr)
-
-    if config.get("save_preview_png", True):
-        try:
-            preview_path = visualization.save_preview(points_gdf, boundary, chosen, config)
-            print(f"Preview: {preview_path}")
-        except Exception as exc:
-            print(f"WARNING: preview generation failed: {exc}", file=sys.stderr)
-
-    try:
-        input_records = []
-        for role, source_path, source_url, license_name in (
-            (
-                "base_station_points",
-                config["points_shp"],
-                "data/manifest.json",
-                "Public redistribution permission confirmed by repository owner",
-            ),
-            (
-                "administrative_boundary",
-                config["boundary_shp"],
-                "data/manifest.json",
-                "Public redistribution permission confirmed by repository owner",
-            ),
-        ):
-            for component in sorted(source_path.parent.glob(f"{source_path.stem}.*")):
-                if component.is_file():
-                    input_records.append(
-                        io.build_dataset_record(
-                            component,
-                            name=f"{role}:{component.suffix.lstrip('.')}",
-                            source_url=source_url,
-                            license_name=license_name,
-                            crs=str(points_gdf.crs),
-                        )
-                    )
-        input_records.append(
-            io.build_dataset_record(
-                dem_path,
-                name="dem",
-                source_url=(
-                    "https://developers.google.com/earth-engine/datasets/catalog/USGS_3DEP_1m"
-                ),
-                license_name="USGS public-domain data; retain source attribution",
-                crs=dem_crs,
-                resolution_m=dem_resolution_m,
-            )
-        )
-        outputs = [
-            path
-            for path in (
-                config["output_csv"],
-                config["output_3d_png"],
-                config["output_3d_png"].with_suffix(".eps"),
-                config["output_3d_html"],
-                config["preview_png"],
-            )
-            if path.exists()
-        ]
-        run_record = io.write_run_record(
-            config["output_dir"],
-            config=config,
-            inputs=input_records,
-            outputs=outputs,
-            command=sys.argv if argv is None else ["lte-select-sites", *argv],
-            filename="run-select-sites.json",
-        )
-        print(f"Run record: {run_record}")
-    except Exception as exc:
-        print(f"WARNING: run record generation failed: {exc}", file=sys.stderr)
     return 0

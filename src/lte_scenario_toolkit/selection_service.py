@@ -5,7 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import dataclass
+import stat
+import uuid
+from collections.abc import Iterable
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +22,8 @@ from rasterio.windows import intersect as windows_intersect
 from shapely.geometry import box, mapping
 from shapely.ops import transform as transform_geometry
 
-from .candidate_cache import CandidateCache, cache_key
+from . import io, visualization
+from .candidate_cache import CACHE_SCHEMA_VERSION, CandidateCache, cache_key
 from .candidate_scanner import (
     Candidate,
     ScanCancelled,
@@ -29,10 +33,21 @@ from .candidate_scanner import (
     scan_candidates,
 )
 from .data_validation import validate_scenario_data
-from .profiles import ExperimentProfile, validate_profile
+from .profiles import ExperimentProfile, dump_profile, validate_profile
+from .run_service import RunService
 from .spatial import prepare_spatial_data
 
 SCANNER_ALGORITHM_VERSION = "row-sweep-v1"
+EXPORT_ARTIFACTS = frozenset(
+    {"csv", "preview_png", "terrain_png", "terrain_eps", "terrain_html"}
+)
+_ARTIFACT_ORDER = (
+    "csv",
+    "preview_png",
+    "terrain_png",
+    "terrain_eps",
+    "terrain_html",
+)
 
 
 class SelectionError(ValueError):
@@ -63,6 +78,10 @@ class SelectionStatisticsError(SelectionError):
     """Raised when exact candidate DEM statistics cannot be computed."""
 
 
+class SelectionExportError(SelectionError):
+    """Raised when a selected candidate cannot be published safely."""
+
+
 @dataclass(frozen=True)
 class DemStatistics:
     minimum: float
@@ -83,6 +102,8 @@ class SelectionPreflight:
     boundary_fingerprint: str
     points_fingerprint: str
     dem_fingerprint: str
+    boundary_dataset_id: str | None = None
+    dem_dataset_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -316,6 +337,112 @@ def stream_dem_statistics(
     )
 
 
+def _sample_point_elevations(points: gpd.GeoDataFrame, dem: Any) -> np.ndarray:
+    """Sample point elevations without reading a complete native DEM band."""
+
+    if points.crs is None:
+        raise ValueError("Point data requires a CRS before DEM sampling")
+    if getattr(dem, "crs", None) is None:
+        raise ValueError("DEM requires a CRS before elevation sampling")
+    if points.empty:
+        return np.asarray([], dtype=float)
+    projected = points.to_crs(dem.crs) if points.crs != dem.crs else points
+    coordinates = zip(
+        projected.geometry.x.to_numpy(),
+        projected.geometry.y.to_numpy(),
+        strict=True,
+    )
+    nodata = getattr(dem, "nodata", None)
+    elevations: list[float] = []
+    for sample in dem.sample(coordinates, indexes=1, masked=True):
+        value = sample[0]
+        if np.ma.is_masked(value):
+            elevations.append(np.nan)
+            continue
+        numeric = float(value)
+        if (
+            not np.isfinite(numeric)
+            or (nodata is not None and np.isclose(numeric, nodata, equal_nan=True))
+        ):
+            elevations.append(np.nan)
+            continue
+        elevations.append(numeric)
+    values = np.asarray(elevations, dtype=float)
+    invalid_count = int((~np.isfinite(values)).sum())
+    if invalid_count:
+        raise ValueError(
+            f"{invalid_count} selected station(s) have no valid DEM elevation"
+        )
+    return values
+
+
+def _temporary_sibling(path: Path) -> Path:
+    return path.with_name(
+        f".{path.stem}.{uuid.uuid4().hex}.tmp{path.suffix}"
+    )
+
+
+def _require_nonempty_regular_file(path: Path) -> Path:
+    status = path.lstat()
+    if stat.S_ISLNK(status.st_mode) or not stat.S_ISREG(status.st_mode):
+        raise ValueError(f"Required output is not a regular file: {path}")
+    if status.st_size <= 0:
+        raise ValueError(f"Required output is empty: {path}")
+    return path
+
+
+def _promote_nonempty_file(temporary: Path, destination: Path) -> Path:
+    _require_nonempty_regular_file(temporary)
+    temporary.replace(destination)
+    return destination
+
+
+def _render_terrain_artifact(
+    token: str,
+    temporary: Path,
+    *,
+    rectangle: dict[str, Any],
+    selected_points: gpd.GeoDataFrame,
+    dem_path: Path,
+    rectangle_size: float,
+    target_crs: str,
+) -> None:
+    """Adapt the legacy renderer to one independently requested artifact."""
+
+    common = {
+        "rect_size": rectangle_size,
+        "target_crs": target_crs,
+        "save_terrain_png": token in {"terrain_png", "terrain_eps"},
+        "save_terrain_eps": token == "terrain_eps",
+        "save_terrain_html": token == "terrain_html",
+        "output_3d_png": temporary,
+        "output_3d_html": temporary,
+    }
+    helper_png: Path | None = None
+    helper_eps: Path | None = None
+    if token == "terrain_eps":
+        helper_png = temporary.with_name(
+            f".{temporary.stem}.{uuid.uuid4().hex}.helper.png"
+        )
+        helper_eps = helper_png.with_suffix(".eps")
+        common["output_3d_png"] = helper_png
+    try:
+        with rasterio.open(dem_path) as dem:
+            visualization.render_3d_terrain(
+                rectangle,
+                selected_points,
+                dem,
+                common,
+            )
+        if helper_eps is not None:
+            _promote_nonempty_file(helper_eps, temporary)
+    finally:
+        if helper_png is not None:
+            helper_png.unlink(missing_ok=True)
+        if helper_eps is not None:
+            helper_eps.unlink(missing_ok=True)
+
+
 class SelectionService:
     """Share one validated selection implementation between CLI and GUI."""
 
@@ -505,6 +632,8 @@ class SelectionService:
             boundary_fingerprint=boundary_fingerprint,
             points_fingerprint=points_fingerprint,
             dem_fingerprint=dem_fingerprint,
+            boundary_dataset_id=boundary_id,
+            dem_dataset_id=dem_id,
         )
 
     @staticmethod
@@ -692,6 +821,452 @@ class SelectionService:
                 ) from exc
         return result
 
+    @staticmethod
+    def _export_artifacts(artifacts: Iterable[str]) -> tuple[str, ...]:
+        if isinstance(artifacts, (str, bytes, os.PathLike)):
+            raise SelectionExportError(
+                "export.artifacts",
+                "artifacts must be a collection of artifact tokens",
+            )
+        try:
+            requested = list(artifacts)
+        except TypeError as exc:
+            raise SelectionExportError(
+                "export.artifacts",
+                "artifacts must be an iterable of artifact tokens",
+            ) from exc
+        if not requested:
+            raise SelectionExportError(
+                "export.artifacts",
+                "At least one export artifact is required",
+            )
+        if any(type(item) is not str or item not in EXPORT_ARTIFACTS for item in requested):
+            choices = ", ".join(_ARTIFACT_ORDER)
+            raise SelectionExportError(
+                "export.artifacts",
+                f"Export artifacts must be selected from: {choices}",
+            )
+        selected = set(requested)
+        if len(selected) != len(requested):
+            raise SelectionExportError(
+                "export.artifacts",
+                "Export artifacts must not contain duplicates",
+            )
+        return tuple(token for token in _ARTIFACT_ORDER if token in selected)
+
+    @staticmethod
+    def _export_entrypoint(entrypoint: Iterable[str] | None) -> list[str]:
+        if entrypoint is None:
+            return []
+        if isinstance(entrypoint, (str, bytes, os.PathLike)):
+            raise SelectionExportError(
+                "export.entrypoint",
+                "entrypoint must be a sequence of strings",
+            )
+        try:
+            command = list(entrypoint)
+        except TypeError as exc:
+            raise SelectionExportError(
+                "export.entrypoint",
+                "entrypoint must be a sequence of strings",
+            ) from exc
+        if any(type(item) is not str for item in command):
+            raise SelectionExportError(
+                "export.entrypoint",
+                "entrypoint must contain only strings",
+            )
+        return command
+
+    def _export_dataset_ids(
+        self,
+        preflight: SelectionPreflight,
+    ) -> dict[str, str]:
+        """Resolve catalog IDs, with stable path-stem IDs for manual fixtures."""
+
+        scenario: dict[str, Any] = {}
+        if (
+            preflight.boundary_dataset_id is None
+            or preflight.dem_dataset_id is None
+        ):
+            try:
+                candidate = self.catalog.scenario(preflight.scenario_id)
+            except (AttributeError, KeyError, TypeError, ValueError):
+                pass
+            else:
+                if isinstance(candidate, dict):
+                    scenario = candidate
+        declared = {
+            "points": preflight.profile.points_dataset_id,
+            "boundary": preflight.boundary_dataset_id
+            or scenario.get("boundary_dataset_id"),
+            "dem": preflight.dem_dataset_id or scenario.get("dem_dataset_id"),
+        }
+        paths = {
+            "points": preflight.points_path,
+            "boundary": preflight.boundary_path,
+            "dem": preflight.dem_path,
+        }
+        return {
+            role: (
+                dataset_id
+                if type(dataset_id) is str and dataset_id
+                else Path(paths[role]).stem or role
+            )
+            for role, dataset_id in declared.items()
+        }
+
+    @staticmethod
+    def _candidate_geometry(
+        preflight: SelectionPreflight,
+        candidate: Candidate,
+    ) -> Any:
+        return box(
+            candidate.left_x,
+            candidate.bottom_y,
+            candidate.left_x + preflight.profile.rect_size,
+            candidate.bottom_y + preflight.profile.rect_size,
+        )
+
+    @staticmethod
+    def _selected_stations(
+        prepared: PreparedSelection,
+        candidate: Candidate,
+    ) -> gpd.GeoDataFrame:
+        size = prepared.preflight.profile.rect_size
+        maximum_x = candidate.left_x + size
+        maximum_y = candidate.bottom_y + size
+        points = prepared.points
+        mask = (
+            (points.geometry.x >= candidate.left_x)
+            & (points.geometry.x <= maximum_x)
+            & (points.geometry.y >= candidate.bottom_y)
+            & (points.geometry.y <= maximum_y)
+        )
+        selected = points[mask].copy().reset_index(drop=True)
+        if len(selected) != candidate.point_count:
+            raise SelectionExportError(
+                "export.station_count",
+                "Selected station count does not match the completed scan candidate",
+                details={
+                    "candidate_point_count": candidate.point_count,
+                    "selected_station_count": len(selected),
+                },
+            )
+        return selected
+
+    @staticmethod
+    def _legacy_candidate(
+        preflight: SelectionPreflight,
+        candidate: Candidate,
+        geometry: Any,
+    ) -> dict[str, Any]:
+        return {
+            "geometry": geometry,
+            "flat_grid_id": candidate.flat_grid_id,
+            "pt_count": candidate.point_count,
+            "left_x": candidate.left_x,
+            "bottom_y": candidate.bottom_y,
+            "center_x": candidate.center_x,
+            "center_y": candidate.center_y,
+            "rect_size": preflight.profile.rect_size,
+        }
+
+    def export(
+        self,
+        preflight: SelectionPreflight,
+        scan_result: ScanResult,
+        candidate: Candidate,
+        *,
+        output_root: str | os.PathLike[str],
+        artifacts: Iterable[str],
+        entrypoint: Iterable[str] | None = None,
+    ) -> Path:
+        """Publish one completed-scan candidate through an atomic run staging."""
+
+        if not isinstance(preflight, SelectionPreflight):
+            raise SelectionExportError(
+                "export.request",
+                "preflight must be a SelectionPreflight",
+            )
+        if not isinstance(scan_result, ScanResult) or scan_result.completed is not True:
+            raise SelectionExportError(
+                "export.scan",
+                "export requires a completed ScanResult",
+            )
+        dataset_ids = self._export_dataset_ids(preflight)
+        if not isinstance(candidate, Candidate):
+            raise SelectionExportError(
+                "export.candidate",
+                "candidate must be a Candidate from the completed scan",
+            )
+        requested = self._export_artifacts(artifacts)
+        command = self._export_entrypoint(entrypoint)
+        try:
+            resolved_output = _resolved_output_root(self.catalog, output_root)
+        except ValueError as exc:
+            raise SelectionExportError("export.output_root", str(exc)) from exc
+        if resolved_output != preflight.output_root.resolve():
+            raise SelectionExportError(
+                "export.output_root",
+                "output_root must match the validated preflight output root",
+            )
+        matches = [
+            (index, stored)
+            for index, stored in enumerate(scan_result.candidates)
+            if stored == candidate
+        ]
+        if len(matches) != 1:
+            raise SelectionExportError(
+                "export.candidate",
+                "candidate must match exactly one completed scan candidate",
+            )
+        candidate_index, candidate = matches[0]
+        candidate_id = f"candidate-{candidate_index + 1:04d}"
+        try:
+            request = self._request(preflight.profile)
+            key = cache_key(
+                request,
+                preflight.scenario_id,
+                preflight.boundary_fingerprint,
+                preflight.points_fingerprint,
+                preflight.profile.target_crs,
+            )
+        except ValueError as exc:
+            raise SelectionExportError("export.scan", str(exc)) from exc
+        if scan_result.algorithm_version != request.algorithm_version:
+            raise SelectionExportError(
+                "export.scan",
+                "scan_result algorithm_version does not match the profile request",
+            )
+
+        try:
+            prepared = self.prepared_selection(preflight)
+            geometry = self._candidate_geometry(preflight, candidate)
+            selected = self._selected_stations(prepared, candidate)
+        except SelectionExportError:
+            raise
+        except Exception as exc:
+            raise SelectionExportError(
+                "export.inputs",
+                f"Cannot prepare selected-station inputs: {exc}",
+            ) from exc
+        try:
+            with rasterio.open(preflight.dem_path) as dem:
+                statistics = stream_dem_statistics(
+                    dem,
+                    geometry,
+                    geometry_crs=preflight.profile.target_crs,
+                )
+                selected["elevation"] = _sample_point_elevations(selected, dem)
+        except SelectionExportError:
+            raise
+        except Exception as exc:
+            raise SelectionExportError(
+                "export.elevation",
+                f"Cannot sample selected-station elevations: {exc}",
+            ) from exc
+
+        service = RunService(resolved_output)
+        run = None
+        try:
+            run = service.begin(
+                preflight.scenario_id,
+                preflight.profile.profile_id,
+            )
+            snapshot = replace(
+                preflight.profile,
+                output_root=resolved_output,
+            )
+            run_config_path = run.path / "run-config.yaml"
+            dump_profile(snapshot, run_config_path)
+            _require_nonempty_regular_file(run_config_path)
+            frame = io.build_output_dataframe(
+                selected,
+                selected.crs,
+                rect_id=1,
+                pt_count=candidate.point_count,
+                left_x=candidate.left_x,
+                bottom_y=candidate.bottom_y,
+                center_x=candidate.center_x,
+                center_y=candidate.center_y,
+                rect_size=preflight.profile.rect_size,
+                run_id=run.run_id,
+                scenario_id=preflight.scenario_id,
+                profile_id=preflight.profile.profile_id,
+                candidate_id=candidate_id,
+            )
+            selection_document = {
+                "schema_version": 1,
+                "run_id": run.run_id,
+                "scenario_id": preflight.scenario_id,
+                "profile_id": preflight.profile.profile_id,
+                "candidate_id": candidate_id,
+                "scan": {
+                    "algorithm_version": scan_result.algorithm_version,
+                    "cache_key": key,
+                    "checked_positions": scan_result.checked_positions,
+                    "total_positions": scan_result.total_positions,
+                    "completed": scan_result.completed,
+                },
+                "candidates": [
+                    {
+                        "candidate_id": candidate_id,
+                        **asdict(candidate),
+                        "bounds": list(geometry.bounds),
+                        "geometry": mapping(geometry),
+                        "dem_statistics": asdict(statistics),
+                        "selected_station_ids": frame["cell"].tolist(),
+                    }
+                ],
+            }
+            selection_path = run.path / "selection.json"
+            io.atomic_write_json(selection_path, selection_document)
+            _require_nonempty_regular_file(selection_path)
+
+            size = preflight.profile.rect_size
+            base = (
+                f"{preflight.scenario_id}_{size}m_"
+                f"target{preflight.profile.target_count}_tol{preflight.profile.tolerance}"
+            )
+            names = {
+                "csv": f"{base}.csv",
+                "preview_png": f"{base}.png",
+                "terrain_png": f"{base}_3d.png",
+                "terrain_eps": f"{base}_3d.eps",
+                "terrain_html": f"{base}_3d.html",
+            }
+            artifact_paths: dict[str, str] = {}
+            errors: list[dict[str, str]] = []
+            legacy_candidate = self._legacy_candidate(
+                preflight,
+                candidate,
+                geometry,
+            )
+            for token in requested:
+                destination = run.path / names[token]
+                temporary = _temporary_sibling(destination)
+                try:
+                    if token == "csv":
+                        frame.to_csv(temporary, index=False, encoding="utf-8-sig")
+                    elif token == "preview_png":
+                        visualization.save_preview(
+                            prepared.points,
+                            prepared.boundary,
+                            [legacy_candidate],
+                            {
+                                "rect_size": size,
+                                "boundary_layer": preflight.scenario_id,
+                                "preview_png": temporary,
+                            },
+                        )
+                    else:
+                        _render_terrain_artifact(
+                            token,
+                            temporary,
+                            rectangle=legacy_candidate,
+                            selected_points=selected,
+                            dem_path=preflight.dem_path,
+                            rectangle_size=size,
+                            target_crs=preflight.profile.target_crs,
+                        )
+                    _promote_nonempty_file(temporary, destination)
+                    artifact_paths[token] = names[token]
+                except Exception as exc:
+                    errors.append(
+                        {
+                            "artifact": token,
+                            "code": f"artifact.{token}.failed",
+                            "message": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+                finally:
+                    temporary.unlink(missing_ok=True)
+            if not artifact_paths:
+                raise SelectionExportError(
+                    "export.no_artifacts",
+                    "No requested export artifact was published",
+                    details={"errors": errors},
+                )
+            _require_nonempty_regular_file(run_config_path)
+            _require_nonempty_regular_file(selection_path)
+            profile = preflight.profile
+            metadata = {
+                "schema_version": 1,
+                "run_kind": "selection",
+                "candidate": {
+                    "candidate_id": candidate_id,
+                    "flat_grid_id": candidate.flat_grid_id,
+                    "point_count": candidate.point_count,
+                    "center_x": candidate.center_x,
+                    "center_y": candidate.center_y,
+                },
+                "scanner": {
+                    "algorithm_version": scan_result.algorithm_version,
+                    "checked_positions": scan_result.checked_positions,
+                    "total_positions": scan_result.total_positions,
+                },
+                "cache": {
+                    "schema_version": CACHE_SCHEMA_VERSION,
+                    "key": key,
+                },
+                "inputs": {
+                    "points": {
+                        "dataset_id": dataset_ids["points"],
+                        "fingerprint": preflight.points_fingerprint,
+                    },
+                    "boundary": {
+                        "dataset_id": dataset_ids["boundary"],
+                        "fingerprint": preflight.boundary_fingerprint,
+                    },
+                    "dem": {
+                        "dataset_id": dataset_ids["dem"],
+                        "fingerprint": preflight.dem_fingerprint,
+                    },
+                },
+                "parameters": {
+                    "target_crs": profile.target_crs,
+                    "rectangle_size_m": profile.rect_size,
+                    "target_base_station_count": profile.target_count,
+                    "count_tolerance": profile.tolerance,
+                    "scan_mode": profile.scan_mode,
+                    "strategy": profile.strategy,
+                    "step_m": profile.scan_step,
+                    "max_candidates": profile.max_rects,
+                    "minimum_center_spacing_m": profile.min_spacing,
+                    "random_seed": profile.random_seed,
+                },
+                "sidecars": {
+                    "config": "run-config.yaml",
+                    "selection": "selection.json",
+                    "compatibility_records": [],
+                },
+                "requested_artifacts": list(requested),
+                "artifact_paths": dict(artifact_paths),
+                "git_commit": io._git_commit(Path(self.catalog.root).resolve()),
+                "software_versions": io.software_versions(),
+                "entrypoint": command,
+            }
+            status = "completed" if not errors else "partial"
+            return service.publish(
+                run,
+                status=status,
+                artifacts=artifact_paths.values(),
+                metadata=metadata,
+                errors=errors,
+            )
+        except Exception as exc:
+            if run is not None:
+                try:
+                    service.abandon(run)
+                except Exception as cleanup_error:
+                    exc.add_note(f"Run staging cleanup also failed: {cleanup_error}")
+            if isinstance(exc, SelectionExportError):
+                raise
+            raise SelectionExportError(
+                "export.failed",
+                f"Selected candidate export failed: {exc}",
+            ) from exc
+
     def candidate_statistics(
         self,
         preflight: SelectionPreflight,
@@ -735,9 +1310,11 @@ class SelectionService:
 
 __all__ = [
     "DemStatistics",
+    "EXPORT_ARTIFACTS",
     "PreparedSelection",
     "SCANNER_ALGORITHM_VERSION",
     "SelectionError",
+    "SelectionExportError",
     "SelectionPreflight",
     "SelectionPreflightError",
     "SelectionProgress",

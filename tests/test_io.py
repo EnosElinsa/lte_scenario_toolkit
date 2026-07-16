@@ -53,6 +53,52 @@ def test_build_output_dataframe_contains_reproducible_scenario_fields():
     assert frame.loc[0, "elevation"] == 12.5
 
 
+def test_build_output_dataframe_adds_optional_traceability_without_legacy_regression():
+    selected = gpd.GeoDataFrame(
+        {"cell": [10], "elevation": [12.5]},
+        geometry=[Point(100, 200)],
+        crs="EPSG:3857",
+    )
+    arguments = {
+        "rect_id": 1,
+        "pt_count": 1,
+        "left_x": 0,
+        "bottom_y": 0,
+        "center_x": 500,
+        "center_y": 500,
+        "rect_size": 1000,
+    }
+
+    legacy = build_output_dataframe(selected, selected.crs, **arguments)
+    traced = build_output_dataframe(
+        selected,
+        selected.crs,
+        **arguments,
+        run_id="a" * 32,
+        scenario_id="chicago",
+        profile_id="chicago-default",
+        candidate_id="candidate-0001",
+    )
+
+    assert traced.columns.tolist() == legacy.columns.tolist() + [
+        "run_id",
+        "scenario_id",
+        "profile_id",
+        "candidate_id",
+    ]
+    assert traced.loc[0, [
+        "run_id",
+        "scenario_id",
+        "profile_id",
+        "candidate_id",
+    ]].tolist() == [
+        "a" * 32,
+        "chicago",
+        "chicago-default",
+        "candidate-0001",
+    ]
+
+
 def test_dataset_record_includes_sha256_and_spatial_metadata(tmp_path):
     source = tmp_path / "data.bin"
     source.write_bytes(b"abc")
@@ -70,6 +116,19 @@ def test_dataset_record_includes_sha256_and_spatial_metadata(tmp_path):
     assert record["size_bytes"] == 3
     assert record["crs"] == "EPSG:3857"
     assert record["resolution_m"] == 1
+
+
+def test_git_commit_is_none_when_git_executable_is_unavailable(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        io_module.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(FileNotFoundError("git")),
+    )
+
+    assert io_module._git_commit(tmp_path) is None
 
 
 def test_write_run_record_captures_config_inputs_outputs_and_versions(tmp_path):
