@@ -584,6 +584,12 @@ def test_schema_v2_linked_profile_uses_catalog_owned_boundary_and_dem(tmp_path):
     assert not any(message.code.startswith("config.") for message in report.messages)
     assert not (tmp_path / "results").exists()
 
+    points_dbf = tmp_path / "points_shp" / "points" / "points.dbf"
+    points_dbf.write_bytes(points_dbf.read_bytes() + b"drift")
+    drifted = validate_scenario_data(catalog, "city", dataset_ids=("points",))
+    assert not drifted.ok
+    assert any(message.code == "manifest.size" for message in drifted.messages)
+
 
 def test_validate_cli_single_all_and_argument_errors(tmp_path, capsys):
     catalog_path, _ = _write_catalog(tmp_path, second_city=True)

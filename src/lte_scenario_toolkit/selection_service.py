@@ -23,12 +23,13 @@ from .candidate_cache import CandidateCache, cache_key
 from .candidate_scanner import (
     Candidate,
     ScanCancelled,
+    ScanProgress,
     ScanRequest,
     ScanResult,
     scan_candidates,
 )
 from .data_validation import validate_scenario_data
-from .profiles import ExperimentProfile
+from .profiles import ExperimentProfile, validate_profile
 from .spatial import prepare_spatial_data
 
 SCANNER_ALGORITHM_VERSION = "row-sweep-v1"
@@ -54,6 +55,14 @@ class SelectionPreflightError(SelectionError):
     """Raised when selection inputs cannot pass the read-only preflight."""
 
 
+class SelectionScanError(SelectionError):
+    """Raised when a candidate scan cannot produce a reusable result."""
+
+
+class SelectionStatisticsError(SelectionError):
+    """Raised when exact candidate DEM statistics cannot be computed."""
+
+
 @dataclass(frozen=True)
 class DemStatistics:
     minimum: float
@@ -74,6 +83,41 @@ class SelectionPreflight:
     boundary_fingerprint: str
     points_fingerprint: str
     dem_fingerprint: str
+
+
+@dataclass(frozen=True)
+class SelectionProgress:
+    """Cache-aware immutable progress emitted by the selection service."""
+
+    phase: str
+    checked_positions: int
+    total_positions: int
+    candidate_count: int
+    elapsed_seconds: float
+    added_candidates: tuple[Candidate, ...]
+    removed_flat_grid_ids: tuple[int, ...]
+    cache_status: str
+    cache_key: str
+
+    @classmethod
+    def from_scan(
+        cls,
+        event: ScanProgress,
+        *,
+        cache_status: str,
+        cache_key: str,
+    ) -> SelectionProgress:
+        return cls(
+            phase=event.phase,
+            checked_positions=event.checked_positions,
+            total_positions=event.total_positions,
+            candidate_count=event.candidate_count,
+            elapsed_seconds=event.elapsed_seconds,
+            added_candidates=event.added_candidates,
+            removed_flat_grid_ids=event.removed_flat_grid_ids,
+            cache_status=cache_status,
+            cache_key=cache_key,
+        )
 
 
 def _canonical_fingerprint(value: Any) -> str:
@@ -162,7 +206,9 @@ def _resolved_output_root(catalog: Any, output_root: str | os.PathLike[str]) -> 
     if not path.is_absolute():
         path = Path(catalog.root).resolve() / path
     path = path.resolve()
-    writable = path if path.exists() else path.parent
+    writable = path
+    while not writable.exists() and writable != writable.parent:
+        writable = writable.parent
     if not writable.is_dir():
         raise ValueError(f"Output root parent is not a directory: {writable}")
     if not os.access(writable, os.W_OK):
@@ -300,6 +346,13 @@ class SelectionService:
                 "profile must be an ExperimentProfile",
             )
         try:
+            validate_profile(profile)
+        except ValueError as exc:
+            raise SelectionPreflightError(
+                "profile.invalid",
+                str(exc),
+            ) from exc
+        try:
             _target_crs(profile.target_crs)
         except ValueError as exc:
             raise SelectionPreflightError(
@@ -307,21 +360,6 @@ class SelectionService:
                 str(exc),
                 details={"target_crs": profile.target_crs},
             ) from exc
-        try:
-            report = validate_scenario_data(self.catalog, scenario_id)
-        except Exception as exc:
-            raise SelectionPreflightError(
-                "scenario.validation_failed",
-                f"Scenario data validation could not run: {exc}",
-                details={"scenario_id": scenario_id},
-            ) from exc
-        if getattr(report, "status", status) != "ready" or not report.ok:
-            raise SelectionPreflightError(
-                "scenario.validation_failed",
-                _validation_error(report),
-                details={"scenario_id": scenario_id},
-            )
-
         try:
             scenario = self.catalog.scenario(scenario_id)
         except Exception as exc:
@@ -407,6 +445,25 @@ class SelectionService:
             ) from exc
 
         try:
+            report = validate_scenario_data(
+                self.catalog,
+                scenario_id,
+                dataset_ids=(profile.points_dataset_id,),
+            )
+        except Exception as exc:
+            raise SelectionPreflightError(
+                "scenario.validation_failed",
+                f"Scenario data validation could not run: {exc}",
+                details={"scenario_id": scenario_id},
+            ) from exc
+        if getattr(report, "status", status) != "ready" or not report.ok:
+            raise SelectionPreflightError(
+                "scenario.validation_failed",
+                _validation_error(report),
+                details={"scenario_id": scenario_id},
+            )
+
+        try:
             records = _manifest_records(self.catalog)
             boundary_fingerprint = _dataset_fingerprint(records, boundary_id)
             points_fingerprint = _dataset_fingerprint(
@@ -464,39 +521,128 @@ class SelectionService:
         """Load or compute a completed candidate scan through the shared cache."""
 
         if not isinstance(preflight, SelectionPreflight):
-            raise ValueError("preflight must be a SelectionPreflight")
-        if cancel is not None and cancel.is_set():
+            raise SelectionScanError(
+                "scan.request",
+                "preflight must be a SelectionPreflight",
+            )
+        try:
+            cancelled = cancel is not None and cancel.is_set()
+        except Exception as exc:
+            raise SelectionScanError(
+                "scan.request",
+                "cancel must expose is_set()",
+            ) from exc
+        if cancelled:
             raise ScanCancelled("Candidate scan was cancelled")
-        points = gpd.read_file(preflight.points_path)
-        boundaries = gpd.read_file(preflight.boundary_path)
-        _, boundary, coordinates = prepare_spatial_data(
-            points,
-            boundaries,
-            target_crs=preflight.profile.target_crs,
-        )
-        request = self._request(preflight.profile)
-        key = cache_key(
-            request,
-            preflight.scenario_id,
-            preflight.boundary_fingerprint,
-            preflight.points_fingerprint,
-            preflight.profile.target_crs,
-        )
+        try:
+            points = gpd.read_file(preflight.points_path)
+            boundaries = gpd.read_file(preflight.boundary_path)
+            _, boundary, coordinates = prepare_spatial_data(
+                points,
+                boundaries,
+                target_crs=preflight.profile.target_crs,
+            )
+        except Exception as exc:
+            raise SelectionScanError(
+                "scan.inputs",
+                f"Cannot load selection vector inputs: {exc}",
+                details={
+                    "points_path": str(preflight.points_path),
+                    "boundary_path": str(preflight.boundary_path),
+                },
+            ) from exc
+        try:
+            request = self._request(preflight.profile)
+            key = cache_key(
+                request,
+                preflight.scenario_id,
+                preflight.boundary_fingerprint,
+                preflight.points_fingerprint,
+                preflight.profile.target_crs,
+            )
+        except ValueError as exc:
+            raise SelectionScanError(
+                "scan.request",
+                str(exc),
+            ) from exc
         if not force:
-            cached = self.cache.load(key, request)
+            try:
+                cached = self.cache.load(key, request)
+            except (OSError, ValueError) as exc:
+                raise SelectionScanError(
+                    "scan.cache",
+                    f"Candidate cache read failed: {exc}",
+                    details={"cache_key": key},
+                ) from exc
             if cached is not None:
                 if cancel is not None and cancel.is_set():
                     raise ScanCancelled("Candidate scan was cancelled")
+                if progress is not None:
+                    progress(
+                        SelectionProgress(
+                            phase="completed",
+                            checked_positions=cached.checked_positions,
+                            total_positions=cached.total_positions,
+                            candidate_count=len(cached.candidates),
+                            elapsed_seconds=0.0,
+                            added_candidates=cached.candidates,
+                            removed_flat_grid_ids=(),
+                            cache_status="hit",
+                            cache_key=key,
+                        )
+                    )
                 return cached
-        result = scan_candidates(
-            request,
-            boundary,
-            coordinates,
-            progress=progress,
-            cancel=cancel,
-        )
+        cache_status = "forced" if force else "miss"
+        if progress is not None:
+            progress(
+                SelectionProgress(
+                    phase="cache",
+                    checked_positions=0,
+                    total_positions=0,
+                    candidate_count=0,
+                    elapsed_seconds=0.0,
+                    added_candidates=(),
+                    removed_flat_grid_ids=(),
+                    cache_status=cache_status,
+                    cache_key=key,
+                )
+            )
+
+        def forward_progress(event: ScanProgress) -> None:
+            if progress is not None:
+                progress(
+                    SelectionProgress.from_scan(
+                        event,
+                        cache_status=cache_status,
+                        cache_key=key,
+                    )
+                )
+
+        try:
+            result = scan_candidates(
+                request,
+                boundary,
+                coordinates,
+                progress=forward_progress if progress is not None else None,
+                cancel=cancel,
+            )
+        except ScanCancelled:
+            raise
+        except (OSError, ValueError) as exc:
+            raise SelectionScanError(
+                "scan.failed",
+                f"Candidate scan failed: {exc}",
+                details={"cache_key": key},
+            ) from exc
         if result.completed:
-            self.cache.store(key, request, result)
+            try:
+                self.cache.store(key, request, result)
+            except (OSError, ValueError) as exc:
+                raise SelectionScanError(
+                    "scan.cache",
+                    f"Candidate cache write failed: {exc}",
+                    details={"cache_key": key},
+                ) from exc
         return result
 
     def candidate_statistics(
@@ -507,21 +653,37 @@ class SelectionService:
         """Compute exact native-resolution DEM statistics for one candidate."""
 
         if not isinstance(preflight, SelectionPreflight):
-            raise ValueError("preflight must be a SelectionPreflight")
+            raise SelectionStatisticsError(
+                "statistics.request",
+                "preflight must be a SelectionPreflight",
+            )
         if not isinstance(candidate, Candidate):
-            raise ValueError("candidate must be a Candidate")
+            raise SelectionStatisticsError(
+                "statistics.request",
+                "candidate must be a Candidate",
+            )
         geometry = box(
             candidate.left_x,
             candidate.bottom_y,
             candidate.left_x + preflight.profile.rect_size,
             candidate.bottom_y + preflight.profile.rect_size,
         )
-        with rasterio.open(preflight.dem_path) as dem:
-            return stream_dem_statistics(
-                dem,
-                geometry,
-                geometry_crs=preflight.profile.target_crs,
-            )
+        try:
+            with rasterio.open(preflight.dem_path) as dem:
+                return stream_dem_statistics(
+                    dem,
+                    geometry,
+                    geometry_crs=preflight.profile.target_crs,
+                )
+        except Exception as exc:
+            raise SelectionStatisticsError(
+                "statistics.failed",
+                f"Cannot compute candidate DEM statistics: {exc}",
+                details={
+                    "candidate_flat_grid_id": candidate.flat_grid_id,
+                    "dem_path": str(preflight.dem_path),
+                },
+            ) from exc
 
 
 __all__ = [
@@ -530,6 +692,9 @@ __all__ = [
     "SelectionError",
     "SelectionPreflight",
     "SelectionPreflightError",
+    "SelectionProgress",
+    "SelectionScanError",
     "SelectionService",
+    "SelectionStatisticsError",
     "stream_dem_statistics",
 ]

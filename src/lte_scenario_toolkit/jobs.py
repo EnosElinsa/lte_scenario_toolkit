@@ -72,6 +72,7 @@ class JobCoordinator:
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lte-job")
         self._active: Job | None = None
         self._shutdown = False
+        self._shutdown_complete = Event()
 
     @staticmethod
     def _validate_kind(kind: Any) -> str:
@@ -171,14 +172,22 @@ class JobCoordinator:
 
         with self._lock:
             if self._shutdown:
-                return
-            self._shutdown = True
-            active = self._active
-            if active is not None:
-                active.cancel_event.set()
-        self._executor.shutdown(wait=True, cancel_futures=True)
-        with self._lock:
-            self._active = None
+                owns_shutdown = False
+            else:
+                self._shutdown = True
+                owns_shutdown = True
+                active = self._active
+                if active is not None:
+                    active.cancel_event.set()
+        if not owns_shutdown:
+            self._shutdown_complete.wait()
+            return
+        try:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+        finally:
+            with self._lock:
+                self._active = None
+            self._shutdown_complete.set()
 
 
 __all__ = [

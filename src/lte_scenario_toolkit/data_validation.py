@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
@@ -480,6 +481,7 @@ def _validate_manifest(
     report: ValidationReport,
     *,
     full_checksum: bool,
+    dataset_ids: tuple[str, ...] = (),
 ) -> dict[str, dict[str, Any]]:
     """Read and validate the schema-v2 manifest, returning indexed records."""
 
@@ -565,6 +567,39 @@ def _validate_manifest(
                     require_entrypoint=True,
                     shape_valid=shape_valid.get(dem_id, False),
                 )
+
+    scenario_dataset_ids = {boundary_id}
+    if dem is not None:
+        scenario_dataset_ids.add(dem.get("dataset_id"))
+    for dataset_id in dataset_ids:
+        if dataset_id in scenario_dataset_ids:
+            continue
+        dataset = catalog.datasets_by_id.get(dataset_id)
+        if dataset is None:
+            _error(
+                report,
+                "manifest.dataset",
+                f"Catalog is missing requested dataset: {dataset_id}",
+            )
+            continue
+        record = records.get(dataset_id)
+        if record is None:
+            _error(
+                report,
+                "manifest.dataset",
+                f"Manifest is missing requested dataset: {dataset_id}",
+            )
+            continue
+        entrypoint = catalog.resolve(dataset.get("entrypoint", ""))
+        _manifest_record(
+            catalog,
+            dataset,
+            record,
+            report,
+            full_checksum=full_checksum,
+            require_entrypoint=entrypoint.is_file(),
+            shape_valid=shape_valid.get(dataset_id, False),
+        )
     return records
 
 
@@ -685,8 +720,20 @@ def validate_scenario_data(
     scenario_id: str,
     *,
     full_checksum: bool = False,
+    dataset_ids: Iterable[str] = (),
 ) -> ValidationReport:
     """Validate one registered scenario in fast or full-checksum mode."""
+
+    if isinstance(dataset_ids, (str, bytes)):
+        raise ValueError("dataset_ids must be an iterable of dataset IDs")
+    try:
+        requested_dataset_ids = tuple(dataset_ids)
+    except TypeError as exc:
+        raise ValueError("dataset_ids must be an iterable of dataset IDs") from exc
+    for dataset_id in requested_dataset_ids:
+        if type(dataset_id) is not str or not dataset_id:
+            raise ValueError("dataset_ids must contain non-empty strings")
+    requested_dataset_ids = tuple(dict.fromkeys(requested_dataset_ids))
 
     scenario = catalog.scenario(scenario_id)
     status = catalog.scenario_status(scenario_id)
@@ -701,6 +748,7 @@ def validate_scenario_data(
         dem,
         report,
         full_checksum=full_checksum,
+        dataset_ids=requested_dataset_ids,
     )
     _validate_dem(catalog, scenario, boundary_path, report)
     _validate_config(catalog, scenario, boundary, dem, report)

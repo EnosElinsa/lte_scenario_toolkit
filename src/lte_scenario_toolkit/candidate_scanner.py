@@ -122,6 +122,12 @@ class ScanResult:
 class ScanCancelled(RuntimeError):
     """Raised instead of returning a partial result when cancellation is requested."""
 
+    code = "scan.cancelled"
+
+    def __init__(self, message: str = "Candidate scan was cancelled") -> None:
+        super().__init__(message)
+        self.details: dict[str, Any] = {}
+
 
 def _positive_finite_dimension(value: Any, *, field: str) -> float:
     message = f"{field} must be a finite number greater than zero"

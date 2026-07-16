@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from threading import Event
+from threading import Barrier, Event, Thread
 
 import pytest
 
@@ -128,3 +128,71 @@ def test_shutdown_cancels_running_worker_and_rejects_new_jobs():
         coordinator.start("figure")
     assert captured.value.code == "job.coordinator_closed"
     assert captured.value.details == {}
+
+
+def test_concurrent_shutdown_callers_both_wait_for_the_worker():
+    coordinator = JobCoordinator()
+    worker_started = Event()
+    release_worker = Event()
+    second_returned = Event()
+    errors = []
+
+    def worker(cancel, emit):
+        del cancel, emit
+        worker_started.set()
+        assert release_worker.wait(timeout=2)
+
+    job = coordinator.submit("scan", worker)
+    assert worker_started.wait(timeout=1)
+
+    first = Thread(target=lambda: coordinator.shutdown())
+
+    def second_shutdown():
+        try:
+            coordinator.shutdown()
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+        finally:
+            second_returned.set()
+
+    second = Thread(target=second_shutdown)
+    first.start()
+    assert job.cancel_event.wait(timeout=1)
+    second.start()
+    try:
+        assert not second_returned.wait(timeout=0.1)
+    finally:
+        release_worker.set()
+        first.join(timeout=2)
+        second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert job.future is not None and job.future.done()
+
+
+def test_simultaneous_start_has_exactly_one_winner():
+    coordinator = JobCoordinator()
+    barrier = Barrier(3)
+    jobs = []
+    busy = []
+
+    def reserve(kind):
+        barrier.wait(timeout=1)
+        try:
+            jobs.append(coordinator.start(kind))
+        except JobBusyError as exc:
+            busy.append(exc)
+
+    threads = [Thread(target=reserve, args=(kind,)) for kind in ("scan", "figure")]
+    for thread in threads:
+        thread.start()
+    barrier.wait(timeout=1)
+    for thread in threads:
+        thread.join(timeout=1)
+
+    assert len(jobs) == 1
+    assert len(busy) == 1
+    assert coordinator.finish(jobs[0].job_id) is True
+    coordinator.shutdown()

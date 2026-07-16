@@ -346,6 +346,14 @@ def _validate_profile(profile: ExperimentProfile) -> ExperimentProfile:
     return profile
 
 
+def validate_profile(profile: ExperimentProfile) -> ExperimentProfile:
+    """Validate an in-memory profile, including directly constructed values."""
+
+    if not isinstance(profile, ExperimentProfile):
+        raise ValueError("profile must be an ExperimentProfile")
+    return _validate_profile(profile)
+
+
 def _profile_repository(path: Path) -> Path:
     for parent in path.parents:
         if parent.name.casefold() == "configs":

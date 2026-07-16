@@ -14,12 +14,18 @@ from rasterio.io import MemoryFile
 from rasterio.transform import from_origin
 from shapely.geometry import Point, box
 
-from lte_scenario_toolkit.candidate_scanner import Candidate, ScanCancelled
+from lte_scenario_toolkit.candidate_scanner import (
+    Candidate,
+    ScanCancelled,
+)
 from lte_scenario_toolkit.profiles import ExperimentProfile, FigureSettings, OutputSettings
 from lte_scenario_toolkit.selection_service import (
     SelectionPreflight,
     SelectionPreflightError,
+    SelectionProgress,
+    SelectionScanError,
     SelectionService,
+    SelectionStatisticsError,
     stream_dem_statistics,
 )
 
@@ -69,6 +75,54 @@ def test_preflight_rejects_nonready_scenario_without_output_creation(tmp_path):
         "status": "dem-pending",
     }
     assert not output.exists()
+
+
+def test_preflight_validates_directly_constructed_profile_before_io(tmp_path):
+    class ReadyCatalog:
+        root = tmp_path
+
+        @staticmethod
+        def scenario_status(scenario_id):
+            assert scenario_id == "chicago"
+            return "ready"
+
+    with pytest.raises(SelectionPreflightError) as captured:
+        SelectionService(ReadyCatalog()).preflight(
+            _profile(tmp_path, rect_size=0),
+            output_root=tmp_path / "output",
+        )
+
+    assert captured.value.code == "profile.invalid"
+    assert "greater than zero" in str(captured.value)
+
+
+def test_preflight_maps_unknown_points_dataset_to_profile_field(tmp_path):
+    class Catalog:
+        root = tmp_path
+
+        @staticmethod
+        def scenario_status(scenario_id):
+            return "ready"
+
+        @staticmethod
+        def scenario(scenario_id):
+            return {
+                "scenario_id": scenario_id,
+                "boundary_dataset_id": "boundary",
+                "dem_dataset_id": "dem",
+            }
+
+        @staticmethod
+        def dataset(dataset_id):
+            raise KeyError(dataset_id)
+
+    with pytest.raises(SelectionPreflightError) as captured:
+        SelectionService(Catalog()).preflight(
+            _profile(tmp_path, points_dataset_id="missing-points"),
+            output_root=tmp_path / "output",
+        )
+
+    assert captured.value.code == "inputs.points_dataset_id"
 
 
 def test_preflight_resolves_catalog_inputs_and_manifest_fingerprints(
@@ -152,7 +206,11 @@ def test_preflight_resolves_catalog_inputs_and_manifest_fingerprints(
     (data_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     monkeypatch.setattr(
         "lte_scenario_toolkit.selection_service.validate_scenario_data",
-        lambda catalog, scenario_id: SimpleNamespace(ok=True, status="ready", messages=[]),
+        lambda catalog, scenario_id, **kwargs: SimpleNamespace(
+            ok=True,
+            status="ready",
+            messages=[],
+        ),
     )
     output = tmp_path / "output"
 
@@ -168,6 +226,14 @@ def test_preflight_resolves_catalog_inputs_and_manifest_fingerprints(
     assert len(preflight.boundary_fingerprint) == 64
     assert len(preflight.dem_fingerprint) == 64
     assert not output.exists()
+
+    nested_output = tmp_path / "new" / "nested" / "output"
+    nested = SelectionService(Catalog()).preflight(
+        _profile(tmp_path),
+        output_root=nested_output,
+    )
+    assert nested.output_root == nested_output.resolve()
+    assert not (tmp_path / "new").exists()
 
     occupied_parent = tmp_path / "occupied"
     occupied_parent.write_text("not a directory", encoding="utf-8")
@@ -321,20 +387,34 @@ def test_scan_uses_shared_cache_and_force_bypasses_reads(tmp_path, monkeypatch):
     )
     service = SelectionService(SimpleNamespace(root=tmp_path))
 
-    first = service.scan(preflight)
+    miss_events: list[SelectionProgress] = []
+    first = service.scan(preflight, progress=miss_events.append)
+    assert miss_events
+    assert {event.cache_status for event in miss_events} == {"miss"}
+    assert all(event.cache_key for event in miss_events)
     monkeypatch.setattr(
         "lte_scenario_toolkit.selection_service.scan_candidates",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("cache miss")),
     )
-    second = service.scan(preflight)
+    hit_events: list[SelectionProgress] = []
+    second = service.scan(preflight, progress=hit_events.append)
 
     assert second == first
+    assert len(hit_events) == 1
+    assert hit_events[0].cache_status == "hit"
+    assert hit_events[0].cache_key == miss_events[0].cache_key
     cancel = Event()
     cancel.set()
-    with pytest.raises(ScanCancelled):
+    with pytest.raises(ScanCancelled) as captured:
         service.scan(preflight, cancel=cancel)
+    assert captured.value.code == "scan.cancelled"
     with pytest.raises(AssertionError, match="cache miss"):
         service.scan(preflight, force=True)
+
+    missing_points = replace(preflight, points_path=tmp_path / "missing.geojson")
+    with pytest.raises(SelectionScanError) as captured:
+        service.scan(missing_points)
+    assert captured.value.code == "scan.inputs"
 
 
 def test_candidate_statistics_uses_candidate_bounds_and_profile_crs(tmp_path):
@@ -371,3 +451,11 @@ def test_candidate_statistics_uses_candidate_bounds_and_profile_crs(tmp_path):
 
     assert stats.valid_pixel_count == 4
     assert stats.mean == pytest.approx((9 + 10 + 13 + 14) / 4)
+
+    missing_dem = replace(preflight, dem_path=tmp_path / "missing.tif")
+    with pytest.raises(SelectionStatisticsError) as captured:
+        SelectionService(SimpleNamespace(root=tmp_path)).candidate_statistics(
+            missing_dem,
+            Candidate(0, 1, 0, 0, 1, 1),
+        )
+    assert captured.value.code == "statistics.failed"

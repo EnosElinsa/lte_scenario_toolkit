@@ -15,11 +15,11 @@ import rasterio
 from shapely.geometry import box
 
 from . import io, scenario, spatial, terrain, visualization
-from .candidate_scanner import Candidate
+from .candidate_scanner import Candidate, ScanResult
 from .config import load_experiment_config
 from .data_catalog import CatalogError, DataCatalog, load_data_catalog
 from .profiles import ExperimentProfile, FigureSettings, OutputSettings, load_profile
-from .selection_service import SelectionPreflight, SelectionService
+from .selection_service import SelectionPreflight, SelectionProgress, SelectionService
 
 
 def _points_dataset_id(catalog: DataCatalog, points_path: Path) -> str:
@@ -132,6 +132,19 @@ def _profile_selection_io_paths(
         "output_3d_html": output_dir / f"{base_name}_3d.html",
         "preview_png": output_dir / f"{base_name}.png",
     }
+
+
+def _shared_cache_message(result: ScanResult, progress: SelectionProgress) -> str:
+    """Return the legacy hit/miss message for the shared cache location."""
+
+    if progress.cache_status not in {"hit", "miss", "forced"}:
+        raise ValueError("Selection scan did not report a cache status")
+    if progress.cache_key is None:
+        raise ValueError("Selection scan did not report a cache key")
+    cache_name = f"{progress.cache_key}.json"
+    if progress.cache_status == "hit":
+        return f"Loaded {len(result.candidates)} cached candidates: {cache_name}"
+    return f"Saved {len(result.candidates)} candidates: {cache_name}"
 
 
 def _linked_catalog_scenario(
@@ -343,7 +356,16 @@ def main(argv=None) -> int:
     print(f"DEM: {config['dem_path']}")
     print(f"Output: {config['output_dir']}")
     try:
-        scan_result = selection_service.scan(preflight)
+        cache_progress: SelectionProgress | None = None
+
+        def capture_progress(event: SelectionProgress) -> None:
+            nonlocal cache_progress
+            if event.cache_status is not None:
+                cache_progress = event
+
+        scan_result = selection_service.scan(preflight, progress=capture_progress)
+        if cache_progress is None:
+            raise ValueError("Selection scan did not report cache status")
         points_gdf, boundary, coordinates = spatial.load_and_prepare(config)
     except (ValueError, FileNotFoundError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -352,7 +374,7 @@ def main(argv=None) -> int:
         _legacy_result(candidate, config["rect_size"])
         for candidate in scan_result.candidates
     ]
-    print(f"Loaded {len(results)} candidates from the shared candidate cache")
+    print(_shared_cache_message(scan_result, cache_progress))
 
     scenario.verify_results(results, coordinates, config["rect_size"])
     if args.select_index is None:

@@ -1,17 +1,22 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 import pytest
+import rasterio
 import yaml
 from rasterio.io import MemoryFile
 from rasterio.transform import from_origin
 from shapely.geometry import Point, box
 
 from lte_scenario_toolkit import select_sites
+from lte_scenario_toolkit.candidate_scanner import Candidate, ScanResult
 from lte_scenario_toolkit.config import load_experiment_config
 from lte_scenario_toolkit.data_catalog import load_data_catalog
 from lte_scenario_toolkit.select_sites import process_selected_rectangles
+from lte_scenario_toolkit.selection_service import SelectionProgress
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -318,6 +323,177 @@ def test_process_selected_rectangles_samples_dem_and_builds_csv_rows():
     assert frame["elevation"].tolist() == [12.0]
     assert frame["rect_id"].tolist() == [1]
     assert selected.crs.to_epsg() == 3857
+
+
+@pytest.mark.parametrize(
+    ("cache_status", "prefix"),
+    [("hit", "Loaded 1 cached candidates:"), ("miss", "Saved 1 candidates:")],
+)
+def test_shared_cache_message_preserves_legacy_loaded_and_saved_text(
+    cache_status,
+    prefix,
+):
+    candidate = Candidate(0, 1, 0, 0, 1, 1)
+    result = ScanResult((candidate,), 1, 1, True, "row-sweep-v1")
+    progress = SelectionProgress(
+        phase="completed",
+        checked_positions=1,
+        total_positions=1,
+        candidate_count=1,
+        elapsed_seconds=0,
+        added_candidates=(candidate,),
+        removed_flat_grid_ids=(),
+        cache_status=cache_status,
+        cache_key="a" * 64,
+    )
+
+    message = select_sites._shared_cache_message(result, progress)
+
+    assert message.startswith(prefix)
+    assert message.endswith(f"{'a' * 64}.json")
+
+
+@pytest.mark.parametrize(
+    ("cache_status", "expected"),
+    [("hit", "Loaded 1 cached candidates:"), ("miss", "Saved 1 candidates:")],
+)
+def test_main_reports_the_legacy_shared_cache_message_on_success(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    cache_status,
+    expected,
+):
+    output = tmp_path / "output"
+    config_path = tmp_path / "profile.yaml"
+    config_path.write_text("profile", encoding="utf-8")
+    dem_path = tmp_path / "dem.tif"
+    with rasterio.open(
+        dem_path,
+        "w",
+        driver="GTiff",
+        width=2,
+        height=2,
+        count=1,
+        dtype="float32",
+        crs="EPSG:3857",
+        transform=from_origin(0, 2, 1, 1),
+    ) as dem:
+        dem.write(np.ones((2, 2), dtype="float32"), 1)
+    config = {
+        "repo_root": tmp_path,
+        "config_path": config_path,
+        "output_root": output,
+        "rect_size": 2,
+        "target_count": 1,
+        "tolerance": 0,
+        "scan_step": 1,
+        "max_rects": 1,
+        "min_spacing": 2,
+        "strategy": "sequential",
+        "random_seed": 7,
+        "target_crs": "EPSG:3857",
+        "save_csv": False,
+        "save_preview_png": False,
+        "save_terrain_png": False,
+        "save_terrain_eps": False,
+        "save_terrain_html": False,
+    }
+    points_path = tmp_path / "points.geojson"
+    boundary_path = tmp_path / "boundary.geojson"
+    paths = {
+        "registered_scenario_id": "chicago",
+        "output_dir": output,
+        "output_csv": output / "scenario.csv",
+        "output_3d_png": output / "terrain.png",
+        "output_3d_html": output / "terrain.html",
+        "preview_png": output / "preview.png",
+        "points_shp": points_path,
+        "boundary_shp": boundary_path,
+        "dem_path": dem_path,
+        "boundary_folder": "Chicago",
+        "boundary_layer": "Chicago_Boundary",
+    }
+    candidate = Candidate(0, 1, 0, 0, 1, 1)
+    scan_result = ScanResult((candidate,), 1, 1, True, "row-sweep-v1")
+    preflight = SimpleNamespace(
+        points_path=points_path,
+        boundary_path=boundary_path,
+        dem_path=dem_path,
+    )
+
+    class Service:
+        @staticmethod
+        def preflight(profile, output_root):
+            del profile
+            assert output_root == output
+            return preflight
+
+        @staticmethod
+        def scan(received, *, progress):
+            assert received is preflight
+            progress(
+                SelectionProgress(
+                    phase="completed",
+                    checked_positions=1,
+                    total_positions=1,
+                    candidate_count=1,
+                    elapsed_seconds=0,
+                    added_candidates=(candidate,),
+                    removed_flat_grid_ids=(),
+                    cache_status=cache_status,
+                    cache_key="a" * 64,
+                )
+            )
+            return scan_result
+
+    points = gpd.GeoDataFrame(
+        {"cell": [1]},
+        geometry=[Point(1, 1)],
+        crs="EPSG:3857",
+    )
+    monkeypatch.setattr(select_sites, "load_experiment_config", lambda *args, **kwargs: config)
+    monkeypatch.setattr(
+        select_sites,
+        "resolve_selection_io_paths",
+        lambda received, *, create_output: paths,
+    )
+    monkeypatch.setattr(select_sites, "load_data_catalog", lambda *args, **kwargs: object())
+    monkeypatch.setattr(select_sites, "_selection_profile", lambda *args: object())
+    monkeypatch.setattr(select_sites, "SelectionService", lambda catalog: Service())
+    monkeypatch.setattr(
+        select_sites.spatial,
+        "load_and_prepare",
+        lambda received: (points, box(0, 0, 2, 2), np.asarray([[1.0, 1.0]])),
+    )
+    monkeypatch.setattr(select_sites.scenario, "verify_results", lambda *args: None)
+    monkeypatch.setattr(
+        select_sites.scenario,
+        "choose_result",
+        lambda results, index: [results[index - 1]],
+    )
+    monkeypatch.setattr(select_sites.terrain, "validate_dem_path", lambda path: path)
+    monkeypatch.setattr(
+        select_sites,
+        "process_selected_rectangles",
+        lambda *args: (pd.DataFrame({"cell": [1]}), points),
+    )
+    monkeypatch.setattr(select_sites.visualization, "render_3d_terrain", lambda *args: [])
+    monkeypatch.setattr(select_sites.io, "build_dataset_record", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        select_sites.io,
+        "write_run_record",
+        lambda *args, **kwargs: output / "run-select-sites.json",
+    )
+
+    exit_code = select_sites.main(
+        ["--config", str(config_path), "--select-index", "1"]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert expected in captured.out
+    assert f"{'a' * 64}.json" in captured.out
 
 
 def test_main_runs_shared_preflight_before_creating_output(tmp_path, monkeypatch, capsys):
