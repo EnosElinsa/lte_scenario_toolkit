@@ -433,8 +433,8 @@ def _atomic_restore_bytes(path: Path, content: bytes) -> None:
             temporary_path.unlink(missing_ok=True)
 
 
-def dump_profile(profile: ExperimentProfile, path: str | Path) -> Path:
-    """Validate and atomically write a deterministic schema-version-2 profile."""
+def _profile_text(profile: ExperimentProfile, path: str | Path) -> str:
+    """Return the deterministic UTF-8 text written for one profile."""
 
     destination = Path(path).resolve()
     document = _profile_document(profile, destination)
@@ -445,6 +445,14 @@ def dump_profile(profile: ExperimentProfile, path: str | Path) -> Path:
     )
     if not text.endswith("\n"):
         text += "\n"
+    return text
+
+
+def dump_profile(profile: ExperimentProfile, path: str | Path) -> Path:
+    """Validate and atomically write a deterministic schema-version-2 profile."""
+
+    destination = Path(path).resolve()
+    text = _profile_text(profile, destination)
     _atomic_write_profile_text(destination, text)
     return destination
 
@@ -732,8 +740,13 @@ class ProfileStore:
             return save_data_catalog(catalog, document)
         except Exception as exc:
             try:
-                if catalog.path.read_bytes() != original:
+                try:
+                    current = catalog.path.read_bytes()
+                except FileNotFoundError:
                     _atomic_restore_bytes(catalog.path, original)
+                else:
+                    if current != original:
+                        _atomic_restore_bytes(catalog.path, original)
             except Exception as rollback_error:
                 exc.add_note(
                     f"Catalog rollback also failed for {catalog.path}: {rollback_error}"
@@ -794,13 +807,26 @@ class ProfileStore:
     def _restore_profile_after_error(
         path: Path,
         original: bytes | None,
+        expected: bytes,
         operation_error: Exception,
     ) -> None:
         try:
-            if original is None:
-                path.unlink(missing_ok=True)
-            else:
+            try:
+                current = path.read_bytes()
+            except FileNotFoundError:
+                if original is not None:
+                    _atomic_restore_bytes(path, original)
+                return
+            if current != expected:
+                operation_error.add_note(
+                    f"Profile rollback skipped for {path}: target changed "
+                    "after this operation wrote it"
+                )
+                return
+            if original is not None:
                 _atomic_restore_bytes(path, original)
+                return
+            path.unlink()
         except Exception as rollback_error:
             operation_error.add_note(
                 f"Profile rollback also failed for {path}: {rollback_error}"
@@ -851,7 +877,17 @@ class ProfileStore:
             if destination_exists and not overwrite:
                 raise FileExistsError(destination)
             original = destination.read_bytes() if destination_exists else None
-            dump_profile(profile, destination)
+            expected = _profile_text(profile, destination).encode("utf-8")
+            try:
+                dump_profile(profile, destination)
+            except Exception as exc:
+                self._restore_profile_after_error(
+                    destination,
+                    original,
+                    expected,
+                    exc,
+                )
+                raise
             if not set_default:
                 return destination
             document = self._default_document(
@@ -862,7 +898,12 @@ class ProfileStore:
             try:
                 self._save_catalog(catalog, document)
             except Exception as exc:
-                self._restore_profile_after_error(destination, original, exc)
+                self._restore_profile_after_error(
+                    destination,
+                    original,
+                    expected,
+                    exc,
+                )
                 raise
             return destination
 
@@ -887,7 +928,17 @@ class ProfileStore:
             destination = self._destination(copied)
             if os.path.lexists(destination):
                 raise FileExistsError(destination)
-            dump_profile(copied, destination)
+            expected = _profile_text(copied, destination).encode("utf-8")
+            try:
+                dump_profile(copied, destination)
+            except Exception as exc:
+                self._restore_profile_after_error(
+                    destination,
+                    None,
+                    expected,
+                    exc,
+                )
+                raise
             return destination
 
     def rename(
@@ -913,7 +964,17 @@ class ProfileStore:
                 raise FileExistsError(destination)
             default_path = self._catalog_profile_path(catalog, source_profile.scenario_id)
             is_default = default_path == source_path
-            dump_profile(renamed, destination)
+            expected = _profile_text(renamed, destination).encode("utf-8")
+            try:
+                dump_profile(renamed, destination)
+            except Exception as exc:
+                self._restore_profile_after_error(
+                    destination,
+                    None,
+                    expected,
+                    exc,
+                )
+                raise
             saved_catalog: DataCatalog | None = None
             try:
                 if is_default:
@@ -935,7 +996,12 @@ class ProfileStore:
                             f"Catalog rollback also failed during rename: {rollback_error}"
                         )
                 if catalog_restored:
-                    self._restore_profile_after_error(destination, None, exc)
+                    self._restore_profile_after_error(
+                        destination,
+                        None,
+                        expected,
+                        exc,
+                    )
                 raise
             return destination
 

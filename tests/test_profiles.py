@@ -542,6 +542,180 @@ def test_profile_store_restores_catalog_if_save_replaces_it_then_raises(
     assert catalog_path.read_bytes() == original_catalog
 
 
+def test_profile_store_restores_catalog_if_save_deletes_it_then_raises(
+    profile_repository,
+    monkeypatch,
+):
+    repo_root, catalog_path = profile_repository
+    original_catalog = catalog_path.read_bytes()
+    store = ProfileStore(repo_root, catalog_path)
+    destination = repo_root / "configs/chicago/chicago-default.yaml"
+
+    def delete_then_fail(catalog, document):
+        catalog.path.unlink()
+        raise OSError("boom")
+
+    monkeypatch.setattr(profiles_module, "save_data_catalog", delete_then_fail)
+    with pytest.raises(OSError, match="boom"):
+        store.save(make_profile(repo_root), set_default=True)
+
+    assert not destination.exists()
+    assert catalog_path.read_bytes() == original_catalog
+    restored = profiles_module.load_data_catalog(catalog_path, repo_root=repo_root)
+    assert restored.scenario("chicago")["config_path"] is None
+
+
+def test_profile_store_removes_new_profile_if_dump_writes_then_raises(
+    profile_repository,
+    monkeypatch,
+):
+    repo_root, catalog_path = profile_repository
+    store = ProfileStore(repo_root, catalog_path)
+    destination = repo_root / "configs/chicago/chicago-default.yaml"
+    original_dump = profiles_module.dump_profile
+
+    def write_then_fail(profile, path):
+        original_dump(profile, path)
+        raise OSError("write boom")
+
+    monkeypatch.setattr(profiles_module, "dump_profile", write_then_fail)
+    with pytest.raises(OSError, match="write boom"):
+        store.save(make_profile(repo_root))
+
+    assert not destination.exists()
+
+
+def test_profile_store_restores_overwrite_if_dump_writes_then_raises(
+    profile_repository,
+    monkeypatch,
+):
+    repo_root, catalog_path = profile_repository
+    store = ProfileStore(repo_root, catalog_path)
+    destination = store.save(make_profile(repo_root))
+    original_bytes = destination.read_bytes()
+    original_dump = profiles_module.dump_profile
+
+    def write_then_fail(profile, path):
+        original_dump(profile, path)
+        raise OSError("write boom")
+
+    monkeypatch.setattr(profiles_module, "dump_profile", write_then_fail)
+    with pytest.raises(OSError, match="write boom"):
+        store.save(
+            make_profile(repo_root, display_name="Changed"),
+            overwrite=True,
+        )
+
+    assert destination.read_bytes() == original_bytes
+    assert load_profile(destination, repo_root=repo_root).display_name == (
+        "Chicago default"
+    )
+
+
+def test_profile_store_removes_copy_if_dump_writes_then_raises(
+    profile_repository,
+    monkeypatch,
+):
+    repo_root, catalog_path = profile_repository
+    store = ProfileStore(repo_root, catalog_path)
+    source = store.save(make_profile(repo_root))
+    source_bytes = source.read_bytes()
+    destination = repo_root / "configs/chicago/chicago-copy.yaml"
+    original_dump = profiles_module.dump_profile
+
+    def write_then_fail(profile, path):
+        original_dump(profile, path)
+        raise OSError("write boom")
+
+    monkeypatch.setattr(profiles_module, "dump_profile", write_then_fail)
+    with pytest.raises(OSError, match="write boom"):
+        store.copy(source, "chicago-copy", "Chicago copy")
+
+    assert source.read_bytes() == source_bytes
+    assert not destination.exists()
+
+
+def test_profile_store_removes_rename_target_if_dump_writes_then_raises(
+    profile_repository,
+    monkeypatch,
+):
+    repo_root, catalog_path = profile_repository
+    store = ProfileStore(repo_root, catalog_path)
+    source = store.save(make_profile(repo_root), set_default=True)
+    source_bytes = source.read_bytes()
+    original_catalog = catalog_path.read_bytes()
+    destination = repo_root / "configs/chicago/chicago-renamed.yaml"
+    original_dump = profiles_module.dump_profile
+
+    def write_then_fail(profile, path):
+        original_dump(profile, path)
+        raise OSError("write boom")
+
+    monkeypatch.setattr(profiles_module, "dump_profile", write_then_fail)
+    with pytest.raises(OSError, match="write boom"):
+        store.rename(source, "chicago-renamed", "Chicago renamed")
+
+    assert source.read_bytes() == source_bytes
+    assert not destination.exists()
+    assert catalog_path.read_bytes() == original_catalog
+
+
+def test_profile_store_preserves_external_change_after_dump_failure(
+    profile_repository,
+    monkeypatch,
+):
+    repo_root, catalog_path = profile_repository
+    store = ProfileStore(repo_root, catalog_path)
+    destination = repo_root / "configs/chicago/chicago-default.yaml"
+    sentinel = b"external owner\n"
+    original_dump = profiles_module.dump_profile
+
+    def write_change_then_fail(profile, path):
+        original_dump(profile, path)
+        Path(path).write_bytes(sentinel)
+        raise OSError("write boom")
+
+    monkeypatch.setattr(profiles_module, "dump_profile", write_change_then_fail)
+    with pytest.raises(OSError, match="write boom") as error:
+        store.save(make_profile(repo_root))
+
+    assert destination.read_bytes() == sentinel
+    assert any("changed" in note for note in error.value.__notes__)
+
+
+@pytest.mark.parametrize("overwrite", [False, True])
+def test_profile_store_handles_deleted_target_after_dump_failure(
+    profile_repository,
+    monkeypatch,
+    overwrite,
+):
+    repo_root, catalog_path = profile_repository
+    store = ProfileStore(repo_root, catalog_path)
+    destination = repo_root / "configs/chicago/chicago-default.yaml"
+    original_bytes = None
+    if overwrite:
+        destination = store.save(make_profile(repo_root))
+        original_bytes = destination.read_bytes()
+    original_dump = profiles_module.dump_profile
+
+    def write_delete_then_fail(profile, path):
+        original_dump(profile, path)
+        Path(path).unlink()
+        raise OSError("write boom")
+
+    monkeypatch.setattr(profiles_module, "dump_profile", write_delete_then_fail)
+    with pytest.raises(OSError, match="write boom"):
+        store.save(
+            make_profile(repo_root, display_name="Changed"),
+            overwrite=overwrite,
+        )
+
+    if overwrite:
+        assert destination.read_bytes() == original_bytes
+    else:
+        assert not destination.exists()
+
+
 def test_profile_store_discover_is_recursive_sorted_and_filterable(
     profile_repository,
 ):
