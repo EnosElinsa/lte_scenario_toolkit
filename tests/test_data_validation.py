@@ -515,6 +515,76 @@ def test_config_boundary_and_dem_mismatches_are_reported(tmp_path):
     assert not (tmp_path / "results").exists()
 
 
+def test_schema_v2_linked_profile_uses_catalog_owned_boundary_and_dem(tmp_path):
+    config_path = "configs/city/default.yaml"
+    catalog_path, _ = _write_catalog(tmp_path, dem=True, config_path=config_path)
+    catalog_document = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    points_dataset = {
+        "dataset_id": "points",
+        "role": "points",
+        "path": "points_shp/points",
+        "entrypoint": "points_shp/points/points.shp",
+        "source_url": None,
+        "provider": "test",
+        "license": "CC0-1.0",
+        "download_date": None,
+        "crs": "EPSG:3857",
+        "spatial_resolution": "point vector",
+        "notes": "fixture",
+    }
+    catalog_document["datasets"].append(points_dataset)
+    catalog_path.write_text(
+        yaml.safe_dump(catalog_document, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    manifest_path = tmp_path / "data" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["datasets"].append(
+        {
+            **points_dataset,
+            "files": _dataset_files(tmp_path, tmp_path / "points_shp" / "points"),
+        }
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    profile = {
+        "schema_version": 2,
+        "profile": {
+            "id": "default",
+            "display_name": "Default",
+            "scenario_id": "city",
+        },
+        "inputs": {"points_dataset_id": "points"},
+        "experiment": {"random_seed": 7},
+        "spatial": {
+            "target_crs": "EPSG:3857",
+            "rectangle_size_m": 2,
+            "target_base_station_count": 1,
+            "count_tolerance": 0,
+        },
+        "scan": {
+            "mode": "fast",
+            "strategy": "uniform",
+            "step_m": 1,
+            "max_rectangles": 1,
+            "minimum_center_spacing_m": 2,
+        },
+        "outputs": {"root": "results"},
+        "figures": {"preset": "publication"},
+    }
+    profile_path = tmp_path / config_path
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(yaml.safe_dump(profile, sort_keys=False), encoding="utf-8")
+    catalog = load_data_catalog(catalog_path, repo_root=tmp_path)
+
+    report = validate_scenario_data(catalog, "city")
+
+    assert report.ok
+    assert not any(message.code.startswith("config.") for message in report.messages)
+    assert not (tmp_path / "results").exists()
+
+
 def test_validate_cli_single_all_and_argument_errors(tmp_path, capsys):
     catalog_path, _ = _write_catalog(tmp_path, second_city=True)
 

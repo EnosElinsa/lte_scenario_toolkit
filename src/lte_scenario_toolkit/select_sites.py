@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import argparse
-import json
+import re
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -14,8 +15,123 @@ import rasterio
 from shapely.geometry import box
 
 from . import io, scenario, spatial, terrain, visualization
+from .candidate_scanner import Candidate
 from .config import load_experiment_config
 from .data_catalog import CatalogError, DataCatalog, load_data_catalog
+from .profiles import ExperimentProfile, FigureSettings, OutputSettings, load_profile
+from .selection_service import SelectionPreflight, SelectionService
+
+
+def _points_dataset_id(catalog: DataCatalog, points_path: Path) -> str:
+    matches = [
+        dataset_id
+        for dataset_id, dataset in catalog.datasets_by_id.items()
+        if dataset.get("role") == "points"
+        and catalog.resolve(dataset["entrypoint"]) == points_path.resolve()
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"Expected exactly one registered points dataset for {points_path}, "
+            f"found {len(matches)}"
+        )
+    return matches[0]
+
+
+def _legacy_profile_id(value: Any) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value).casefold()).strip("-")
+    return slug or "legacy-profile"
+
+
+def _selection_profile(
+    config: dict[str, Any],
+    catalog: DataCatalog,
+    scenario_id: str,
+) -> ExperimentProfile:
+    """Build the typed service profile used by legacy and schema-v2 CLIs."""
+
+    if config.get("profile_id") is not None:
+        profile = load_profile(config["config_path"], repo_root=config["repo_root"])
+        return replace(
+            profile,
+            rect_size=config["rect_size"],
+            target_count=config["target_count"],
+            output_root=Path(config["output_root"]),
+        )
+
+    return ExperimentProfile(
+        schema_version=2,
+        profile_id=_legacy_profile_id(
+            config.get("experiment_name", Path(config["config_path"]).stem)
+        ),
+        display_name=str(config.get("experiment_name", scenario_id)),
+        scenario_id=scenario_id,
+        points_dataset_id=_points_dataset_id(catalog, Path(config["points_shp"])),
+        random_seed=config.get("random_seed", 42),
+        target_crs=config["target_crs"],
+        rect_size=config["rect_size"],
+        target_count=config["target_count"],
+        tolerance=config["tolerance"],
+        scan_mode=config.get("scan_mode", "fast"),
+        strategy=config["strategy"],
+        scan_step=config["scan_step"],
+        max_rects=config["max_rects"],
+        min_spacing=config["min_spacing"],
+        output_root=Path(config["output_root"]),
+        outputs=OutputSettings(
+            save_csv=config.get("save_csv", True),
+            save_preview_png=config.get("save_preview_png", True),
+            save_terrain_png=config.get("save_terrain_png", True),
+            save_terrain_eps=config.get("save_terrain_eps", True),
+            save_terrain_html=config.get("save_terrain_html", True),
+        ),
+        figure=FigureSettings(),
+        source_path=Path(config["config_path"]),
+    )
+
+
+def _legacy_result(candidate: Candidate, rectangle_size: int) -> dict[str, Any]:
+    return {
+        "geometry": box(
+            candidate.left_x,
+            candidate.bottom_y,
+            candidate.left_x + rectangle_size,
+            candidate.bottom_y + rectangle_size,
+        ),
+        "flat_grid_id": candidate.flat_grid_id,
+        "pt_count": candidate.point_count,
+        "left_x": candidate.left_x,
+        "bottom_y": candidate.bottom_y,
+        "center_x": candidate.center_x,
+        "center_y": candidate.center_y,
+    }
+
+
+def _profile_selection_io_paths(
+    config: dict[str, Any],
+    catalog: DataCatalog,
+    preflight: SelectionPreflight,
+) -> dict[str, Any]:
+    """Build temporary legacy renderer paths from catalog-owned profile inputs."""
+
+    registered = catalog.scenario(preflight.scenario_id)
+    city_tag = registered["scenario_id"]
+    output_dir = Path(preflight.output_root)
+    base_name = (
+        f"{city_tag}_{config['rect_size']}m_"
+        f"target{config['target_count']}_tol{config['tolerance']}"
+    )
+    return {
+        "boundary_folder": city_tag,
+        "boundary_layer": Path(preflight.boundary_path).stem,
+        "points_shp": Path(preflight.points_path),
+        "boundary_shp": Path(preflight.boundary_path),
+        "dem_path": Path(preflight.dem_path),
+        "output_dir": output_dir,
+        "output_csv": output_dir / f"{base_name}.csv",
+        "output_3d_png": output_dir / f"{base_name}_3d.png",
+        "output_3d_html": output_dir / f"{base_name}_3d.html",
+        "preview_png": output_dir / f"{base_name}.png",
+    }
 
 
 def _linked_catalog_scenario(
@@ -191,7 +307,32 @@ def main(argv=None) -> int:
             config["rect_size"] = args.size
         if args.target is not None:
             config["target_count"] = args.target
-        config.update(resolve_selection_io_paths(config))
+        catalog = load_data_catalog(
+            Path(config["repo_root"]) / "data" / "datasets.yaml",
+            repo_root=config["repo_root"],
+        )
+        is_versioned_profile = config.get("profile_id") is not None
+        if is_versioned_profile:
+            scenario_id = config["scenario_id"]
+        else:
+            config.update(resolve_selection_io_paths(config, create_output=False))
+            scenario_id = config.get("registered_scenario_id")
+            if scenario_id is None:
+                raise ValueError(
+                    "Selection requires a scenario registered in data/datasets.yaml"
+                )
+        profile = _selection_profile(config, catalog, scenario_id)
+        selection_service = SelectionService(catalog)
+        preflight = selection_service.preflight(
+            profile,
+            output_root=config["output_root"],
+        )
+        if is_versioned_profile:
+            config.update(_profile_selection_io_paths(config, catalog, preflight))
+        else:
+            config["points_shp"] = preflight.points_path
+            config["boundary_shp"] = preflight.boundary_path
+            config["dem_path"] = preflight.dem_path
     except (CatalogError, ValueError, FileNotFoundError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
@@ -201,38 +342,17 @@ def main(argv=None) -> int:
     print(f"Boundary: {config['boundary_shp']}")
     print(f"DEM: {config['dem_path']}")
     print(f"Output: {config['output_dir']}")
-    points_gdf, boundary, coordinates = spatial.load_and_prepare(config)
-
-    cache_path = config["cache_json"]
-    if cache_path.exists():
-        cached = json.loads(cache_path.read_text(encoding="utf-8"))
-        results = []
-        for result in cached:
-            result["geometry"] = box(
-                result["left_x"],
-                result["bottom_y"],
-                result["left_x"] + config["rect_size"],
-                result["bottom_y"] + config["rect_size"],
-            )
-            results.append(result)
-        print(f"Loaded {len(results)} cached candidates: {cache_path.name}")
-    else:
-        positions = scenario.generate_scan_positions(
-            boundary,
-            config["rect_size"],
-            config["scan_step"],
-            config["strategy"],
-            random_seed=config.get("random_seed", 42),
-        )
-        results = scenario.scan_rectangles(coordinates, boundary, positions, config)
-        cache_payload = [
-            {key: value for key, value in result.items() if key != "geometry"}
-            for result in results
-        ]
-        cache_path.write_text(
-            json.dumps(cache_payload, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        print(f"Saved {len(results)} candidates: {cache_path.name}")
+    try:
+        scan_result = selection_service.scan(preflight)
+        points_gdf, boundary, coordinates = spatial.load_and_prepare(config)
+    except (ValueError, FileNotFoundError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    results = [
+        _legacy_result(candidate, config["rect_size"])
+        for candidate in scan_result.candidates
+    ]
+    print(f"Loaded {len(results)} candidates from the shared candidate cache")
 
     scenario.verify_results(results, coordinates, config["rect_size"])
     if args.select_index is None:
@@ -249,6 +369,7 @@ def main(argv=None) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
+    Path(config["output_dir"]).mkdir(parents=True, exist_ok=True)
     with rasterio.open(dem_path) as dem:
         dem_crs = str(dem.crs)
         dem_resolution_m = float(abs(dem.res[0]))

@@ -318,3 +318,124 @@ def test_process_selected_rectangles_samples_dem_and_builds_csv_rows():
     assert frame["elevation"].tolist() == [12.0]
     assert frame["rect_id"].tolist() == [1]
     assert selected.crs.to_epsg() == 3857
+
+
+def test_main_runs_shared_preflight_before_creating_output(tmp_path, monkeypatch, capsys):
+    output = tmp_path / "output"
+    config_path = tmp_path / "profile.yaml"
+    config_path.write_text("profile", encoding="utf-8")
+    config = {
+        "repo_root": tmp_path,
+        "config_path": config_path,
+        "output_root": output,
+        "rect_size": 2,
+        "target_count": 1,
+        "tolerance": 0,
+        "scan_step": 1,
+        "max_rects": 1,
+        "min_spacing": 2,
+        "strategy": "sequential",
+        "random_seed": 7,
+        "target_crs": "EPSG:3857",
+    }
+    paths = {
+        "registered_scenario_id": "chicago",
+        "output_dir": output,
+        "output_csv": output / "scenario.csv",
+        "output_3d_png": output / "terrain.png",
+        "output_3d_html": output / "terrain.html",
+        "preview_png": output / "preview.png",
+        "points_shp": tmp_path / "points.shp",
+        "boundary_shp": tmp_path / "boundary.shp",
+        "dem_path": tmp_path / "dem.tif",
+        "boundary_folder": "Chicago",
+        "boundary_layer": "Chicago_Boundary",
+    }
+    monkeypatch.setattr(select_sites, "load_experiment_config", lambda *args, **kwargs: config)
+
+    def resolve_paths(received, *, create_output=True):
+        assert received is config
+        assert create_output is False
+        return paths
+
+    monkeypatch.setattr(select_sites, "resolve_selection_io_paths", resolve_paths)
+    monkeypatch.setattr(select_sites, "load_data_catalog", lambda *args, **kwargs: object())
+    monkeypatch.setattr(select_sites, "_selection_profile", lambda *args: object())
+
+    class RejectingService:
+        def __init__(self, catalog):
+            assert catalog is not None
+
+        @staticmethod
+        def preflight(profile, output_root):
+            assert profile is not None
+            assert output_root == output
+            raise ValueError("preflight rejected")
+
+    monkeypatch.setattr(select_sites, "SelectionService", RejectingService)
+
+    exit_code = select_sites.main(["--config", str(config_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.out == ""
+    assert "preflight rejected" in captured.err
+    assert not output.exists()
+
+
+def test_main_schema_v2_profile_resolves_inputs_only_through_preflight(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    output = tmp_path / "output"
+    config_path = tmp_path / "profile.yaml"
+    config_path.write_text("profile", encoding="utf-8")
+    config = {
+        "repo_root": tmp_path,
+        "config_path": config_path,
+        "profile_id": "default",
+        "scenario_id": "chicago",
+        "points_dataset_id": "points",
+        "output_root": output,
+        "rect_size": 2,
+        "target_count": 1,
+        "tolerance": 0,
+        "scan_mode": "fast",
+        "scan_step": 1,
+        "max_rects": 1,
+        "min_spacing": 2,
+        "strategy": "sequential",
+        "random_seed": 7,
+        "target_crs": "EPSG:3857",
+    }
+    monkeypatch.setattr(select_sites, "load_experiment_config", lambda *args, **kwargs: config)
+    monkeypatch.setattr(
+        select_sites,
+        "resolve_selection_io_paths",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("schema-v2 must not resolve legacy path fields")
+        ),
+    )
+    monkeypatch.setattr(select_sites, "load_data_catalog", lambda *args, **kwargs: object())
+    monkeypatch.setattr(select_sites, "_selection_profile", lambda *args: object())
+
+    class RejectingService:
+        def __init__(self, catalog):
+            assert catalog is not None
+
+        @staticmethod
+        def preflight(profile, output_root):
+            assert profile is not None
+            assert output_root == output
+            raise ValueError("profile preflight rejected")
+
+    monkeypatch.setattr(select_sites, "SelectionService", RejectingService)
+
+    exit_code = select_sites.main(["--config", str(config_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.out == ""
+    assert "profile preflight rejected" in captured.err
+    assert not output.exists()

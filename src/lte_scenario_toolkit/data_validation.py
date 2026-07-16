@@ -620,6 +620,33 @@ def _validate_config(
     try:
         resolved_config_path = catalog.resolve(config_path)
         config = load_experiment_config(resolved_config_path, repo_root=catalog.root)
+    except Exception as exc:
+        _error(report, "config.invalid", f"Cannot load linked experiment config: {exc}")
+        return
+
+    if "scenario_id" in config or "points_dataset_id" in config:
+        configured_scenario = config.get("scenario_id")
+        if configured_scenario != scenario.get("scenario_id"):
+            _error(
+                report,
+                "config.scenario",
+                "Profile scenario does not match the catalog scenario "
+                f"({configured_scenario!r} != {scenario.get('scenario_id')!r})",
+            )
+        points_dataset_id = config.get("points_dataset_id")
+        try:
+            points = catalog.dataset(points_dataset_id)
+            if points.get("role") != "points":
+                raise ValueError("registered dataset does not have role 'points'")
+        except Exception as exc:
+            _error(
+                report,
+                "config.points",
+                f"Profile points dataset is invalid: {exc}",
+            )
+        return
+
+    try:
         paths = resolve_io_paths(config, create_output=False)
     except Exception as exc:
         _error(report, "config.invalid", f"Cannot resolve linked experiment config: {exc}")
