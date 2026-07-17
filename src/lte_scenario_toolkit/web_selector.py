@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from .candidate_scanner import Candidate, ScanResult
 from .gui.i18n import Translator
+from .gui.leaflet_assets import register_station_dots_resource
 from .gui.pages.candidates import (
     CandidateSession,
     build_candidate_map_bundle,
@@ -183,6 +184,8 @@ def _render_selector_page(
     coordinator: JobCoordinator,
     ui: Any,
     app: Any,
+    *,
+    station_layer_resource: str,
 ) -> None:
     translator = Translator("en")
 
@@ -216,6 +219,7 @@ def _render_selector_page(
         translator,
         candidate_session,
         coordinator,
+        station_layer_resource=station_layer_resource,
         candidate_overlay_builder=lambda active, candidate, style: (
             build_candidate_overlay(active, assets, candidate, style=style)
         ),
@@ -248,6 +252,7 @@ def _run_server(session: _SelectorSession) -> None:
 
     candidate_session, assets = _build_candidate_session(payload)
     coordinator = JobCoordinator()
+    station_layer_resource = register_station_dots_resource(app)
     host = "127.0.0.1"
     port = _available_port()
     stop_browser = Event()
@@ -261,6 +266,7 @@ def _run_server(session: _SelectorSession) -> None:
             coordinator,
             ui,
             app,
+            station_layer_resource=station_layer_resource,
         )
 
     def open_browser_when_ready() -> None:

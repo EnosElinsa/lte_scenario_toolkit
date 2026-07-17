@@ -224,6 +224,14 @@ def test_run_server_opens_loopback_browser_and_releases_owned_runtime(
     monkeypatch.setattr(web_selector, "JobCoordinator", FakeCoordinator)
     monkeypatch.setattr(
         web_selector,
+        "register_station_dots_resource",
+        lambda app: (
+            calls.__setitem__("station_resource_app", app)
+            or "/_lte_gui/assets/station-dots.js"
+        ),
+    )
+    monkeypatch.setattr(
+        web_selector,
         "_build_candidate_session",
         lambda _payload: (object(), object()),
         raising=False,
@@ -274,6 +282,7 @@ def test_run_server_opens_loopback_browser_and_releases_owned_runtime(
     assert calls["url"] == "http://127.0.0.1:43123/"
     assert calls["shutdown"] >= 1
     assert calls["coordinator_shutdown"] == 1
+    assert calls["station_resource_app"] is fake_app
 
 
 def test_run_server_browser_failure_is_actionable_and_still_cleans_up(
@@ -322,6 +331,11 @@ def test_run_server_browser_failure_is_actionable_and_still_cleans_up(
         SimpleNamespace(app=fake_app, ui=FakeUi()),
     )
     monkeypatch.setattr(web_selector, "JobCoordinator", FakeCoordinator)
+    monkeypatch.setattr(
+        web_selector,
+        "register_station_dots_resource",
+        lambda _app: "/_lte_gui/assets/station-dots.js",
+    )
     monkeypatch.setattr(
         web_selector,
         "_build_candidate_session",
@@ -401,6 +415,11 @@ def test_run_server_wraps_unexpected_nicegui_failure_after_cleanup(
         SimpleNamespace(app=FakeApp(), ui=FakeUi()),
     )
     monkeypatch.setattr(web_selector, "JobCoordinator", FakeCoordinator)
+    monkeypatch.setattr(
+        web_selector,
+        "register_station_dots_resource",
+        lambda _app: "/_lte_gui/assets/station-dots.js",
+    )
     monkeypatch.setattr(
         web_selector,
         "_build_candidate_session",
@@ -507,12 +526,16 @@ def test_selector_renderer_reuses_precomputed_candidate_page_without_rescan(
         coordinator,
         FakeUi(),
         app,
+        station_layer_resource="/_lte_gui/assets/station-dots.js",
     )
 
     assert captured["args"][2] is candidate_session
     assert captured["args"][3] is coordinator
     assert captured["kwargs"]["auto_start"] is False
     assert captured["kwargs"]["allow_rescan"] is False
+    assert captured["kwargs"]["station_layer_resource"] == (
+        "/_lte_gui/assets/station-dots.js"
+    )
     assert selector.wait(0) is candidates[1]
     assert app.shutdown_calls == 1
     assert len(delete_handlers) == 1

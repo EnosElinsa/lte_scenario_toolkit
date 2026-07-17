@@ -38,6 +38,9 @@ results/**
 *.eps
 *.html
 
+# Locally generated user profiles
+configs/new-york-city/
+
 # Generated GEEMu runs; keep only reusable artifacts
 runs/**
 !runs/README.md

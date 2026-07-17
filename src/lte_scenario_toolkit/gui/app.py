@@ -24,6 +24,7 @@ from ..profiles import ProfileStore
 from ..selection_service import SelectionService
 from .i18n import Translator, validate_translations
 from .layout import render_app_shell
+from .leaflet_assets import register_station_dots_resource
 from .pages.candidates import (
     CandidateMapBundle,
     CandidateSession,
@@ -290,6 +291,8 @@ def create_app(
 
     from nicegui import app, ui
 
+    station_layer_resource = register_station_dots_resource(app)
+
     if catalog is None:
         repo_root = Path.cwd().resolve()
         catalog = load_data_catalog(
@@ -431,6 +434,51 @@ def create_app(
     def open_generation_session(confirmed: CandidateSession) -> None:
         ui.navigate.to(f"/generate/{confirmed.session_id}")
 
+    def render_candidate_explorer_body(
+        translator: Translator,
+        session: CandidateSession,
+        bundle: CandidateMapBundle,
+    ) -> None:
+        asset_url = candidate_asset_url(bundle.dem_asset.path)
+        render_candidate_page(
+            ui,
+            translator,
+            session,
+            runtime.coordinator,
+            station_layer_resource=station_layer_resource,
+            registry=sessions,
+            dem_asset_url=asset_url,
+            dem_asset_url_builder=candidate_asset_url,
+            online_tile_probe=online_tile_probe or default_online_tile_probe,
+            candidate_overlay_builder=(
+                candidate_overlay_asset_builder
+                or (
+                    lambda active_session, candidate, style: (
+                        build_candidate_overlay(
+                            active_session,
+                            map_assets,
+                            candidate,
+                            style=style,
+                        )
+                    )
+                )
+            ),
+            dem_style_builder=(
+                candidate_style_asset_builder
+                or (
+                    lambda active_session, style: (
+                        build_candidate_style_overlay(
+                            active_session,
+                            map_assets,
+                            bundle.map_bounds,
+                            style,
+                        )
+                    )
+                )
+            ),
+            on_confirm=open_generation_session,
+        )
+
     @ui.page("/configure/{scenario_id}", **page_options)
     def configure_scenario(scenario_id: str, profile: str | None = None) -> None:
         render_shell(
@@ -457,78 +505,79 @@ def create_app(
                 lambda translator: render_candidate_unavailable(ui, translator),
             )
             return
-        if session.map_bundle is None:
-            from nicegui import run
 
-            sessions.pin(session_id)
-            try:
-                bundle = await run.io_bound(
-                    bundle_builder,
-                    session,
-                    map_assets,
-                )
-                session = sessions.set_map_bundle(session_id, bundle)
-            except Exception as error:
-                message = str(error)
-                render_shell(
-                    "/configure",
-                    lambda translator, detail=message: render_candidate_unavailable(
-                        ui,
-                        translator,
-                        detail,
-                    ),
-                )
-                return
-            finally:
-                sessions.unpin(session_id)
-        bundle = session.map_bundle
-        if bundle is None:
+        prepared_bundle = session.map_bundle
+        if prepared_bundle is not None:
             render_shell(
                 "/configure",
-                lambda translator: render_candidate_unavailable(ui, translator),
+                lambda translator: render_candidate_explorer_body(
+                    translator,
+                    session,
+                    prepared_bundle,
+                ),
             )
             return
-        asset_url = candidate_asset_url(bundle.dem_asset.path)
+
+        loading_container: Any | None = None
+        loading_translator: Translator | None = None
+
+        def render_loading(translator: Translator) -> None:
+            nonlocal loading_container, loading_translator
+            loading_translator = translator
+            loading_container = ui.column().classes("full-width")
+            with loading_container:
+                with ui.column().classes("items-center justify-center full-width"):
+                    ui.spinner(size="lg")
+                    ui.label(translator.text("candidates.preparing_map"))
+
         render_shell(
             "/configure",
-            lambda translator: render_candidate_page(
-                ui,
-                translator,
-                session,
-                runtime.coordinator,
-                registry=sessions,
-                dem_asset_url=asset_url,
-                dem_asset_url_builder=candidate_asset_url,
-                online_tile_probe=online_tile_probe or default_online_tile_probe,
-                candidate_overlay_builder=(
-                    candidate_overlay_asset_builder
-                    or (
-                        lambda active_session, candidate, style: (
-                            build_candidate_overlay(
-                                active_session,
-                                map_assets,
-                                candidate,
-                                style=style,
-                            )
-                        )
-                    )
-                ),
-                dem_style_builder=(
-                    candidate_style_asset_builder
-                    or (
-                        lambda active_session, style: (
-                            build_candidate_style_overlay(
-                                active_session,
-                                map_assets,
-                                bundle.map_bounds,
-                                style,
-                            )
-                        )
-                    )
-                ),
-                on_confirm=open_generation_session,
-            ),
+            render_loading,
         )
+        assert loading_container is not None
+        assert loading_translator is not None
+
+        client = ui.context.client
+        sessions.pin(session_id)
+        try:
+            await client.connected()
+            if client.is_deleted:
+                return
+            if session.map_bundle is None:
+                from nicegui import run
+
+                try:
+                    bundle = await run.io_bound(
+                        bundle_builder,
+                        session,
+                        map_assets,
+                    )
+                    session = sessions.set_map_bundle(session_id, bundle)
+                except Exception as error:
+                    if not client.is_deleted:
+                        loading_container.clear()
+                        with loading_container:
+                            render_candidate_unavailable(
+                                ui,
+                                loading_translator,
+                                str(error),
+                            )
+                    return
+            bundle = session.map_bundle
+            if client.is_deleted:
+                return
+            loading_container.clear()
+            with loading_container:
+                if bundle is None:
+                    render_candidate_unavailable(ui, loading_translator)
+                else:
+                    render_candidate_explorer_body(
+                        loading_translator,
+                        session,
+                        bundle,
+                    )
+        finally:
+            sessions.unpin(session_id)
 
     @ui.page("/candidates", **page_options)
     def candidate_without_session() -> None:

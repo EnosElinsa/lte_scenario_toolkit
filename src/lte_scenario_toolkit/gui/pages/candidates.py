@@ -28,6 +28,17 @@ from ...selection_service import (
 DEFAULT_LAYERS = frozenset({"dem", "boundary", "stations", "candidates"})
 ALLOWED_LAYERS = DEFAULT_LAYERS | {"online"}
 ALLOWED_VIEWS = frozenset({"map", "filmstrip"})
+STATION_DOT_STYLE = {
+    "radius": 2.5,
+    "stroke": True,
+    "color": "#0b5f8a",
+    "weight": 1,
+    "opacity": 0.75,
+    "fillColor": "#4f93c8",
+    "fillOpacity": 0.55,
+    "interactive": True,
+    "bubblingMouseEvents": False,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -1392,6 +1403,7 @@ def render_candidate_page(
     session: CandidateSession,
     coordinator: JobCoordinator,
     *,
+    station_layer_resource: str,
     registry: CandidateSessionRegistry | None = None,
     dem_asset_url: str | None = None,
     dem_asset_url_builder: Callable[[Path], str] | None = None,
@@ -1561,6 +1573,7 @@ def render_candidate_page(
                         center=((bottom + top) / 2.0, (left + right) / 2.0),
                         zoom=10,
                         options={"zoomControl": True, "preferCanvas": True},
+                        additional_resources=[station_layer_resource],
                     ).classes("lte-candidate-map full-width").mark("candidate-map")
                     map_element.clear_layers()
                     dem_layer = map_element.image_overlay(
@@ -1582,8 +1595,11 @@ def render_candidate_page(
                         ],
                     )
                     stations_layer = map_element.generic_layer(
-                        name="geoJSON",
-                        args=[bundle.stations_geojson, {}],
+                        name="stationDots",
+                        args=[
+                            bundle.stations_geojson,
+                            {"dotStyle": dict(STATION_DOT_STYLE)},
+                        ],
                     )
                     leaflet_extent = _leaflet_bounds(bundle.map_bounds)
                     map_element.on(
@@ -1659,6 +1675,7 @@ def render_candidate_page(
             "fillColor": color,
             "weight": 4 if selected else 2,
             "fillOpacity": 0.24 if selected else 0.09,
+            "pane": "overlayPane",
         }
 
     def sync_candidate_layers(state: CandidatePageState) -> None:
@@ -2250,7 +2267,7 @@ def render_candidate_page(
     dem_opacity.on_value_change(lambda event: change_opacity(event.value))
     dem_style_select.on_value_change(lambda event: change_dem_style(event.value))
 
-    timer = ui.timer(0.15, tick, active=True, immediate=True)
+    timer = ui.timer(0.25, tick, active=True, immediate=True)
     coordinator_timer = ui.timer(
         0.5,
         coordinator_tick,

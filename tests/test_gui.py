@@ -54,12 +54,34 @@ def test_gui_test_dependencies_and_async_mode_are_declared():
     assert project["tool"]["pytest"]["ini_options"]["main_file"] == ""
 
 
-def test_gui_css_is_declared_as_package_data():
+def test_gui_css_and_leaflet_extension_are_declared_as_package_data():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
     assert project["tool"]["setuptools"]["package-data"]["lte_scenario_toolkit"] == [
-        "gui/assets/*.css"
+        "gui/assets/*.css",
+        "gui/assets/*.js",
     ]
+
+
+def test_station_dot_resource_is_local_and_registered_once():
+    from lte_scenario_toolkit.gui import leaflet_assets
+
+    calls = []
+
+    class App:
+        def remove_route(self, path):
+            calls.append(("remove", path))
+
+        def add_static_file(self, **kwargs):
+            calls.append(("add", kwargs))
+            return kwargs["url_path"]
+
+    url = leaflet_assets.register_station_dots_resource(App())
+
+    assert url == "/_lte_gui/assets/station-dots.js"
+    assert calls[0] == ("remove", url)
+    assert calls[1][1]["local_file"].name == "station_dots.js"
+    assert calls[1][1]["strict"] is True
 
 
 def test_translation_dictionaries_have_identical_keys_and_format_values():
@@ -259,7 +281,16 @@ def test_create_app_uses_injected_catalog_and_shared_local_css(
     module = _gui_module("app")
     assert hasattr(module, "create_app")
     calls: dict[str, object] = {}
-    fake_app = object()
+
+    class FakeApp:
+        def remove_route(self, path):
+            calls["removed_route"] = path
+
+        def add_static_file(self, **kwargs):
+            calls["static_file"] = kwargs
+            return kwargs["url_path"]
+
+    fake_app = FakeApp()
 
     class FakeUi:
         def add_css(self, content, *, shared=False):
@@ -285,6 +316,8 @@ def test_create_app_uses_injected_catalog_and_shared_local_css(
     assert ":root" in calls["css"]
     assert "--lte-canvas: #ffffff" in calls["css"]
     assert calls["page"][0] == "/"
+    assert calls["removed_route"] == "/_lte_gui/assets/station-dots.js"
+    assert calls["static_file"]["url_path"] == "/_lte_gui/assets/station-dots.js"
 
 
 def test_gui_main_passes_server_flags_to_nicegui(tmp_path, monkeypatch, capsys):
@@ -2045,6 +2078,11 @@ def test_custom_coordinator_does_not_create_or_own_shared_coordinator(
     monkeypatch.setitem(sys.modules, "nicegui", SimpleNamespace(app=fake_app, ui=FakeUi()))
     monkeypatch.setattr(
         module,
+        "register_station_dots_resource",
+        lambda _app: "/_lte_gui/assets/station-dots.js",
+    )
+    monkeypatch.setattr(
+        module,
         "get_job_coordinator",
         lambda: pytest.fail("custom coordinator must not create the shared coordinator"),
     )
@@ -2599,6 +2637,46 @@ def _task14_map_bundle(tmp_path):
     )
 
 
+async def test_candidate_route_connects_before_slow_map_preparation_finishes(
+    user, tmp_path
+):
+    from lte_scenario_toolkit.gui.app import create_app
+    from lte_scenario_toolkit.gui.pages.candidates import CandidateSessionRegistry
+
+    started = Event()
+    release = Event()
+
+    class Service:
+        def scan(self, *args, **kwargs):
+            return _task14_scan_result()
+
+    def slow_bundle_builder(_session, _assets):
+        started.set()
+        assert release.wait(2)
+        return _task14_map_bundle(tmp_path)
+
+    registry = CandidateSessionRegistry()
+    registry.add(_task14_session(tmp_path, Service()))
+    create_app(
+        catalog=_Task13Catalog(tmp_path),
+        profile_store=object(),
+        candidate_registry=registry,
+        candidate_bundle_builder=slow_bundle_builder,
+        testing=True,
+    )
+
+    opening = asyncio.create_task(user.open("/candidates/session-1"))
+    try:
+        assert await asyncio.to_thread(started.wait, 1)
+        await asyncio.wait_for(asyncio.shield(opening), 1)
+        await user.should_see("Preparing the offline candidate map...")
+    finally:
+        release.set()
+        await asyncio.wait_for(opening, 2)
+
+    await user.should_see("Candidate Explorer")
+
+
 def test_gui_file_route_resolver_accepts_only_allowlisted_local_files(tmp_path):
     module = _gui_module("app")
     cache_root = tmp_path / ".lte-data" / "cache"
@@ -2819,6 +2897,26 @@ async def test_candidate_route_uses_one_offline_leaflet_and_preserves_it_on_view
     map_element = next(iter(maps))
     assert not any(isinstance(layer, TileLayer) for layer in map_element.layers)
     assert not any("tile.osm" in str(layer) for layer in map_element.layers)
+    station_layers = [
+        layer
+        for layer in map_element.layers
+        if getattr(layer, "name", None) == "stationDots"
+    ]
+    assert len(station_layers) == 1
+    assert station_layers[0].args[1]["dotStyle"] == {
+        "radius": 2.5,
+        "stroke": True,
+        "color": "#0b5f8a",
+        "weight": 1,
+        "opacity": 0.75,
+        "fillColor": "#4f93c8",
+        "fillOpacity": 0.55,
+        "interactive": True,
+        "bubblingMouseEvents": False,
+    }
+    assert map_element._props["additional-resources"] == [
+        "/_lte_gui/assets/station-dots.js"
+    ]
 
     for _ in range(20):
         rectangles = [
@@ -2831,6 +2929,7 @@ async def test_candidate_route_uses_one_offline_leaflet_and_preserves_it_on_view
         await asyncio.sleep(0.05)
     assert len(rectangles) == 2
     assert {layer.args[1]["color"] for layer in rectangles} == {"#dc3f4f"}
+    assert all(layer.args[1]["pane"] == "overlayPane" for layer in rectangles)
 
     user.find(marker="candidate-map").trigger(
         "mapClick", {"latlng": {"lat": 0.005, "lng": 0.005}}
@@ -2900,6 +2999,7 @@ async def test_candidate_page_can_disable_all_rescan_entrypoints(user, tmp_path)
             Translator("en"),
             session,
             coordinator,
+            station_layer_resource="/_lte_gui/assets/station-dots.js",
             allow_rescan=False,
             auto_start=False,
         )

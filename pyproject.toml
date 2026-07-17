@@ -33,7 +33,7 @@ lte-gui = "lte_scenario_toolkit.gui.app:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-lte_scenario_toolkit = ["gui/assets/*.css"]
+lte_scenario_toolkit = ["gui/assets/*.css", "gui/assets/*.js"]
 
 [project.optional-dependencies]
 dev = [
