@@ -1032,6 +1032,9 @@ def _ingest_dem_shards_locked(
     if not isinstance(prefix, str) or not prefix:
         raise DemIngestError(f"Registered DEM {dem_id!r} has no export_prefix")
 
+    lexical_destination = catalog.root / Path(dem["entrypoint"])
+    if os.path.lexists(lexical_destination):
+        raise DemIngestError(f"DEM destination already exists: {lexical_destination}")
     destination = _safe_catalog_path(catalog.root, dem["entrypoint"], description="DEM entrypoint")
     if os.path.lexists(destination):
         raise DemIngestError(f"DEM destination already exists: {destination}")

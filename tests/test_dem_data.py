@@ -911,7 +911,7 @@ def test_ingest_dem_shards_reloads_catalog_only_after_lock_and_rejects_existing_
     destination = tmp_path / "dem" / "sample-city" / "usgs_3dep_1m_sample-city.tif"
     destination.parent.mkdir(parents=True)
     try:
-        destination.symlink_to(tmp_path / "missing-target.tif")
+        destination.symlink_to(destination.with_name("missing-target.tif"))
     except OSError as exc:
         pytest.skip(f"symlink creation unavailable: {exc}")
     with pytest.raises(DemIngestError, match="already exists"):
