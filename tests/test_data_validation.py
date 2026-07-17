@@ -468,7 +468,18 @@ def test_boundary_contract_errors_are_normalized(tmp_path, change, code):
 def test_boundary_sidecar_extension_matching_is_case_insensitive(tmp_path):
     _, catalog = _write_catalog(tmp_path)
     cpg = catalog.resolve("boundary_shp/city/city.cpg")
-    cpg.rename(cpg.with_suffix(".CPG"))
+    uppercase_cpg = cpg.with_suffix(".CPG")
+    cpg.rename(uppercase_cpg)
+    manifest_path = tmp_path / "data" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    boundary_record = next(
+        item for item in manifest["datasets"] if item["dataset_id"] == "boundary_city"
+    )
+    cpg_record = next(
+        item for item in boundary_record["files"] if item["path"].endswith("/city.cpg")
+    )
+    cpg_record["path"] = uppercase_cpg.relative_to(tmp_path).as_posix()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     report = validate_scenario_data(catalog, "city")
 
