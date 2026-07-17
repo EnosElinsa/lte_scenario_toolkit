@@ -27,18 +27,28 @@ dependencies = [
 lte-select-sites = "lte_scenario_toolkit.select_sites:main"
 lte-generate-figures = "lte_scenario_toolkit.generate_figures:main"
 lte-data = "lte_scenario_toolkit.data_cli:main"
+lte-gui = "lte_scenario_toolkit.gui.app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+lte_scenario_toolkit = ["gui/assets/*.css"]
+
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0",
+  "pytest-asyncio>=0.24",
   "ruff>=0.8",
+]
+gui = [
+  "nicegui>=3.14,<4",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"
+main_file = ""
 
 [tool.ruff]
 target-version = "py310"
