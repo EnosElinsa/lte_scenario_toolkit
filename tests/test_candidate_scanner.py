@@ -1,6 +1,8 @@
+import json
 from dataclasses import FrozenInstanceError, fields, replace
 from itertools import combinations
 from threading import Event
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -875,3 +877,152 @@ def test_complete_scan_cancels_before_full_coverage_without_completed_event():
     assert events
     assert events[-1].checked_positions < events[-1].total_positions
     assert all(event.phase != "completed" for event in events)
+
+
+def fake_benchmark_inputs(_config_path):
+    request = ScanRequest(
+        rectangle_size=4,
+        target_count=1,
+        tolerance=1,
+        step=3,
+        max_candidates=2,
+        minimum_spacing=1,
+        strategy="sequential",
+        mode="fast",
+        random_seed=7,
+        algorithm_version="row-sweep-v1",
+    )
+    return request, box(0, 0, 11, 11), np.asarray([[1, 1]], dtype=float), "fixture"
+
+
+def test_benchmark_reports_metrics_without_writing_outputs(tmp_path, monkeypatch):
+    from lte_scenario_toolkit.benchmark import benchmark_profile
+
+    config = tmp_path / "profile.yaml"
+    config.write_text("fixture", encoding="utf-8")
+    monkeypatch.setattr(
+        "lte_scenario_toolkit.benchmark._load_benchmark_inputs",
+        fake_benchmark_inputs,
+    )
+
+    result = benchmark_profile(config)
+
+    assert result["scenario"] == "fixture"
+    assert result["grid_x_positions"] == 3
+    assert result["grid_y_positions"] == 3
+    assert result["grid_positions"] == 9
+    assert result["checked_positions"] <= 9
+    assert result["candidate_count"] >= 0
+    assert result["peak_python_bytes"] > 0
+    assert result["elapsed_seconds"] >= 0
+    assert list(tmp_path.iterdir()) == [config]
+
+
+def test_benchmark_input_loader_uses_preflight_without_touching_cache_or_outputs(
+    tmp_path,
+    monkeypatch,
+):
+    from lte_scenario_toolkit import benchmark
+    from lte_scenario_toolkit.candidate_cache import CandidateCache
+    from lte_scenario_toolkit.selection_service import SelectionService
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    config = tmp_path / "profile.yaml"
+    config.write_text("fixture", encoding="utf-8")
+    output_root = repository / "results"
+    profile = object()
+    catalog = SimpleNamespace(root=repository)
+    request, boundary, coordinates, _ = fake_benchmark_inputs(config)
+    preflight = SimpleNamespace(scenario_id="fixture")
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        benchmark,
+        "load_experiment_config",
+        lambda path: {
+            "repo_root": repository,
+            "profile_id": "fixture",
+            "scenario_id": "fixture",
+            "output_root": output_root,
+        },
+    )
+    monkeypatch.setattr(benchmark, "load_data_catalog", lambda *args, **kwargs: catalog)
+    monkeypatch.setattr(
+        benchmark,
+        "_selection_profile",
+        lambda config_values, loaded_catalog, scenario_id: profile,
+    )
+
+    def fail_cache(*_args, **_kwargs):
+        pytest.fail("benchmark input loading must not read or write candidate caches")
+
+    monkeypatch.setattr(CandidateCache, "_ensure_cache_root", fail_cache)
+    monkeypatch.setattr(CandidateCache, "load", fail_cache)
+    monkeypatch.setattr(CandidateCache, "store", fail_cache)
+
+    def prepare_preflight(self, selected_profile, *, output_root):
+        calls.append("preflight")
+        assert selected_profile is profile
+        assert output_root == repository / "results"
+        return preflight
+
+    def prepare_spatial(self, selected_preflight):
+        calls.append("prepared_selection")
+        assert selected_preflight is preflight
+        return SimpleNamespace(boundary=boundary, coordinates=coordinates)
+
+    monkeypatch.setattr(SelectionService, "preflight", prepare_preflight)
+    monkeypatch.setattr(SelectionService, "prepared_selection", prepare_spatial)
+    monkeypatch.setattr(
+        SelectionService,
+        "_request",
+        staticmethod(lambda selected_profile: request),
+    )
+
+    loaded_request, loaded_boundary, loaded_coordinates, loaded_scenario = (
+        benchmark._load_benchmark_inputs(config)
+    )
+
+    assert loaded_request is request
+    assert loaded_boundary is boundary
+    assert loaded_coordinates is coordinates
+    assert loaded_scenario == "fixture"
+    assert calls == ["preflight", "prepared_selection"]
+    assert not (repository / ".lte-data").exists()
+    assert not output_root.exists()
+
+
+def test_benchmark_main_prints_sorted_json(tmp_path, monkeypatch, capsys):
+    from lte_scenario_toolkit import benchmark
+
+    config = tmp_path / "profile.yaml"
+    monkeypatch.setattr(
+        benchmark,
+        "benchmark_profile",
+        lambda path: {"z_metric": str(path), "a_metric": 1},
+    )
+
+    exit_code = benchmark.main(["--config", str(config)])
+
+    assert exit_code == 0
+    assert capsys.readouterr().out == (
+        json.dumps({"z_metric": str(config), "a_metric": 1}, sort_keys=True)
+        + "\n"
+    )
+
+
+def test_benchmark_main_returns_nonzero_for_domain_error(tmp_path, monkeypatch, capsys):
+    from lte_scenario_toolkit import benchmark
+
+    def fail(_path):
+        raise ValueError("invalid benchmark profile")
+
+    monkeypatch.setattr(benchmark, "benchmark_profile", fail)
+
+    exit_code = benchmark.main(["--config", str(tmp_path / "profile.yaml")])
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.out == ""
+    assert captured.err == "ERROR: invalid benchmark profile\n"

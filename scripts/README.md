@@ -1,29 +1,49 @@
 # Command-line wrappers
 
-The supported data lifecycle command is the installed `lte-data` entrypoint.
-It manages scenario registration, DEM export planning/submission, shard
-ingest, and validation:
+Files in this directory are thin source-tree wrappers. Reusable behavior belongs
+in `src/lte_scenario_toolkit/`; installed console scripts are the public
+interface.
+
+## Data lifecycle
+
+`manage_data.py` delegates to `lte-data`, the CLI-only scenario registration,
+DEM export, ingest, and validation interface:
 
 ```powershell
-lte-data scenario add <scenario-id> --boundary-source <path-or-url> --provider <name> --license <terms> --redistribution-confirmed
+lte-data scenario add <scenario-id> --boundary-source <path-or-url> `
+  --provider <name> --license <terms> --redistribution-confirmed
 lte-data scenario list
 lte-data dem export <scenario-id> --dry-run
 lte-data dem ingest <scenario-id> --tiles-dir <download-directory>
 lte-data validate <scenario-id>
 ```
 
-Use `--redistribution-confirmed` only after verifying that the supplied license
-permits the normalized boundary to be tracked in this repository.
+Use `--redistribution-confirmed` only after verifying that the source license
+permits the normalized boundary to be tracked.
 
-`manage_data.py` is the thin source-tree wrapper for `lte-data`; it adds
-`src/` to `sys.path` and delegates to `lte_scenario_toolkit.data_cli.main`.
-The other wrappers serve the reproducible research workflow:
+## Experiment workflow
 
-- `select_sites.py` delegates to the package scenario selector;
-- `generate_scenario_figures.py` delegates to figure generation;
+- `select_sites.py` delegates to `lte-select-sites`. Its default interactive
+  selector is the local web candidate explorer; use `--selector legacy` for the
+  Matplotlib window or `--select-index N` for a headless deterministic choice.
+- `generate_scenario_figures.py` delegates to `lte-generate-figures`. It accepts
+  a profile, selection run, or compatible CSV and supports preview/publication
+  presets plus explicit PNG, EPS, and offline HTML formats.
+- `benchmark_candidate_scan.py` runs the opt-in production-path scanner
+  benchmark with cache and run writes disabled and prints sorted JSON metrics.
 - `create_data_manifest.py` delegates to schema-v2 manifest generation.
 
-Wrappers contain no business logic and should remain small. Add reusable
-behavior to the installed package first, then expose it through a wrapper only
-when a source-tree invocation is useful. The package console scripts in
-`pyproject.toml` are the public interface for installed environments.
+Examples:
+
+```powershell
+python scripts/select_sites.py --config configs/example.yaml --output-root results
+python scripts/generate_scenario_figures.py --run-dir <selection-run> `
+  --output-root results --format png --format html
+python scripts/benchmark_candidate_scan.py --config configs/example.yaml
+```
+
+`--output-root` creates a unique run hierarchy. The legacy `--output-dir`
+option targets one exact final directory and refuses to overwrite conflicts.
+
+The local GUI is installed as `lte-gui`; it intentionally has no source-tree
+wrapper. Install the GUI extra and run `lte-gui --check` before starting it.

@@ -1,39 +1,93 @@
-# Experiment configurations
+# Experiment profiles
 
-Files in `configs/` describe experiment parameters, not data acquisition
-provenance. The schema-v2 catalog in `data/datasets.yaml` owns provider,
-license, source URL, acquisition date, CRS, and registered entrypoints. Keep
-those concerns separate: changing a scan size does not rewrite dataset
-metadata, and registering a new source does not silently change an experiment.
+Files in `configs/` describe experiment choices. Dataset ownership remains in
+`data/datasets.yaml`: boundary and DEM paths, provider, license, acquisition
+date, CRS, checksums, and registered entrypoints are not repeated in a
+schema-version-2 profile.
 
-## Existing configurations
+## Schema version 2
 
-- `example.yaml` runs the Chicago scenario.
-- `newyork.yaml` runs the New York City scenario.
+The GUI creates profiles below `configs/<scenario-id>/<profile-id>.yaml`. A
+scenario may have multiple profiles; its catalog `config_path` identifies the
+default. Profile IDs are stable lowercase slugs and display names are free-form
+labels.
 
-Use them with the package entrypoints or their thin script wrappers:
-
-```powershell
-python scripts/select_sites.py --config configs/example.yaml
-python scripts/generate_scenario_figures.py --config configs/example.yaml
+```yaml
+schema_version: 2
+profile:
+  id: chicago-default
+  display_name: Chicago default
+  scenario_id: chicago
+inputs:
+  points_dataset_id: usa_clear_lte_base_stations
+experiment:
+  random_seed: 42
+spatial:
+  target_crs: EPSG:3857
+  rectangle_size_m: 3000
+  target_base_station_count: 30
+  count_tolerance: 0
+scan:
+  mode: fast
+  strategy: uniform
+  step_m: 10
+  max_rectangles: 100
+  minimum_center_spacing_m: 3000
+outputs:
+  root: results
+  save_csv: true
+  save_preview_png: true
+  save_terrain_png: true
+  save_terrain_eps: true
+  save_terrain_html: true
+figures:
+  preset: publication
+  colormap: terrain
+  dpi: 300
+  azimuth_deg: -60.0
+  elevation_deg: 30.0
+  vertical_exaggeration: 1.0
+  station_color: red
+  station_marker_size: 20.0
+  title: null
 ```
 
-Each YAML file contains `experiment`, `inputs`, `spatial`, `scan`, and
-`outputs` sections. Input paths are resolved against the repository root;
-outputs are resolved only when a run actually writes them. The important input
-fields are `points_root`, `points_layer`, `boundary_root`, `city`, and
-`dem_path`. Spatial and scan fields define the target CRS, rectangle size,
-point-count tolerance, search strategy, step, candidate limit, and minimum
-spacing.
+Relative output roots resolve from the repository root. A run creates a unique
+`scenario/profile/timestamp-run` directory below that root. Candidate caches
+remain in `.lte-data/cache` and can therefore be reused across output roots.
 
-## Cross-checking links
+`scan.mode: fast` stops after the configured candidate limit is satisfied.
+`scan.mode: complete` visits the complete bounded grid and retains a bounded
+result set. Both modes are deterministic for the same registered data,
+parameters, seed, and scanner version.
 
-When a catalog scenario has a `config_path`, `lte-data validate` loads that
-YAML and calls the same input-path resolver used by the experiment scripts with
-output creation disabled. It compares the selected boundary and DEM paths to
-the catalog's exact entrypoints. A malformed YAML is `config.invalid`; a
-boundary or DEM mismatch is reported separately. This catches a stale city
-name or moved raster before an experiment writes results.
+The GUI supports create, copy, rename, Save, default selection, and guarded
+delete. Overwrite and default-changing operations require confirmation. A
+default profile cannot be deleted until another same-scenario profile is
+selected.
 
-Command-line overrides remain local to a run. They do not modify the YAML,
-catalog, or generated manifest.
+## Legacy YAML compatibility
+
+The top-level `example.yaml` and `newyork.yaml` use the original
+`experiment`/`inputs`/`spatial`/`scan`/`outputs` layout. CLI commands continue to
+read them. The GUI presents their effective values as a read-only migration
+preview. An explicit Save first verifies the displayed source revision, then
+writes a canonical schema-version-2 profile and atomically keeps or repoints
+the catalog default. Effective scan and output settings are preserved; no
+legacy file changes before that confirmed Save.
+
+Legacy YAML repeats boundary and DEM paths. Those links are checked against the
+catalog so drift is reported instead of silently selecting different data.
+New profiles should use dataset IDs and let the catalog remain authoritative.
+
+## Commands
+
+```powershell
+lte-select-sites --config configs/example.yaml
+lte-generate-figures --config configs/example.yaml
+lte-gui
+```
+
+CLI overrides such as `--size`, `--target`, `--output-root`, and figure style
+options apply only to that invocation. They do not modify the profile, catalog,
+manifest, or cached source data.

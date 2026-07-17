@@ -586,10 +586,11 @@ def test_prepare_figure_source_rejects_non_authoritative_candidate(
     assert not preflight.output_root.exists()
 
 
-def test_export_publishes_traceable_csv_preview_and_exact_run_schemas(
+def test_end_to_end_fixture_run(
     selection_export_fixture,
     monkeypatch,
 ):
+    """Publish one fixture selection with traceable CSV, preview, and run schemas."""
     service, preflight, result, candidate, prepared = selection_export_fixture
     monkeypatch.setattr(
         "lte_scenario_toolkit.selection_service.gpd.read_file",
