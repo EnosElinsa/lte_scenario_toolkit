@@ -170,6 +170,16 @@ def _json_value(value: Any) -> Any:
     return str(value)
 
 
+def _force_finite_2d(geometry: Any, *, label: str) -> Any:
+    from shapely import force_2d, get_coordinates
+
+    display = force_2d(geometry)
+    coordinates = get_coordinates(display, include_z=False)
+    if coordinates.size == 0 or not np.isfinite(coordinates).all():
+        raise ValueError(f"{label} must contain finite XY coordinates")
+    return display
+
+
 def _valid_cached_png(path: Path, *, size: tuple[int, int]) -> bool:
     if not os.path.lexists(path) or _is_redirected_path(path):
         return False
@@ -498,9 +508,8 @@ class MapAssetService:
         if geometry.geom_type not in {"Polygon", "MultiPolygon"}:
             raise ValueError("geometry must be a Polygon or MultiPolygon")
         source_crs = _normalise_crs(crs, label="crs")
-        if tolerance is None:
-            display = geometry
-        else:
+        display = _force_finite_2d(geometry, label="display boundary")
+        if tolerance is not None:
             simplify_tolerance = _finite_number(tolerance, label="tolerance")
             if simplify_tolerance < 0:
                 raise ValueError("tolerance must be non-negative")
@@ -515,6 +524,7 @@ class MapAssetService:
                 always_xy=True,
             )
             display = transform(transformer.transform, display)
+        display = _force_finite_2d(display, label="display boundary")
         if display.is_empty or not display.is_valid:
             raise ValueError("display boundary is empty or invalid")
         return {
@@ -550,15 +560,18 @@ class MapAssetService:
             raise ValueError("boundary must be non-empty and valid")
         station_crs = _normalise_crs(stations.crs.to_string(), label="station CRS")
         source_boundary_crs = _normalise_crs(boundary_crs, label="boundary_crs")
+        filter_boundary = _force_finite_2d(boundary, label="station boundary")
         if source_boundary_crs != station_crs:
             transformer = Transformer.from_crs(
                 source_boundary_crs,
                 station_crs,
                 always_xy=True,
             )
-            filter_boundary = transform(transformer.transform, boundary)
-        else:
-            filter_boundary = boundary
+            filter_boundary = transform(transformer.transform, filter_boundary)
+        filter_boundary = _force_finite_2d(
+            filter_boundary,
+            label="station boundary",
+        )
 
         working = stations.copy(deep=True)
         if working.geometry.isna().any() or working.geometry.is_empty.any():
@@ -569,10 +582,14 @@ class MapAssetService:
         if subset["cell"].isna().any():
             raise ValueError("station cell values must not be null")
         display = subset.to_crs("EPSG:4326")
+        geometry_column = display.geometry.name
         features: list[dict[str, Any]] = []
         available = set(display.columns)
         for _, row in display.iterrows():
-            geometry = row.geometry
+            geometry = _force_finite_2d(
+                row[geometry_column],
+                label="station geometry",
+            )
             properties: dict[str, Any] = {}
             for field in STATION_DISPLAY_FIELDS:
                 if field == "longitude":

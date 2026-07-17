@@ -12,6 +12,7 @@ import rasterio
 from PIL import Image
 from rasterio import Affine
 from rasterio.transform import from_origin
+from shapely import from_wkt
 from shapely.geometry import Point, box
 
 import lte_scenario_toolkit.map_assets as map_assets
@@ -727,6 +728,25 @@ def test_boundary_geojson_rejects_non_polygon_geometry(tmp_path):
         service.boundary_geojson(Point(1, 1), crs="EPSG:3857")
 
 
+def test_boundary_geojson_drops_nan_z_without_mutating_exact_geometry(tmp_path):
+    exact = from_wkt(
+        "POLYGON Z ((0 0 NaN, 1 0 NaN, 1 1 NaN, 0 1 NaN, 0 0 NaN))"
+    )
+    original_wkt = exact.wkt
+
+    payload = MapAssetService(tmp_path).boundary_geojson(
+        exact,
+        crs="EPSG:4326",
+    )
+
+    coordinates = payload["geometry"]["coordinates"][0]
+    assert all(len(position) == 2 for position in coordinates)
+    assert all(np.isfinite(position).all() for position in coordinates)
+    json.dumps(payload, allow_nan=False)
+    assert exact.wkt == original_wkt
+    assert exact.has_z
+
+
 def test_station_geojson_strictly_filters_and_emits_only_display_fields(tmp_path):
     service = MapAssetService(tmp_path)
     stations = gpd.GeoDataFrame(
@@ -767,6 +787,47 @@ def test_station_geojson_strictly_filters_and_emits_only_display_fields(tmp_path
     assert properties["longitude"] != 999.0
     assert properties["latitude"] != 999.0
     assert stations.equals(original)
+
+
+def test_station_geojson_drops_nan_z_without_mutating_geodataframe(tmp_path):
+    stations = gpd.GeoDataFrame(
+        {"cell": [7]},
+        geometry=[from_wkt("POINT Z (0.5 0.5 NaN)")],
+        crs="EPSG:4326",
+    )
+    original_wkt = stations.geometry.iloc[0].wkt
+
+    payload = MapAssetService(tmp_path).station_geojson(
+        stations,
+        box(0, 0, 1, 1),
+        boundary_crs="EPSG:4326",
+    )
+
+    coordinates = payload["features"][0]["geometry"]["coordinates"]
+    assert len(coordinates) == 2
+    assert np.isfinite(coordinates).all()
+    json.dumps(payload, allow_nan=False)
+    assert stations.geometry.iloc[0].wkt == original_wkt
+    assert stations.geometry.iloc[0].has_z
+
+
+def test_station_geojson_uses_active_custom_geometry_column(tmp_path):
+    stations = gpd.GeoDataFrame(
+        {"cell": [7], "site_shape": [from_wkt("POINT Z (0.5 0.5 NaN)")]},
+        geometry="site_shape",
+        crs="EPSG:4326",
+    )
+
+    payload = MapAssetService(tmp_path).station_geojson(
+        stations,
+        box(0, 0, 1, 1),
+        boundary_crs="EPSG:4326",
+    )
+
+    assert payload["features"][0]["geometry"]["coordinates"] == (0.5, 0.5)
+    json.dumps(payload, allow_nan=False)
+    assert stations.active_geometry_name == "site_shape"
+    assert stations.site_shape.iloc[0].has_z
 
 
 @pytest.mark.parametrize("attributes", [{"name": ["missing"]}, {"cell": [None]}])
