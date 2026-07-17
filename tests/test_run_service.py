@@ -1,5 +1,6 @@
 import errno
 import json
+import os
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -224,6 +225,308 @@ def test_public_run_entry_resolution_revalidates_live_manifest(tmp_path):
     (final / "scenario.csv").unlink()
     with pytest.raises(ValueError, match="available|valid|run"):
         service.entry_for_path(final)
+
+
+def test_relocate_to_exact_directory_preserves_unrelated_files_and_moves_record_last(
+    tmp_path,
+    monkeypatch,
+):
+    exact = tmp_path / "exact"
+    exact.mkdir()
+    unrelated = exact / "notes.txt"
+    unrelated.write_text("keep\n", encoding="utf-8")
+    service = RunService(exact)
+    run = _begin_with_artifact(service)
+    (run.path / "run-config.yaml").write_text("schema_version: 2\n", encoding="utf-8")
+    final = service.publish(
+        run,
+        status="completed",
+        artifacts=["scenario.csv"],
+        metadata={
+            "entrypoint": ["lte-select-sites", "--output-dir", str(exact)],
+            "git_commit": "abc123",
+            "software_versions": {"python": "3.test"},
+            "parameters": {"rectangle_size_m": 1000},
+            "inputs": {"points": {"dataset_id": "points"}},
+        },
+    )
+    moved_to_exact = []
+    original_link = os.link
+
+    def tracking_link(path, target, *args, **kwargs):
+        destination = Path(target)
+        if destination.parent == exact:
+            moved_to_exact.append(destination.name)
+        return original_link(path, target, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", tracking_link)
+
+    relocated = service.relocate_to_exact_directory(
+        final,
+        exact,
+        compatibility_record="run-select-sites.json",
+    )
+
+    assert relocated == exact.resolve()
+    assert unrelated.read_text(encoding="utf-8") == "keep\n"
+    assert (exact / "scenario.csv").is_file()
+    assert (exact / "run-config.yaml").is_file()
+    assert (exact / "run.json").is_file()
+    assert (exact / "run-select-sites.json").is_file()
+    assert moved_to_exact[-1] == "run.json"
+    assert not final.exists()
+    assert not (exact / "chicago").exists()
+    compatibility = json.loads(
+        (exact / "run-select-sites.json").read_text(encoding="utf-8")
+    )
+    assert compatibility["timestamp"] == CREATED_AT
+    assert compatibility["command"][0] == "lte-select-sites"
+    assert compatibility["outputs"] == [str(exact / "scenario.csv")]
+    assert compatibility["run_id"] == run.run_id
+
+
+def test_figure_exact_compatibility_record_keeps_cli_provenance_and_figure_outputs(
+    tmp_path,
+):
+    exact = tmp_path / "exact"
+    service = RunService(exact)
+    run = service.begin("city", "profile", created_at=CREATED_AT)
+    _write_artifact(run, "source.csv")
+    _write_artifact(run, "terrain.png")
+    figure_spec = {"preset": "publication", "dpi": 300}
+    source = {"kind": "run", "path": "selection-run", "run_id": "a" * 32}
+    final = service.publish(
+        run,
+        status="completed",
+        artifacts=["source.csv", "terrain.png"],
+        metadata={
+            "run_kind": "figure",
+            "entrypoint": ["lte-generate-figures", "--format", "png"],
+            "git_commit": "abc123",
+            "software_versions": {"python": "3.test"},
+            "target_crs": "EPSG:3857",
+            "rectangle_size_m": 1000,
+            "figure_spec": figure_spec,
+            "source": source,
+            "inputs": {"csv": {"path": "selection.csv"}},
+        },
+    )
+
+    service.relocate_to_exact_directory(
+        final,
+        exact,
+        compatibility_record="run-generate-figures.json",
+    )
+
+    compatibility = json.loads(
+        (exact / "run-generate-figures.json").read_text(encoding="utf-8")
+    )
+    assert compatibility["command"] == [
+        "lte-generate-figures",
+        "--format",
+        "png",
+    ]
+    assert compatibility["git_commit"] == "abc123"
+    assert compatibility["software"] == {"python": "3.test"}
+    assert compatibility["outputs"] == [str(exact / "terrain.png")]
+    assert compatibility["config"]["figure_spec"] == figure_spec
+    assert compatibility["config"]["source"] == source
+    assert compatibility["config"]["target_crs"] == "EPSG:3857"
+    assert compatibility["config"]["rectangle_size_m"] == 1000
+
+
+def test_relocate_to_exact_directory_rejects_all_conflicts_before_writing(tmp_path):
+    exact = tmp_path / "exact"
+    exact.mkdir()
+    existing = exact / "scenario.csv"
+    existing.write_text("user-owned\n", encoding="utf-8")
+    service = RunService(exact)
+    run = _begin_with_artifact(service)
+    final = service.publish(
+        run,
+        status="completed",
+        artifacts=["scenario.csv"],
+    )
+
+    with pytest.raises(FileExistsError, match="conflict|scenario.csv"):
+        service.relocate_to_exact_directory(
+            final,
+            exact,
+            compatibility_record="run-select-sites.json",
+        )
+
+    assert existing.read_text(encoding="utf-8") == "user-owned\n"
+    assert not (exact / "run.json").exists()
+    assert not (exact / "run-select-sites.json").exists()
+    assert service.entry_for_path(final).run_id == run.run_id
+    assert not (final / "run-select-sites.json").exists()
+
+
+def test_relocate_to_exact_directory_rolls_back_when_manifest_move_fails(
+    tmp_path,
+    monkeypatch,
+):
+    exact = tmp_path / "exact"
+    service = RunService(exact)
+    run = _begin_with_artifact(service)
+    (run.path / "selection.json").write_text("{}\n", encoding="utf-8")
+    final = service.publish(
+        run,
+        status="completed",
+        artifacts=["scenario.csv"],
+    )
+    original_link = os.link
+    failed = False
+
+    def fail_manifest_once(path, target, *args, **kwargs):
+        nonlocal failed
+        destination = Path(target)
+        if (
+            not failed
+            and path.name == "run.json"
+            and destination.parent == exact
+        ):
+            failed = True
+            raise OSError("simulated manifest publication failure")
+        return original_link(path, target, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", fail_manifest_once)
+
+    with pytest.raises(OSError, match="manifest publication"):
+        service.relocate_to_exact_directory(
+            final,
+            exact,
+            compatibility_record="run-select-sites.json",
+        )
+
+    assert failed is True
+    assert not (exact / "scenario.csv").exists()
+    assert not (exact / "selection.json").exists()
+    assert not (exact / "run.json").exists()
+    assert not (exact / "run-select-sites.json").exists()
+    assert service.entry_for_path(final).run_id == run.run_id
+    assert (final / "scenario.csv").is_file()
+    assert (final / "selection.json").is_file()
+    assert (final / "run.json").is_file()
+    assert not (final / "run-select-sites.json").exists()
+
+
+def test_relocate_to_exact_directory_never_overwrites_a_racing_file(
+    tmp_path,
+    monkeypatch,
+):
+    exact = tmp_path / "exact"
+    service = RunService(exact)
+    run = _begin_with_artifact(service)
+    final = service.publish(
+        run,
+        status="completed",
+        artifacts=["scenario.csv"],
+    )
+    original_link = os.link
+    injected = False
+
+    def inject_conflict(path, target, *args, **kwargs):
+        nonlocal injected
+        destination = Path(target)
+        if not injected and destination == exact / "scenario.csv":
+            destination.write_text("racing-owner\n", encoding="utf-8")
+            injected = True
+        return original_link(path, target, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", inject_conflict)
+
+    with pytest.raises(FileExistsError, match="conflict|scenario.csv"):
+        service.relocate_to_exact_directory(
+            final,
+            exact,
+            compatibility_record="run-select-sites.json",
+        )
+
+    assert injected is True
+    assert (exact / "scenario.csv").read_text(encoding="utf-8") == "racing-owner\n"
+    assert not (exact / "run.json").exists()
+    assert not (exact / "run-select-sites.json").exists()
+    assert service.entry_for_path(final).run_id == run.run_id
+    assert (final / "scenario.csv").is_file()
+    assert (final / "run.json").is_file()
+
+
+def test_relocate_to_exact_directory_falls_back_when_hardlinks_are_unsupported(
+    tmp_path,
+    monkeypatch,
+):
+    exact = tmp_path / "exact"
+    service = RunService(exact)
+    run = _begin_with_artifact(service)
+    final = service.publish(
+        run,
+        status="completed",
+        artifacts=["scenario.csv"],
+    )
+
+    def unsupported_link(*args, **kwargs):
+        raise OSError(errno.ENOTSUP, "hardlinks are unavailable")
+
+    monkeypatch.setattr(os, "link", unsupported_link)
+
+    relocated = service.relocate_to_exact_directory(
+        final,
+        exact,
+        compatibility_record="run-select-sites.json",
+    )
+
+    assert relocated == exact.resolve()
+    assert (exact / "scenario.csv").read_text(encoding="utf-8").startswith(
+        "cell,lon,lat"
+    )
+    assert (exact / "run.json").is_file()
+    assert (exact / "run-select-sites.json").is_file()
+    assert not final.exists()
+    assert not (exact / "chicago").exists()
+
+
+def test_relocate_to_exact_directory_rolls_back_when_claim_cleanup_fails(
+    tmp_path,
+    monkeypatch,
+):
+    exact = tmp_path / "exact"
+    service = RunService(exact)
+    run = _begin_with_artifact(service)
+    final = service.publish(
+        run,
+        status="completed",
+        artifacts=["scenario.csv"],
+    )
+    claim = exact / ".publish-.exact-directory.lock"
+    original_unlink = Path.unlink
+    failed = False
+
+    def fail_claim_cleanup_once(path, *args, **kwargs):
+        nonlocal failed
+        if not failed and path == claim:
+            failed = True
+            raise OSError("simulated claim cleanup failure")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_claim_cleanup_once)
+
+    with pytest.raises(OSError, match="claim cleanup"):
+        service.relocate_to_exact_directory(
+            final,
+            exact,
+            compatibility_record="run-select-sites.json",
+        )
+
+    assert failed is True
+    assert claim.is_file()
+    assert not (exact / "scenario.csv").exists()
+    assert not (exact / "run.json").exists()
+    assert not (exact / "run-select-sites.json").exists()
+    assert service.entry_for_path(final).run_id == run.run_id
+    assert (final / "scenario.csv").is_file()
+    assert (final / "run.json").is_file()
+    assert not (final / "run-select-sites.json").exists()
 
 
 def test_publish_rejects_unknown_status(tmp_path):

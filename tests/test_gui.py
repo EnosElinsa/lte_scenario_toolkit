@@ -2560,6 +2560,53 @@ async def test_candidate_route_uses_one_offline_leaflet_and_preserves_it_on_view
     assert registry.get("session-1").locked_candidate.flat_grid_id == 4
 
 
+async def test_candidate_page_can_disable_all_rescan_entrypoints(user, tmp_path):
+    from dataclasses import replace
+
+    from nicegui import ui
+
+    from lte_scenario_toolkit.gui.i18n import Translator
+    from lte_scenario_toolkit.gui.pages.candidates import render_candidate_page
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    scan_calls = []
+
+    class Service:
+        def scan(self, *args, **kwargs):
+            scan_calls.append((args, kwargs))
+            return _task14_scan_result()
+
+    coordinator = JobCoordinator()
+    session = replace(
+        _task14_session(
+            tmp_path,
+            Service(),
+            map_bundle=_task14_map_bundle(tmp_path),
+        ),
+        scan_result=_task14_scan_result(),
+    )
+
+    @ui.page("/candidate-without-rescan")
+    def candidate_without_rescan():
+        render_candidate_page(
+            ui,
+            Translator("en"),
+            session,
+            coordinator,
+            allow_rescan=False,
+            auto_start=False,
+        )
+
+    try:
+        await user.open("/candidate-without-rescan")
+        for marker in ("candidate-start", "candidate-cancel", "candidate-force"):
+            await user.should_not_see(marker=marker)
+        await asyncio.sleep(0.05)
+        assert scan_calls == []
+    finally:
+        coordinator.shutdown()
+
+
 async def test_direct_candidate_route_without_session_fails_closed_offline(user, tmp_path):
     from lte_scenario_toolkit.gui.app import create_app
 

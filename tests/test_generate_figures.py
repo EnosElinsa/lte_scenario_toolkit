@@ -81,6 +81,19 @@ def test_cli_rejects_mutually_exclusive_or_missing_sources():
         generate_figures.main(["--run-dir", "run", "--config", "profile.yaml"])
     assert run_with_config.value.code == 2
 
+    with pytest.raises(SystemExit) as multiple_outputs:
+        generate_figures.main(
+            [
+                "--csv",
+                "scenario.csv",
+                "--output-root",
+                "runs",
+                "--output-dir",
+                "exact",
+            ]
+        )
+    assert multiple_outputs.value.code == 2
+
 
 @pytest.mark.parametrize(
     "arguments",
@@ -154,8 +167,24 @@ def test_run_cli_maps_style_formats_and_parent_to_service(
     calls = []
     published = tmp_path / "published"
 
-    def render(source_value, spec, service, formats, parent_run_id=None):
-        calls.append((source_value, spec, service.output_root, formats, parent_run_id))
+    def render(
+        source_value,
+        spec,
+        service,
+        formats,
+        parent_run_id=None,
+        **provenance,
+    ):
+        calls.append(
+            (
+                source_value,
+                spec,
+                service.output_root,
+                formats,
+                parent_run_id,
+                provenance,
+            )
+        )
         return published
 
     monkeypatch.setattr(generate_figures.FigureService, "render", render)
@@ -164,7 +193,7 @@ def test_run_cli_maps_style_formats_and_parent_to_service(
         [
             "--run-dir",
             str(tmp_path / "source-run"),
-            "--output-dir",
+            "--output-root",
             str(tmp_path / "runs"),
             "--preset",
             "preview",
@@ -176,6 +205,14 @@ def test_run_cli_maps_style_formats_and_parent_to_service(
             "20",
             "--vertical-exaggeration",
             "2",
+            "--colormap",
+            "viridis",
+            "--station-color",
+            "navy",
+            "--station-size",
+            "33",
+            "--title",
+            "Terrain detail",
             "--format",
             "png",
             "--format",
@@ -185,16 +222,85 @@ def test_run_cli_maps_style_formats_and_parent_to_service(
 
     assert exit_code == 0
     assert len(calls) == 1
-    _, spec, output_root, formats, parent_run_id = calls[0]
+    _, spec, output_root, formats, parent_run_id, provenance = calls[0]
     assert spec.preset == "preview"
     assert spec.dpi == 144
     assert spec.azimuth == -45
     assert spec.elevation_angle == 20
     assert spec.vertical_exaggeration == 2
+    assert spec.colormap == "viridis"
+    assert spec.station_color == "navy"
+    assert spec.station_size == 33
+    assert spec.title == "Terrain detail"
     assert output_root == (tmp_path / "runs").resolve()
     assert formats == ("png", "eps")
     assert parent_run_id == "a" * 32
+    assert provenance["entrypoint"][0] == "lte-generate-figures"
+    assert provenance["repository"] == Path.cwd().resolve()
     assert str(published) in capsys.readouterr().out
+
+
+def test_v2_config_uses_profile_figure_settings_before_cli_overrides(
+    tmp_path,
+    monkeypatch,
+):
+    csv_path = tmp_path / "scenario.csv"
+    dem_path = tmp_path / "dem.tif"
+    write_csv(csv_path, REQUIRED_ROW)
+    write_dem(dem_path)
+    source = replace(
+        FigureService.load_source(csv_path),
+        dem_path=dem_path,
+        scenario_id="city",
+        profile_id="profile",
+    )
+    from lte_scenario_toolkit.profiles import FigureSettings
+
+    profile_figure = FigureSettings(
+        preset="preview",
+        colormap="viridis",
+        dpi=144,
+        azimuth_deg=-25.0,
+        elevation_deg=18.0,
+        vertical_exaggeration=2.5,
+        station_color="navy",
+        station_marker_size=31.0,
+        title="Configured title",
+    )
+    configured_spec = generate_figures._profile_figure_spec(profile_figure)
+    monkeypatch.setattr(
+        generate_figures,
+        "_source_and_output",
+        lambda args: (source, tmp_path / "runs", ("png",), configured_spec),
+    )
+    calls = []
+    monkeypatch.setattr(
+        generate_figures.FigureService,
+        "render",
+        lambda source, spec, service, formats, parent_run_id=None, **kwargs: (
+            calls.append(spec) or tmp_path / "published"
+        ),
+    )
+
+    assert generate_figures.main(
+        [
+            "--config",
+            str(tmp_path / "profile.yaml"),
+            "--dpi",
+            "200",
+        ]
+    ) == 0
+
+    spec = calls[0]
+    assert spec.preset == "preview"
+    assert spec.colormap == "viridis"
+    assert spec.dpi == 200
+    assert spec.azimuth == -25.0
+    assert spec.elevation_angle == 18.0
+    assert spec.vertical_exaggeration == 2.5
+    assert spec.station_color == "navy"
+    assert spec.station_size == 31.0
+    assert spec.title == "Configured title"
 
 
 def test_legacy_config_cli_injects_validated_dem_and_config_crs(
@@ -230,7 +336,7 @@ def test_legacy_config_cli_injects_validated_dem_and_config_crs(
     )
     calls = []
 
-    def render(source, spec, service, formats, parent_run_id=None):
+    def render(source, spec, service, formats, parent_run_id=None, **kwargs):
         calls.append((source, formats))
         return tmp_path / "published"
 
@@ -419,7 +525,15 @@ outputs:
   save_terrain_eps: false
   save_terrain_html: false
 figures:
-  preset: publication
+  preset: preview
+  colormap: viridis
+  dpi: 144
+  azimuth_deg: -25
+  elevation_deg: 18
+  vertical_exaggeration: 2.5
+  station_color: navy
+  station_marker_size: 31
+  title: Configured title
 """.strip(),
         encoding="utf-8",
     )
@@ -432,26 +546,47 @@ figures:
     )
     calls = []
 
-    def render(source, spec, service, formats, parent_run_id=None):
-        calls.append((source, service.output_root, formats))
+    def render(source, spec, service, formats, parent_run_id=None, **kwargs):
+        calls.append((source, spec, service.output_root, formats))
         return tmp_path / "published"
 
     monkeypatch.setattr(generate_figures.FigureService, "render", render)
 
     exit_code = generate_figures.main(
-        ["--config", str(profile_path), "--csv", str(csv_path)]
+        [
+            "--config",
+            str(profile_path),
+            "--csv",
+            str(csv_path),
+            "--output-root",
+            str(tmp_path / "published-runs"),
+            "--dpi",
+            "200",
+        ]
     )
 
     assert exit_code == 0
-    source, output_root, formats = calls[0]
+    source, spec, output_root, formats = calls[0]
     assert source.dem_path == dem_path.resolve()
     assert source.scenario_id == "test-city"
     assert source.profile_id == "test-default"
-    assert output_root == (tmp_path / "runs").resolve()
+    assert spec.preset == "preview"
+    assert spec.colormap == "viridis"
+    assert spec.dpi == 200
+    assert spec.azimuth == -25
+    assert spec.elevation_angle == 18
+    assert spec.vertical_exaggeration == 2.5
+    assert spec.station_color == "navy"
+    assert spec.station_size == 31
+    assert spec.title == "Configured title"
+    assert output_root == (tmp_path / "published-runs").resolve()
     assert formats == ("png",)
 
 
-def test_latest_profile_run_uses_published_created_at_not_mtime_or_staging(tmp_path):
+def test_latest_profile_run_uses_public_entries_and_published_created_at(
+    tmp_path,
+    monkeypatch,
+):
     service = RunService(tmp_path / "runs")
 
     def publish(created_at: str, center_x: float):
@@ -522,6 +657,13 @@ def test_latest_profile_run_uses_published_created_at_not_mtime_or_staging(tmp_p
         ),
         encoding="utf-8",
     )
+    monkeypatch.setattr(
+        RunService,
+        "discover",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("figure lookup must consume public RunEntry objects")
+        ),
+    )
 
     source = generate_figures._latest_profile_run(
         service.output_root,
@@ -531,3 +673,117 @@ def test_latest_profile_run_uses_published_created_at_not_mtime_or_staging(tmp_p
 
     assert source.run_id == new_run.run_id
     assert source.run_id != old_run.run_id
+
+
+def test_legacy_output_dir_is_exact_and_preserves_unrelated_files(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    csv_path = tmp_path / "scenario.csv"
+    dem_path = tmp_path / "dem.tif"
+    write_csv(csv_path, REQUIRED_ROW)
+    write_dem(dem_path)
+    source = replace(
+        FigureService.load_source(csv_path),
+        dem_path=dem_path,
+        scenario_id="city",
+        profile_id="profile",
+    )
+    monkeypatch.setattr(
+        generate_figures.FigureService,
+        "load_source",
+        lambda path, rect_id=None: source,
+    )
+
+    def render(
+        source_value,
+        spec,
+        service,
+        formats,
+        parent_run_id=None,
+        **kwargs,
+    ):
+        run = service.begin("city", "profile")
+        artifacts = ["source.csv", *(f"terrain.{value}" for value in formats)]
+        for artifact in artifacts:
+            (run.path / artifact).write_text(artifact, encoding="utf-8")
+        return service.publish(
+            run,
+            status="completed",
+            artifacts=artifacts,
+            metadata={"run_kind": "figure"},
+        )
+
+    monkeypatch.setattr(generate_figures.FigureService, "render", render)
+    exact = tmp_path / "exact"
+    exact.mkdir()
+    (exact / "keep.txt").write_text("keep", encoding="utf-8")
+
+    exit_code = generate_figures.main(
+        [
+            "--run-dir",
+            str(tmp_path / "selection-run"),
+            "--output-dir",
+            str(exact),
+            "--format",
+            "png",
+        ]
+    )
+
+    assert exit_code == 0
+    assert (exact / "keep.txt").read_text(encoding="utf-8") == "keep"
+    assert (exact / "source.csv").is_file()
+    assert (exact / "terrain.png").is_file()
+    assert (exact / "run.json").is_file()
+    assert not (exact / "city").exists()
+    assert not list(tmp_path.glob(".lte-figure-staging-*"))
+    assert f"Figure run: {exact.resolve()}" in capsys.readouterr().out
+
+
+def test_legacy_output_dir_rejects_artifact_conflicts_before_rendering(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    csv_path = tmp_path / "scenario.csv"
+    dem_path = tmp_path / "dem.tif"
+    write_csv(csv_path, REQUIRED_ROW)
+    write_dem(dem_path)
+    source = replace(
+        FigureService.load_source(csv_path),
+        dem_path=dem_path,
+        scenario_id="city",
+        profile_id="profile",
+    )
+    monkeypatch.setattr(
+        generate_figures.FigureService,
+        "load_source",
+        lambda path, rect_id=None: source,
+    )
+    monkeypatch.setattr(
+        generate_figures.FigureService,
+        "render",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("render must not start when exact outputs conflict")
+        ),
+    )
+    exact = tmp_path / "exact"
+    exact.mkdir()
+    conflict = exact / "terrain.png"
+    conflict.write_text("original", encoding="utf-8")
+
+    exit_code = generate_figures.main(
+        [
+            "--run-dir",
+            str(tmp_path / "selection-run"),
+            "--output-dir",
+            str(exact),
+            "--format",
+            "png",
+        ]
+    )
+
+    assert exit_code == 2
+    assert conflict.read_text(encoding="utf-8") == "original"
+    assert "conflict" in capsys.readouterr().err.lower()

@@ -629,6 +629,319 @@ class RunService:
             raise ValueError("run path is not one currently available valid run")
         return matches[0]
 
+    @staticmethod
+    def _compatibility_payload(
+        entry: RunEntry,
+        exact_directory: Path,
+        compatibility_record: str,
+    ) -> dict[str, Any]:
+        """Build the former operation-record shape from a modern run manifest."""
+
+        record = _thaw_record(entry.record)
+        metadata_value = record.get("metadata", {})
+        metadata = metadata_value if isinstance(metadata_value, Mapping) else {}
+        entrypoint = metadata.get("entrypoint", [])
+        command = (
+            list(entrypoint)
+            if isinstance(entrypoint, (list, tuple))
+            and all(type(item) is str for item in entrypoint)
+            else []
+        )
+        raw_inputs = metadata.get("inputs", {})
+        inputs = []
+        if isinstance(raw_inputs, Mapping):
+            for name, value in sorted(raw_inputs.items(), key=lambda item: str(item[0])):
+                item = {"name": str(name)}
+                if isinstance(value, Mapping):
+                    item.update(_thaw_record(value))
+                inputs.append(item)
+        parameters = metadata.get("parameters", {})
+        config: dict[str, Any] = {
+            "schema_version": 2,
+            "scenario_id": record["scenario_id"],
+            "profile_id": record["profile_id"],
+            "parameters": (
+                _thaw_record(parameters) if isinstance(parameters, Mapping) else {}
+            ),
+        }
+        if (entry.run_dir / "run-config.yaml").is_file():
+            config["run_config"] = str(exact_directory / "run-config.yaml")
+        for field in (
+            "target_crs",
+            "rectangle_size_m",
+            "figure_spec",
+            "source",
+            "candidate",
+        ):
+            if field in metadata:
+                config[field] = _thaw_record(metadata[field])
+        software = metadata.get("software_versions", {})
+        artifacts = list(record.get("artifacts", []))
+        if compatibility_record.casefold() == "run-generate-figures.json":
+            artifacts = [
+                relative
+                for relative in artifacts
+                if Path(relative).name.casefold() != "source.csv"
+            ]
+        return {
+            "timestamp": record["created_at"],
+            "command": command,
+            "git_commit": metadata.get("git_commit"),
+            "config": config,
+            "inputs": inputs,
+            "software": (
+                _thaw_record(software) if isinstance(software, Mapping) else {}
+            ),
+            "outputs": [str(exact_directory / relative) for relative in artifacts],
+            "run_id": record["run_id"],
+            "status": record["status"],
+            "source_record": "run.json",
+        }
+
+    @staticmethod
+    def _exact_source_files(run_directory: Path) -> tuple[Path, ...]:
+        files: list[Path] = []
+        for source in sorted(run_directory.iterdir(), key=lambda path: path.name):
+            if source.is_symlink() or not source.is_file():
+                raise ValueError(
+                    "exact-directory publication supports regular run files only: "
+                    f"{source}"
+                )
+            files.append(source)
+        if not any(path.name.casefold() == "run.json" for path in files):
+            raise ValueError("exact-directory publication requires run.json")
+        return tuple(files)
+
+    @staticmethod
+    def _copy_file_without_replacement(source: Path, destination: Path) -> None:
+        """Fallback publication for writable filesystems without hard links."""
+
+        descriptor: int | None = None
+        created = False
+        destination_identity: tuple[int, int] | None = None
+        try:
+            mode = source.stat().st_mode & 0o777
+            descriptor = os.open(
+                destination,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                mode,
+            )
+            created = True
+            status = os.fstat(descriptor)
+            destination_identity = (status.st_dev, status.st_ino)
+            with source.open("rb") as input_stream, os.fdopen(
+                descriptor,
+                "wb",
+                closefd=True,
+            ) as output_stream:
+                descriptor = None
+                shutil.copyfileobj(input_stream, output_stream)
+                output_stream.flush()
+                os.fsync(output_stream.fileno())
+            current = destination.stat()
+            if (current.st_dev, current.st_ino) != destination_identity:
+                raise OSError(
+                    f"exact output changed during fallback publication: {destination}"
+                )
+            source.unlink()
+            created = False
+        except FileExistsError as exc:
+            raise FileExistsError(
+                f"exact output conflict: {destination.name}"
+            ) from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if created:
+                try:
+                    current = destination.stat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    if (current.st_dev, current.st_ino) == destination_identity:
+                        destination.unlink()
+
+    @staticmethod
+    def _move_file_without_replacement(source: Path, destination: Path) -> None:
+        """Move a same-filesystem regular file without an overwrite race."""
+
+        try:
+            os.link(source, destination, follow_symlinks=False)
+        except FileExistsError as exc:
+            raise FileExistsError(
+                f"exact output conflict: {destination.name}"
+            ) from exc
+        except OSError as exc:
+            fallback_errors = {
+                errno.EACCES,
+                errno.EINVAL,
+                errno.ENOSYS,
+                errno.EPERM,
+                errno.EXDEV,
+            }
+            for name in ("ENOTSUP", "EOPNOTSUPP"):
+                value = getattr(errno, name, None)
+                if value is not None:
+                    fallback_errors.add(value)
+            if exc.errno not in fallback_errors:
+                raise
+            RunService._copy_file_without_replacement(source, destination)
+            return
+        try:
+            source.unlink()
+        except BaseException as exc:
+            try:
+                destination.unlink()
+            except OSError as cleanup_error:
+                exc.add_note(
+                    "Exact-directory link cleanup also failed: "
+                    f"{destination}: {cleanup_error}"
+                )
+            raise
+
+    def relocate_to_exact_directory(
+        self,
+        run_path: str | os.PathLike[str],
+        exact_directory: str | os.PathLike[str],
+        *,
+        compatibility_record: str | None = None,
+    ) -> Path:
+        """Merge one just-published run into an exact legacy output directory.
+
+        All destination conflicts are rejected before the first move. Files are
+        rolled back to the validated unique run if publication fails, and the
+        authoritative ``run.json`` is always moved last.
+        """
+
+        raw_target = Path(exact_directory).expanduser()
+        if not raw_target.is_absolute():
+            raise ValueError("exact output directory must be absolute")
+        if raw_target.is_symlink():
+            raise ValueError("exact output directory must not be a symlink")
+        target = raw_target.resolve(strict=False)
+        if target != self.output_root:
+            raise ValueError(
+                "exact output directory must equal this RunService output root"
+            )
+        if not target.is_dir():
+            raise ValueError("exact output directory must be an existing directory")
+        entry = self.entry_for_path(run_path)
+        source_directory = entry.run_dir
+        if source_directory == target:
+            raise ValueError("published run is already the exact output directory")
+
+        compatibility_name: str | None = None
+        if compatibility_record is not None:
+            if type(compatibility_record) is not str:
+                raise ValueError("compatibility record name must be text")
+            relative = Path(compatibility_record)
+            if (
+                relative.is_absolute()
+                or len(relative.parts) != 1
+                or relative.name != compatibility_record
+                or relative.suffix.casefold() != ".json"
+                or relative.name.casefold() == "run.json"
+            ):
+                raise ValueError("compatibility record must be a safe JSON filename")
+            compatibility_name = relative.name
+
+        original_sources = self._exact_source_files(source_directory)
+        original_names = tuple(path.name for path in original_sources)
+        if compatibility_name is not None and compatibility_name in original_names:
+            raise FileExistsError(
+                f"compatibility record already exists in published run: "
+                f"{compatibility_name}"
+            )
+        planned_names = (
+            *original_names,
+            *((compatibility_name,) if compatibility_name else ()),
+        )
+
+        def conflicts() -> tuple[Path, ...]:
+            values = []
+            for name in planned_names:
+                destination = target / name
+                self._assert_contained(
+                    destination,
+                    description="exact publication destination",
+                )
+                if os.path.lexists(destination):
+                    values.append(destination)
+            return tuple(values)
+
+        initial_conflicts = conflicts()
+        if initial_conflicts:
+            names = ", ".join(path.name for path in initial_conflicts)
+            raise FileExistsError(f"exact output conflict: {names}")
+
+        generated_compatibility: Path | None = None
+        moved: list[tuple[Path, Path]] = []
+        try:
+            with self._publication_claim(target / ".exact-directory"):
+                current_entry = self.entry_for_path(source_directory)
+                if current_entry.record != entry.record:
+                    raise ValueError("published run changed before exact relocation")
+                current_sources = self._exact_source_files(source_directory)
+                if tuple(path.name for path in current_sources) != original_names:
+                    raise ValueError(
+                        "published run files changed before exact relocation"
+                    )
+                claimed_conflicts = conflicts()
+                if claimed_conflicts:
+                    names = ", ".join(path.name for path in claimed_conflicts)
+                    raise FileExistsError(f"exact output conflict: {names}")
+                if compatibility_name is not None:
+                    generated_compatibility = source_directory / compatibility_name
+                    atomic_write_json(
+                        generated_compatibility,
+                        self._compatibility_payload(
+                            entry,
+                            target,
+                            compatibility_name,
+                        ),
+                    )
+                sources = list(self._exact_source_files(source_directory))
+                sources.sort(
+                    key=lambda path: (path.name.casefold() == "run.json", path.name)
+                )
+                for source in sources:
+                    destination = target / source.name
+                    self._move_file_without_replacement(source, destination)
+                    moved.append((source, destination))
+        except BaseException as exc:
+            rollback_errors: list[str] = []
+            for source, destination in reversed(moved):
+                try:
+                    self._move_file_without_replacement(destination, source)
+                except OSError as rollback_error:
+                    rollback_errors.append(f"{destination}: {rollback_error}")
+            if (
+                generated_compatibility is not None
+                and generated_compatibility.exists()
+            ):
+                try:
+                    generated_compatibility.unlink()
+                except OSError as cleanup_error:
+                    rollback_errors.append(
+                        f"{generated_compatibility}: {cleanup_error}"
+                    )
+            if rollback_errors:
+                exc.add_note(
+                    "Exact-directory rollback also failed: "
+                    + "; ".join(rollback_errors)
+                )
+            raise
+
+        current = source_directory
+        while current != target:
+            parent = current.parent
+            try:
+                current.rmdir()
+            except OSError:
+                break
+            current = parent
+        return target
+
 
 __all__ = [
     "RunDiscovery",

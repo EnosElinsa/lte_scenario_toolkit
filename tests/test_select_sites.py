@@ -1,4 +1,6 @@
 import json
+import re
+import sys
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -381,6 +383,617 @@ def test_cli_maps_one_legacy_choice_and_builds_exact_artifact_tokens():
                 candidates=(selected, replace(selected, point_count=9)),
             ),
         )
+
+
+def test_cli_parser_defaults_to_web_and_separates_unique_and_exact_outputs(tmp_path):
+    config_path = tmp_path / "profile.yaml"
+
+    defaults = select_sites._parse_args(["--config", str(config_path)])
+    unique = select_sites._parse_args(
+        [
+            "--config",
+            str(config_path),
+            "--selector",
+            "legacy",
+            "--output-root",
+            str(tmp_path / "runs"),
+        ]
+    )
+    exact = select_sites._parse_args(
+        [
+            "--config",
+            str(config_path),
+            "--output-dir",
+            str(tmp_path / "exact"),
+        ]
+    )
+
+    assert defaults.selector == "web"
+    assert defaults.output_root is None
+    assert defaults.output_dir is None
+    assert unique.selector == "legacy"
+    assert unique.output_root == tmp_path / "runs"
+    assert unique.output_dir is None
+    assert exact.output_root is None
+    assert exact.output_dir == tmp_path / "exact"
+    with pytest.raises(SystemExit):
+        select_sites._parse_args(
+            [
+                "--config",
+                str(config_path),
+                "--output-root",
+                str(tmp_path / "runs"),
+                "--output-dir",
+                str(tmp_path / "exact"),
+            ]
+        )
+
+
+@pytest.mark.parametrize("flag", ["--output-root", "--output-dir"])
+def test_main_passes_explicit_output_override_to_config_loader(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    flag,
+):
+    config_path = tmp_path / "profile.yaml"
+    destination = tmp_path / "destination"
+    calls = []
+
+    def load(path, *, city, output_dir):
+        calls.append((Path(path), city, Path(output_dir)))
+        raise ValueError("stop after argument routing")
+
+    monkeypatch.setattr(select_sites, "load_experiment_config", load)
+
+    exit_code = select_sites.main(
+        ["--config", str(config_path), flag, str(destination)]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert calls == [(config_path, None, destination)]
+    assert "stop after argument routing" in captured.err
+
+
+def test_select_index_bypasses_both_interactive_selectors(tmp_path, monkeypatch):
+    candidate = Candidate(0, 1, 0, 0, 1, 1)
+    scan_result = ScanResult((candidate,), 1, 1, True, "row-sweep-v1")
+    results = [select_sites._legacy_result(candidate, 2)]
+    monkeypatch.setattr(
+        select_sites,
+        "_web_selected_candidate",
+        lambda *args, **kwargs: pytest.fail("web selector must be bypassed"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        select_sites.visualization,
+        "interactive_select",
+        lambda *args, **kwargs: pytest.fail("legacy selector must be bypassed"),
+    )
+    monkeypatch.setattr(
+        select_sites.scenario,
+        "choose_result",
+        lambda received, index: [received[index - 1]],
+    )
+
+    selected = select_sites._select_candidate(
+        scan_result,
+        results,
+        selector="web",
+        select_index=1,
+        points_gdf=object(),
+        boundary=object(),
+        config={"repo_root": tmp_path},
+        preflight=object(),
+        selection_service=object(),
+    )
+
+    assert selected is candidate
+
+
+@pytest.mark.parametrize("selector", ["web", "legacy"])
+def test_interactive_selector_returns_exactly_one_scanned_candidate(
+    tmp_path,
+    monkeypatch,
+    selector,
+):
+    candidate = Candidate(0, 1, 0, 0, 1, 1)
+    scan_result = ScanResult((candidate,), 1, 1, True, "row-sweep-v1")
+    results = [select_sites._legacy_result(candidate, 2)]
+    monkeypatch.setattr(
+        select_sites,
+        "_web_selected_candidate",
+        lambda *args, **kwargs: candidate,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        select_sites.visualization,
+        "interactive_select",
+        lambda *args, **kwargs: [results[0]],
+    )
+
+    selected = select_sites._select_candidate(
+        scan_result,
+        results,
+        selector=selector,
+        select_index=None,
+        points_gdf=object(),
+        boundary=object(),
+        config={"repo_root": tmp_path},
+        preflight=object(),
+        selection_service=object(),
+    )
+
+    assert selected is candidate
+
+
+def test_web_selector_import_failure_is_actionable_and_never_falls_back(
+    tmp_path,
+    monkeypatch,
+):
+    candidate = Candidate(0, 1, 0, 0, 1, 1)
+    scan_result = ScanResult((candidate,), 1, 1, True, "row-sweep-v1")
+    monkeypatch.setitem(sys.modules, "lte_scenario_toolkit.web_selector", None)
+    monkeypatch.setattr(
+        select_sites.visualization,
+        "interactive_select",
+        lambda *args, **kwargs: pytest.fail("web failure must not fall back"),
+    )
+
+    with pytest.raises(
+        select_sites.SelectorError,
+        match=r"--select-index.*--selector legacy",
+    ):
+        select_sites._web_selected_candidate(
+            scan_result,
+            preflight=object(),
+            selection_service=object(),
+            repo_root=tmp_path,
+        )
+
+
+def test_web_selector_wrapper_passes_frozen_payload_and_zero_based_choice(
+    tmp_path,
+    monkeypatch,
+):
+    from lte_scenario_toolkit import web_selector
+
+    candidate = Candidate(0, 1, 0, 0, 1, 1)
+    scan_result = ScanResult((candidate,), 1, 1, True, "row-sweep-v1")
+    profile = object()
+    preflight = SimpleNamespace(profile=profile)
+    selection_service = object()
+
+    def confirm_first(session):
+        payload = session.map_payload
+        assert payload.preflight is preflight
+        assert payload.selection_service is selection_service
+        assert payload.scan_result is scan_result
+        assert payload.repo_root == tmp_path.resolve()
+        assert session.confirm(0) is True
+
+    monkeypatch.setattr(web_selector, "_run_server", confirm_first)
+
+    selected = select_sites._web_selected_candidate(
+        scan_result,
+        preflight=preflight,
+        selection_service=selection_service,
+        repo_root=tmp_path,
+    )
+
+    assert selected is candidate
+
+
+def test_web_selector_lifecycle_error_is_mapped_to_actionable_cli_error(
+    tmp_path,
+    monkeypatch,
+):
+    from lte_scenario_toolkit import web_selector
+
+    candidate = Candidate(0, 1, 0, 0, 1, 1)
+    scan_result = ScanResult((candidate,), 1, 1, True, "row-sweep-v1")
+    preflight = SimpleNamespace(profile=object())
+    monkeypatch.setattr(
+        web_selector,
+        "_run_server",
+        lambda _session: (_ for _ in ()).throw(
+            web_selector.WebSelectorError("browser could not start")
+        ),
+    )
+
+    with pytest.raises(
+        select_sites.SelectorError,
+        match=r"browser could not start.*--select-index.*--selector legacy",
+    ):
+        select_sites._web_selected_candidate(
+            scan_result,
+            preflight=preflight,
+            selection_service=object(),
+            repo_root=tmp_path,
+        )
+
+
+def test_web_cancel_returns_none_and_untrusted_candidate_is_rejected(
+    tmp_path,
+    monkeypatch,
+):
+    candidate = Candidate(0, 1, 0, 0, 1, 1)
+    scan_result = ScanResult((candidate,), 1, 1, True, "row-sweep-v1")
+    results = [select_sites._legacy_result(candidate, 2)]
+    selected_values = iter(
+        (
+            None,
+            replace(candidate, point_count=2),
+        )
+    )
+    monkeypatch.setattr(
+        select_sites,
+        "_web_selected_candidate",
+        lambda *args, **kwargs: next(selected_values),
+    )
+
+    cancelled = select_sites._select_candidate(
+        scan_result,
+        results,
+        selector="web",
+        select_index=None,
+        points_gdf=object(),
+        boundary=object(),
+        config={"repo_root": tmp_path},
+        preflight=object(),
+        selection_service=object(),
+    )
+
+    assert cancelled is None
+    with pytest.raises(ValueError, match="exactly one"):
+        select_sites._select_candidate(
+            scan_result,
+            results,
+            selector="web",
+            select_index=None,
+            points_gdf=object(),
+            boundary=object(),
+            config={"repo_root": tmp_path},
+            preflight=object(),
+            selection_service=object(),
+        )
+
+
+def test_legacy_selector_headless_error_is_actionable_and_never_uses_web(
+    tmp_path,
+    monkeypatch,
+):
+    candidate = Candidate(0, 1, 0, 0, 1, 1)
+    scan_result = ScanResult((candidate,), 1, 1, True, "row-sweep-v1")
+    results = [select_sites._legacy_result(candidate, 2)]
+    monkeypatch.setattr(
+        select_sites,
+        "_web_selected_candidate",
+        lambda *args, **kwargs: pytest.fail("legacy failure must not use web"),
+    )
+    monkeypatch.setattr(
+        select_sites.visualization,
+        "interactive_select",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("no display")),
+    )
+
+    with pytest.raises(select_sites.SelectorError, match=r"--select-index"):
+        select_sites._select_candidate(
+            scan_result,
+            results,
+            selector="legacy",
+            select_index=None,
+            points_gdf=object(),
+            boundary=object(),
+            config={"repo_root": tmp_path},
+            preflight=object(),
+            selection_service=object(),
+        )
+
+
+def _exact_preflight(exact_dir: Path):
+    return SimpleNamespace(
+        output_root=exact_dir,
+        scenario_id="city",
+        profile=SimpleNamespace(rect_size=2, target_count=1, tolerance=0),
+    )
+
+
+@pytest.mark.parametrize(
+    ("artifacts", "conflict_name"),
+    [
+        (("csv",), "city_2m_target1_tol0.csv"),
+        (("preview_png",), "city_2m_target1_tol0.png"),
+        (("terrain_png",), "city_2m_target1_tol0_3d.png"),
+        (("terrain_eps",), "city_2m_target1_tol0_3d.eps"),
+        (("terrain_html",), "city_2m_target1_tol0_3d.html"),
+        (("csv",), "run-config.yaml"),
+        (("csv",), "selection.json"),
+        (("csv",), "run-select-sites.json"),
+        (("csv",), "run.json"),
+    ],
+)
+def test_exact_output_conflict_is_rejected_before_shared_export(
+    tmp_path,
+    artifacts,
+    conflict_name,
+):
+    exact_dir = (tmp_path / "exact").resolve()
+    exact_dir.mkdir()
+    conflict = exact_dir / conflict_name
+    conflict.write_text("original\n", encoding="utf-8")
+    candidate = Candidate(0, 1, 0, 0, 1, 1)
+    scan_result = ScanResult((candidate,), 1, 1, True, "row-sweep-v1")
+    export_called = False
+
+    class Service:
+        @staticmethod
+        def export(*args, **kwargs):
+            nonlocal export_called
+            export_called = True
+            pytest.fail("conflicts must be rejected before shared export")
+
+    with pytest.raises(FileExistsError, match=re.escape(conflict_name)):
+        select_sites._publish_candidate(
+            Service(),
+            _exact_preflight(exact_dir),
+            scan_result,
+            candidate,
+            artifacts=artifacts,
+            entrypoint=("lte-select-sites",),
+            exact_output_dir=exact_dir,
+        )
+
+    assert export_called is False
+    assert conflict.read_text(encoding="utf-8") == "original\n"
+    assert not (exact_dir / "city").exists()
+
+
+def test_explicit_output_dir_relocates_one_shared_service_run(tmp_path, monkeypatch):
+    exact_dir = (tmp_path / "exact").resolve()
+    unique_run = exact_dir / "city" / "default" / "unique-run"
+    candidate = Candidate(0, 1, 0, 0, 1, 1)
+    scan_result = ScanResult((candidate,), 1, 1, True, "row-sweep-v1")
+    preflight = _exact_preflight(exact_dir)
+    calls = []
+
+    class Service:
+        @staticmethod
+        def export(
+            received,
+            completed,
+            selected,
+            *,
+            output_root,
+            artifacts,
+            entrypoint,
+        ):
+            calls.append(
+                (
+                    received,
+                    completed,
+                    selected,
+                    Path(output_root),
+                    tuple(artifacts),
+                    tuple(entrypoint),
+                )
+            )
+            return unique_run
+
+    class RelocatingRunService:
+        def __init__(self, output_root):
+            assert Path(output_root) == exact_dir
+
+        def relocate_to_exact_directory(
+            self,
+            run_path,
+            destination,
+            *,
+            compatibility_record,
+        ):
+            assert Path(run_path) == unique_run
+            assert Path(destination) == exact_dir
+            assert compatibility_record == "run-select-sites.json"
+            return exact_dir
+
+    monkeypatch.setattr(
+        select_sites,
+        "RunService",
+        RelocatingRunService,
+        raising=False,
+    )
+
+    published = select_sites._publish_candidate(
+        Service(),
+        preflight,
+        scan_result,
+        candidate,
+        artifacts=("csv",),
+        entrypoint=("lte-select-sites", "--select-index", "1"),
+        exact_output_dir=exact_dir,
+    )
+
+    assert published == exact_dir
+    assert calls == [
+        (
+            preflight,
+            scan_result,
+            candidate,
+            exact_dir,
+            ("csv",),
+            ("lte-select-sites", "--select-index", "1"),
+        )
+    ]
+
+
+def test_explicit_output_dir_composes_real_unique_publish_and_exact_relocation(
+    tmp_path,
+):
+    exact_dir = (tmp_path / "exact").resolve()
+    candidate = Candidate(0, 1, 0, 0, 1, 1)
+    scan_result = ScanResult((candidate,), 1, 1, True, "row-sweep-v1")
+    preflight = _exact_preflight(exact_dir)
+
+    class Service:
+        @staticmethod
+        def export(
+            received,
+            completed,
+            selected,
+            *,
+            output_root,
+            artifacts,
+            entrypoint,
+        ):
+            assert received is preflight
+            assert completed is scan_result
+            assert selected is candidate
+            assert tuple(artifacts) == ("csv",)
+            assert tuple(entrypoint) == ("lte-select-sites",)
+            run_service = select_sites.RunService(output_root)
+            run = run_service.begin("city", "default")
+            (run.path / "scenario.csv").write_text("cell\n1\n", encoding="utf-8")
+            return run_service.publish(
+                run,
+                status="completed",
+                artifacts=["scenario.csv"],
+            )
+
+    published = select_sites._publish_candidate(
+        Service(),
+        preflight,
+        scan_result,
+        candidate,
+        artifacts=("csv",),
+        entrypoint=("lte-select-sites",),
+        exact_output_dir=exact_dir,
+    )
+
+    assert published == exact_dir
+    assert (exact_dir / "scenario.csv").is_file()
+    assert (exact_dir / "run.json").is_file()
+    assert (exact_dir / "run-select-sites.json").is_file()
+    assert not (exact_dir / "city").exists()
+
+
+def test_unique_output_mode_does_not_relocate_the_published_run(tmp_path, monkeypatch):
+    output_root = (tmp_path / "runs").resolve()
+    unique_run = output_root / "city" / "default" / "unique-run"
+    candidate = Candidate(0, 1, 0, 0, 1, 1)
+    scan_result = ScanResult((candidate,), 1, 1, True, "row-sweep-v1")
+    preflight = SimpleNamespace(output_root=output_root)
+
+    class Service:
+        @staticmethod
+        def export(*args, **kwargs):
+            return unique_run
+
+    monkeypatch.setattr(
+        select_sites,
+        "RunService",
+        lambda *args, **kwargs: pytest.fail("unique mode must not relocate"),
+        raising=False,
+    )
+
+    published = select_sites._publish_candidate(
+        Service(),
+        preflight,
+        scan_result,
+        candidate,
+        artifacts=("csv",),
+        entrypoint=("lte-select-sites",),
+        exact_output_dir=None,
+    )
+
+    assert published == unique_run
+
+
+def test_exact_output_conflict_is_propagated_without_cli_fallback(tmp_path, monkeypatch):
+    exact_dir = (tmp_path / "exact").resolve()
+    unique_run = exact_dir / "city" / "default" / "unique-run"
+    candidate = Candidate(0, 1, 0, 0, 1, 1)
+    scan_result = ScanResult((candidate,), 1, 1, True, "row-sweep-v1")
+    preflight = _exact_preflight(exact_dir)
+
+    class Service:
+        @staticmethod
+        def export(*args, **kwargs):
+            return unique_run
+
+    class ConflictingRunService:
+        def __init__(self, output_root):
+            assert Path(output_root) == exact_dir
+
+        @staticmethod
+        def relocate_to_exact_directory(*args, **kwargs):
+            raise FileExistsError("exact output conflict: scenario.csv")
+
+    monkeypatch.setattr(select_sites, "RunService", ConflictingRunService)
+
+    with pytest.raises(FileExistsError, match="conflict"):
+        select_sites._publish_candidate(
+            Service(),
+            preflight,
+            scan_result,
+            candidate,
+            artifacts=("csv",),
+            entrypoint=("lte-select-sites",),
+            exact_output_dir=exact_dir,
+        )
+
+
+def test_schema_v2_city_override_must_match_profile_scenario(tmp_path, capsys):
+    profile_path = tmp_path / "configs" / "default.yaml"
+    profile_path.parent.mkdir(parents=True)
+    profile_path.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 2,
+                "profile": {
+                    "id": "default",
+                    "display_name": "Default",
+                    "scenario_id": "chicago",
+                },
+                "inputs": {"points_dataset_id": "points"},
+                "experiment": {"random_seed": 7},
+                "spatial": {
+                    "target_crs": "EPSG:3857",
+                    "rectangle_size_m": 2,
+                    "target_base_station_count": 1,
+                    "count_tolerance": 0,
+                },
+                "scan": {
+                    "mode": "fast",
+                    "strategy": "sequential",
+                    "step_m": 1,
+                    "max_rectangles": 1,
+                    "minimum_center_spacing_m": 2,
+                },
+                "outputs": {"root": "results"},
+                "figures": {"preset": "publication"},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = select_sites.main(
+        [
+            "--config",
+            str(profile_path),
+            "--city",
+            "new-york-city",
+            "--select-index",
+            "1",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.out == ""
+    assert "does not match profile scenario_id 'chicago'" in captured.err
+    assert not (tmp_path / "results").exists()
 
 
 def test_cli_reports_published_artifacts_partial_errors_and_run_record(

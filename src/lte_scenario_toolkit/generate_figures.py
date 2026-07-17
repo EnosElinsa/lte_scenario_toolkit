@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from collections.abc import Mapping
 from dataclasses import replace
@@ -46,19 +47,32 @@ def _parse_args(argv=None):
     sources.add_argument("--run-dir", type=Path, help="selection run directory")
     sources.add_argument("--csv", type=Path, help="legacy scenario CSV")
     parser.add_argument("--city", help="legacy boundary directory or layer name")
-    parser.add_argument("--output-dir", type=Path, help="root for new figure runs")
+    outputs = parser.add_mutually_exclusive_group()
+    outputs.add_argument(
+        "--output-root",
+        type=Path,
+        help="root for a new uniquely named figure run",
+    )
+    outputs.add_argument(
+        "--output-dir",
+        type=Path,
+        help="legacy exact output directory; existing artifacts are not overwritten",
+    )
     parser.add_argument("--size", type=int, help="legacy rectangle size in metres")
     parser.add_argument("--target", type=int, help="legacy target base-station count")
     parser.add_argument("--rect-id", type=float, help="rectangle ID for a multi-rectangle CSV")
     parser.add_argument(
         "--preset",
         choices=("preview", "publication"),
-        default="publication",
     )
     parser.add_argument("--dpi", type=int)
     parser.add_argument("--azimuth", type=float)
     parser.add_argument("--elevation-angle", type=float)
     parser.add_argument("--vertical-exaggeration", type=float)
+    parser.add_argument("--colormap")
+    parser.add_argument("--station-color")
+    parser.add_argument("--station-size", type=float)
+    parser.add_argument("--title")
     parser.add_argument(
         "--format",
         dest="formats",
@@ -74,14 +88,37 @@ def _parse_args(argv=None):
     return args
 
 
-def _figure_spec(args) -> FigureSpec:
-    spec = FigureSpec.from_preset(args.preset)
+def _profile_figure_spec(settings: Any) -> FigureSpec:
+    base = FigureSpec.from_preset(settings.preset)
+    return replace(
+        base,
+        colormap=settings.colormap,
+        dpi=settings.dpi,
+        azimuth=settings.azimuth_deg,
+        elevation_angle=settings.elevation_deg,
+        vertical_exaggeration=settings.vertical_exaggeration,
+        station_color=settings.station_color,
+        station_size=settings.station_marker_size,
+        title=settings.title,
+    ).validate()
+
+
+def _figure_spec(args: Any, configured: FigureSpec | None = None) -> FigureSpec:
+    spec = (
+        FigureSpec.from_preset(args.preset)
+        if args.preset is not None
+        else configured or FigureSpec.from_preset("publication")
+    )
     changes: dict[str, Any] = {}
     for argument, field in (
         (args.dpi, "dpi"),
         (args.azimuth, "azimuth"),
         (args.elevation_angle, "elevation_angle"),
         (args.vertical_exaggeration, "vertical_exaggeration"),
+        (args.colormap, "colormap"),
+        (args.station_color, "station_color"),
+        (args.station_size, "station_size"),
+        (args.title, "title"),
     ):
         if argument is not None:
             changes[field] = argument
@@ -159,9 +196,10 @@ def _latest_profile_run(
     profile_id: str,
 ) -> FigureSource:
     service = RunService(output_root)
-    discovery = service.discover()
+    discovery = service.discover_entries()
     errors = [item["error"] for item in discovery.diagnostics]
-    for record in reversed(discovery.records):
+    for entry in reversed(discovery.entries):
+        record = entry.record
         metadata = record.get("metadata", {})
         if (
             record["scenario_id"] != scenario_id
@@ -171,13 +209,7 @@ def _latest_profile_run(
         ):
             continue
         try:
-            _, final_path = service._expected_paths(
-                scenario_id=record["scenario_id"],
-                profile_id=record["profile_id"],
-                created_at=record["created_at"],
-                run_id=record["run_id"],
-            )
-            return FigureService.load_source(final_path)
+            return FigureService.load_source(entry.run_dir)
         except (FileNotFoundError, ValueError) as exc:
             errors.append(f"{record['run_id']}: {exc}")
     suffix = f" Checked: {'; '.join(errors)}" if errors else ""
@@ -227,22 +259,29 @@ def _v2_config_source(
     return source, output_root, _legacy_formats(config)
 
 
-def _config_source(args) -> tuple[FigureSource, Path, tuple[str, ...]]:
+def _config_source(
+    args: Any,
+) -> tuple[FigureSource, Path, tuple[str, ...], FigureSpec | None]:
     config = load_experiment_config(
         args.config,
         city=args.city,
-        output_dir=args.output_dir,
+        output_dir=None,
     )
     if args.size is not None:
         config["rect_size"] = args.size
     if args.target is not None:
         config["target_count"] = args.target
-    if getattr(config, "profile_snapshot", None) is not None:
-        return _v2_config_source(args, config)
-    return _legacy_config_source(args, config)
+    profile = getattr(config, "profile_snapshot", None)
+    if profile is not None:
+        source, output_root, formats = _v2_config_source(args, config)
+        return source, output_root, formats, _profile_figure_spec(profile.figure)
+    source, output_root, formats = _legacy_config_source(args, config)
+    return source, output_root, formats, None
 
 
 def _default_output_root(source: FigureSource) -> Path:
+    if source.path is None:
+        raise ValueError("figure source has no path for a default output root")
     if (
         source.path.is_dir()
         and source.profile_id is not None
@@ -255,19 +294,46 @@ def _default_output_root(source: FigureSource) -> Path:
     return (base / "figure-runs").resolve()
 
 
-def _source_and_output(args) -> tuple[FigureSource, Path, tuple[str, ...]]:
+def _source_and_output(
+    args: Any,
+) -> tuple[FigureSource, Path, tuple[str, ...], FigureSpec | None]:
     if args.config is not None:
         return _config_source(args)
     if args.city is not None or args.size is not None or args.target is not None:
         raise ValueError("--city, --size, and --target require --config")
     source_path = args.run_dir if args.run_dir is not None else args.csv
     source = FigureService.load_source(source_path, rect_id=args.rect_id)
-    output_root = (
-        args.output_dir.resolve()
-        if args.output_dir is not None
-        else _default_output_root(source)
-    )
-    return source, output_root, ("png", "html")
+    return source, _default_output_root(source), ("png", "html"), None
+
+
+def _exact_output_directory(path: Path, formats: tuple[str, ...]) -> Path:
+    raw = path.expanduser()
+    if not raw.is_absolute():
+        raw = Path.cwd() / raw
+    if raw.is_symlink():
+        raise ValueError(f"exact output directory must not be a symlink: {raw}")
+    exact = raw.resolve(strict=False)
+    if os.path.lexists(exact) and not exact.is_dir():
+        raise ValueError(f"exact output directory must be a real directory: {exact}")
+    names = {
+        "source.csv",
+        "run.json",
+        "run-generate-figures.json",
+        *(f"terrain.{value}" for value in formats),
+    }
+    conflicts = sorted(name for name in names if os.path.lexists(exact / name))
+    if conflicts:
+        raise FileExistsError(f"exact output conflict: {', '.join(conflicts)}")
+    return exact
+
+
+def _repository_for_command(args: Any) -> Path:
+    if args.config is not None:
+        config_path = args.config.expanduser().resolve(strict=False)
+        for candidate in (config_path.parent, *config_path.parents):
+            if (candidate / "data" / "datasets.yaml").is_file():
+                return candidate.resolve()
+    return Path.cwd().resolve()
 
 
 def main(argv=None) -> int:
@@ -281,16 +347,39 @@ def main(argv=None) -> int:
 
     args = _parse_args(argv)
     try:
-        spec = _figure_spec(args)
-        source, output_root, defaults = _source_and_output(args)
+        source, default_output_root, defaults, configured_spec = _source_and_output(args)
+        spec = _figure_spec(args, configured_spec)
         formats = tuple(args.formats) if args.formats is not None else defaults
+        exact_output = (
+            _exact_output_directory(args.output_dir, formats)
+            if args.output_dir is not None
+            else None
+        )
+        output_root = (
+            args.output_root.resolve()
+            if args.output_root is not None
+            else exact_output or default_output_root
+        )
+        run_service = RunService(output_root)
         run_dir = FigureService.render(
             source,
             spec,
-            RunService(output_root),
+            run_service,
             formats,
             parent_run_id=source.run_id,
+            entrypoint=(
+                sys.argv
+                if argv is None
+                else ("lte-generate-figures", *argv)
+            ),
+            repository=_repository_for_command(args),
         )
+        if exact_output is not None:
+            run_dir = run_service.relocate_to_exact_directory(
+                run_dir,
+                exact_output,
+                compatibility_record="run-generate-figures.json",
+            )
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2

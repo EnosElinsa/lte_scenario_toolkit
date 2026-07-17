@@ -856,6 +856,22 @@ def _normalise_formats(formats: Iterable[str]) -> tuple[str, ...]:
     return tuple(normalised)
 
 
+def _normalise_entrypoint(entrypoint: Iterable[str] | None) -> list[str]:
+    if entrypoint is None:
+        return []
+    if isinstance(entrypoint, (str, bytes, os.PathLike)):
+        raise ValueError("entrypoint must be a collection of command arguments")
+    try:
+        command = list(entrypoint)
+    except TypeError as exc:
+        raise ValueError(
+            "entrypoint must be a collection of command arguments"
+        ) from exc
+    if any(type(item) is not str for item in command):
+        raise ValueError("entrypoint arguments must be text")
+    return command
+
+
 def _require_dem(source: FigureSource) -> Path:
     if source.dem_path is None:
         raise ValueError(
@@ -1041,6 +1057,9 @@ class FigureService:
         run_service: RunService,
         formats: Iterable[str],
         parent_run_id: str | None = None,
+        *,
+        entrypoint: Iterable[str] | None = None,
+        repository: str | os.PathLike[str] | None = None,
     ) -> Path:
         if not isinstance(source, FigureSource):
             raise ValueError("source must be a FigureSource")
@@ -1050,6 +1069,12 @@ class FigureService:
             raise ValueError("run_service must be a RunService")
         spec.validate()
         requested = _normalise_formats(formats)
+        command = _normalise_entrypoint(entrypoint)
+        repository_root = (
+            Path.cwd().resolve()
+            if repository is None
+            else Path(repository).expanduser().resolve(strict=False)
+        )
         dem_path = _require_dem(source)
         inputs = _input_metadata(source, dem_path)
         with rasterio.open(dem_path) as dem:
@@ -1137,6 +1162,10 @@ class FigureService:
                 "inputs": inputs,
                 "target_crs": source.target_crs,
                 "rectangle_size_m": source.rectangle_size_m,
+                "parameters": {
+                    "target_crs": source.target_crs,
+                    "rectangle_size_m": source.rectangle_size_m,
+                },
                 "rect_id": source.rectangle["rect_id"],
                 "rectangle": _json_safe_rectangle(source.rectangle),
                 "figure_spec": spec.as_dict(),
@@ -1146,6 +1175,9 @@ class FigureService:
                     for name in rendered_artifacts
                 },
                 "warnings": list(source.warnings),
+                "entrypoint": command,
+                "git_commit": io._git_commit(repository_root),
+                "software_versions": io.software_versions(),
             }
             publishing = True
             return run_service.publish(

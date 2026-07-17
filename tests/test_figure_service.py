@@ -452,7 +452,10 @@ def test_preview_writes_only_requested_path_and_requires_resolved_dem(tmp_path):
     assert sorted(path.name for path in output.parent.iterdir()) == ["terrain.png"]
 
 
-def test_render_publishes_full_spec_parent_and_self_contained_outputs(tmp_path):
+def test_render_publishes_full_spec_parent_and_self_contained_outputs(
+    tmp_path,
+    monkeypatch,
+):
     dem_path = write_dem(tmp_path)
     source = replace(
         FigureService.load_source(write_single_csv(tmp_path)),
@@ -465,6 +468,8 @@ def test_render_publishes_full_spec_parent_and_self_contained_outputs(tmp_path):
     )
     service = RunService(tmp_path / "runs")
     parent_run_id = "b" * 32
+    monkeypatch.setattr(io, "_git_commit", lambda repository: "abc123")
+    monkeypatch.setattr(io, "software_versions", lambda: {"python": "3.test"})
 
     run_dir = FigureService.render(
         source,
@@ -472,6 +477,8 @@ def test_render_publishes_full_spec_parent_and_self_contained_outputs(tmp_path):
         service,
         ("png", "html"),
         parent_run_id=parent_run_id,
+        entrypoint=("lte-generate-figures", "--format", "png"),
+        repository=tmp_path,
     )
 
     record = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
@@ -480,6 +487,13 @@ def test_render_publishes_full_spec_parent_and_self_contained_outputs(tmp_path):
     assert record["metadata"]["figure_spec"] == spec.as_dict()
     assert record["metadata"]["requested_formats"] == ["png", "html"]
     assert record["metadata"]["run_kind"] == "figure"
+    assert record["metadata"]["entrypoint"] == [
+        "lte-generate-figures",
+        "--format",
+        "png",
+    ]
+    assert record["metadata"]["git_commit"] == "abc123"
+    assert record["metadata"]["software_versions"] == {"python": "3.test"}
     inputs = record["metadata"]["inputs"]
     assert inputs["csv"] == {
         "path": str(source.csv_path.resolve()),

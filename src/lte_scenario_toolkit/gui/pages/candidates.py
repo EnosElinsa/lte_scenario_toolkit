@@ -1403,6 +1403,7 @@ def render_candidate_page(
     dem_style_builder: Callable[[CandidateSession, MapStyle], MapAsset] | None = None,
     on_confirm: Callable[[CandidateSession], None] | None = None,
     auto_start: bool = True,
+    allow_rescan: bool = True,
 ) -> CandidatePageView:
     """Render one progressive, offline-first candidate selection page."""
 
@@ -1490,6 +1491,10 @@ def render_candidate_page(
             force_button = ui.button(
                 translator.text("candidates.force_rescan")
             ).props("outline").mark("candidate-force")
+            if not allow_rescan:
+                for button in (start_button, cancel_button, force_button):
+                    button.disable()
+                    button.set_visibility(False)
             ui.separator().props("vertical")
             previous_button = ui.button(
                 translator.text("candidates.previous")
@@ -1624,9 +1629,11 @@ def render_candidate_page(
     def set_scan_buttons(state: CandidatePageState) -> None:
         running = state.phase in {"starting", "cache", "scanning", "cancelling"}
         any_job = coordinator.snapshot().active
-        start_button.set_enabled(not running and not any_job)
-        cancel_button.set_enabled(state.phase in {"starting", "cache", "scanning"})
-        force_button.set_enabled(not running and not any_job)
+        start_button.set_enabled(allow_rescan and not running and not any_job)
+        cancel_button.set_enabled(
+            allow_rescan and state.phase in {"starting", "cache", "scanning"}
+        )
+        force_button.set_enabled(allow_rescan and not running and not any_job)
         previous_button.set_enabled(bool(state.candidates))
         next_button.set_enabled(bool(state.candidates))
         choose_id_button.set_enabled(bool(state.candidates))
@@ -2018,6 +2025,8 @@ def render_candidate_page(
         refresh(state)
 
     def start_scan(*, force: bool = False) -> None:
+        if not allow_rescan:
+            return
         try:
             controller.start_scan(force=force)
         except JobBusyError:
@@ -2030,6 +2039,8 @@ def render_candidate_page(
         refresh(controller.state)
 
     def cancel_scan() -> None:
+        if not allow_rescan:
+            return
         if controller.cancel_scan():
             refresh(controller.state)
 
@@ -2254,7 +2265,7 @@ def render_candidate_page(
 
     ui.context.client.on_delete(cleanup)
     switch_view(controller.state.view)
-    if auto_start and session.scan_result is None:
+    if auto_start and allow_rescan and session.scan_result is None:
         start_scan()
     else:
         refresh(controller.state)

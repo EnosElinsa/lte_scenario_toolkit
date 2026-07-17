@@ -528,6 +528,8 @@ class FigureController:
                     RunService(output_root),
                     requested,
                     parent_run_id=parent_run_id,
+                    entrypoint=("lte-gui", "figures"),
+                    repository=self.repo_root,
                 )
                 entry = RunService(output_root).entry_for_path(path)
                 record = entry.record

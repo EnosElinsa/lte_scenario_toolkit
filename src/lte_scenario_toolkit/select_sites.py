@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from dataclasses import replace
@@ -19,7 +20,12 @@ from .candidate_scanner import Candidate, ScanResult
 from .config import load_experiment_config
 from .data_catalog import CatalogError, DataCatalog, load_data_catalog
 from .profiles import ExperimentProfile, FigureSettings, OutputSettings, load_profile
+from .run_service import RunService
 from .selection_service import SelectionPreflight, SelectionProgress, SelectionService
+
+
+class SelectorError(ValueError):
+    """Raised when an explicitly requested interactive selector cannot run."""
 
 
 def _points_dataset_id(catalog: DataCatalog, points_path: Path) -> str:
@@ -170,6 +176,96 @@ def _chosen_candidate(
     return matches[0]
 
 
+def _scanned_candidate(value: Any, scan_result: ScanResult) -> Candidate:
+    """Resolve one selector value to exactly one completed-scan candidate."""
+
+    if not isinstance(value, Candidate):
+        raise ValueError("Selector must return one scanned Candidate")
+    matches = [candidate for candidate in scan_result.candidates if candidate == value]
+    if len(matches) != 1:
+        raise ValueError("Selected candidate must match exactly one completed scan candidate")
+    return matches[0]
+
+
+def _web_selected_candidate(
+    scan_result: ScanResult,
+    *,
+    preflight: SelectionPreflight,
+    selection_service: SelectionService,
+    repo_root: str | Path,
+) -> Candidate | None:
+    """Run the optional local web selector without importing it for other modes."""
+
+    guidance = (
+        "Use --select-index in headless environments, or --selector legacy only "
+        "when a supported display is available."
+    )
+    try:
+        from .web_selector import (
+            WebSelectorError,
+            WebSelectorPayload,
+            select_candidate,
+        )
+    except ImportError as exc:
+        raise SelectorError(f"Web selector is unavailable: {exc}. {guidance}") from exc
+
+    try:
+        payload = WebSelectorPayload(
+            preflight=preflight,
+            selection_service=selection_service,
+            scan_result=scan_result,
+            repo_root=Path(repo_root).expanduser().resolve(strict=False),
+        )
+        return select_candidate(scan_result.candidates, map_payload=payload)
+    except (ImportError, WebSelectorError) as exc:
+        raise SelectorError(f"Web selector could not start: {exc}. {guidance}") from exc
+
+
+def _select_candidate(
+    scan_result: ScanResult,
+    legacy_results: list[dict[str, Any]],
+    *,
+    selector: str,
+    select_index: int | None,
+    points_gdf: Any,
+    boundary: Any,
+    config: dict[str, Any],
+    preflight: SelectionPreflight,
+    selection_service: SelectionService,
+) -> Candidate | None:
+    """Select one candidate, with an explicit index bypassing both GUIs."""
+
+    if select_index is not None:
+        return _chosen_candidate(
+            scenario.choose_result(legacy_results, select_index),
+            scan_result,
+        )
+    if selector == "web":
+        selected = _web_selected_candidate(
+            scan_result,
+            preflight=preflight,
+            selection_service=selection_service,
+            repo_root=config["repo_root"],
+        )
+        return None if selected is None else _scanned_candidate(selected, scan_result)
+    if selector == "legacy":
+        try:
+            chosen = visualization.interactive_select(
+                points_gdf,
+                boundary,
+                legacy_results,
+                config,
+            )
+        except Exception as exc:
+            raise SelectorError(
+                "Legacy selector could not start on this display. "
+                "Use --select-index, or use --selector web when the local web GUI "
+                f"is installed: {exc}"
+            ) from exc
+        return None if not chosen else _chosen_candidate(chosen, scan_result)
+    raise ValueError("selector must be web or legacy")
+
+
 def _export_artifacts(config: dict[str, Any]) -> tuple[str, ...]:
     """Translate legacy output flags to the service's stable artifact tokens."""
 
@@ -181,6 +277,94 @@ def _export_artifacts(config: dict[str, Any]) -> tuple[str, ...]:
         ("save_terrain_html", "terrain_html"),
     )
     return tuple(token for flag, token in flags if config.get(flag, True))
+
+
+def _exact_output_names(
+    preflight: SelectionPreflight,
+    artifacts: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Return the fixed filenames that one exact-directory export would publish."""
+
+    profile = preflight.profile
+    base = (
+        f"{preflight.scenario_id}_{profile.rect_size}m_"
+        f"target{profile.target_count}_tol{profile.tolerance}"
+    )
+    artifact_names = {
+        "csv": f"{base}.csv",
+        "preview_png": f"{base}.png",
+        "terrain_png": f"{base}_3d.png",
+        "terrain_eps": f"{base}_3d.eps",
+        "terrain_html": f"{base}_3d.html",
+    }
+    try:
+        selected_names = tuple(artifact_names[token] for token in artifacts)
+    except KeyError as exc:
+        raise ValueError(f"Unsupported selection artifact: {exc.args[0]}") from exc
+    return (
+        "run-config.yaml",
+        "selection.json",
+        "run-select-sites.json",
+        "run.json",
+        *selected_names,
+    )
+
+
+def _require_available_exact_output(
+    exact_dir: Path,
+    planned_names: tuple[str, ...],
+) -> None:
+    """Reject every direct target conflict before shared export creates a run."""
+
+    if os.path.lexists(exact_dir) and not exact_dir.is_dir():
+        raise FileExistsError(f"exact output path is not a directory: {exact_dir}")
+    conflicts = tuple(
+        exact_dir / name
+        for name in planned_names
+        if os.path.lexists(exact_dir / name)
+    )
+    if conflicts:
+        names = ", ".join(path.name for path in conflicts)
+        raise FileExistsError(f"exact output conflict: {names}")
+
+
+def _publish_candidate(
+    selection_service: SelectionService,
+    preflight: SelectionPreflight,
+    scan_result: ScanResult,
+    candidate: Candidate,
+    *,
+    artifacts: tuple[str, ...],
+    entrypoint: tuple[str, ...] | list[str],
+    exact_output_dir: str | Path | None,
+) -> Path:
+    """Publish through the shared service, optionally relocating for legacy CLI use."""
+
+    exact_dir: Path | None = None
+    if exact_output_dir is not None:
+        exact_dir = Path(exact_output_dir).expanduser().resolve(strict=False)
+        if exact_dir != Path(preflight.output_root).expanduser().resolve(strict=False):
+            raise ValueError("exact output directory must match the validated output root")
+        _require_available_exact_output(
+            exact_dir,
+            _exact_output_names(preflight, artifacts),
+        )
+
+    run_dir = selection_service.export(
+        preflight,
+        scan_result,
+        candidate,
+        output_root=preflight.output_root,
+        artifacts=artifacts,
+        entrypoint=entrypoint,
+    )
+    if exact_dir is None:
+        return Path(run_dir)
+    return RunService(exact_dir).relocate_to_exact_directory(
+        run_dir,
+        exact_dir,
+        compatibility_record="run-select-sites.json",
+    )
 
 
 def _report_published_run(run_dir: Path) -> None:
@@ -345,9 +529,25 @@ def _parse_args(argv=None):
         help="experiment YAML; paths are repository-relative",
     )
     parser.add_argument("--city", help="boundary directory or layer name")
-    parser.add_argument("--output-dir", type=Path, help="write outputs directly to this directory")
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument(
+        "--output-dir",
+        type=Path,
+        help="legacy exact final directory; existing artifact names are never overwritten",
+    )
+    output.add_argument(
+        "--output-root",
+        type=Path,
+        help="root for a new unique scenario/profile/run directory",
+    )
     parser.add_argument("--size", type=int, help="override rectangle size in metres")
     parser.add_argument("--target", type=int, help="override target base-station count")
+    parser.add_argument(
+        "--selector",
+        choices=("web", "legacy"),
+        default="web",
+        help="interactive selector used when --select-index is absent (default: web)",
+    )
     parser.add_argument(
         "--select-index",
         type=int,
@@ -367,10 +567,13 @@ def main(argv=None) -> int:
 
     args = _parse_args(argv)
     try:
+        output_override = (
+            args.output_dir if args.output_dir is not None else args.output_root
+        )
         config = load_experiment_config(
             args.config,
             city=args.city,
-            output_dir=args.output_dir,
+            output_dir=output_override,
         )
         if args.size is not None:
             config["rect_size"] = args.size
@@ -437,27 +640,31 @@ def main(argv=None) -> int:
 
     try:
         scenario.verify_results(results, coordinates, config["rect_size"])
-        if args.select_index is None:
-            chosen = visualization.interactive_select(
-                points_gdf,
-                boundary,
-                results,
-                config,
-            )
-        else:
-            chosen = scenario.choose_result(results, args.select_index)
-        if not chosen:
+        selected_candidate = _select_candidate(
+            scan_result,
+            results,
+            selector=args.selector,
+            select_index=args.select_index,
+            points_gdf=points_gdf,
+            boundary=boundary,
+            config=config,
+            preflight=preflight,
+            selection_service=selection_service,
+        )
+        if selected_candidate is None:
             print("No rectangle selected", file=sys.stderr)
             return 2
-        selected_candidate = _chosen_candidate(chosen, scan_result)
-        run_dir = selection_service.export(
+        run_dir = _publish_candidate(
+            selection_service,
             preflight,
             scan_result,
             selected_candidate,
-            output_root=preflight.output_root,
             artifacts=_export_artifacts(config),
             entrypoint=(
                 sys.argv if argv is None else ["lte-select-sites", *argv]
+            ),
+            exact_output_dir=(
+                preflight.output_root if args.output_dir is not None else None
             ),
         )
         _report_published_run(run_dir)

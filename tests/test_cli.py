@@ -27,6 +27,8 @@ def test_select_sites_exposes_reproducible_configuration_arguments():
     assert "--config" in help_text
     assert "--city" in help_text
     assert "--output-dir" in help_text
+    assert "--output-root" in help_text
+    assert "--selector" in help_text
     assert "--select-index" in help_text
     assert not (ROOT / "select_sites.py").exists()
 
