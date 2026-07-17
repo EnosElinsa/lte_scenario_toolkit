@@ -131,6 +131,173 @@ body,
   background: var(--lte-canvas);
 }
 
+.lte-page {
+  width: min(1380px, 100%);
+  margin: 0 auto;
+  gap: var(--lte-space-4);
+}
+
+.lte-page-title {
+  color: var(--lte-ink);
+  font-size: 24px;
+  font-weight: 680;
+  letter-spacing: -0.02em;
+}
+
+.lte-page-subtitle,
+.lte-card-id {
+  color: var(--lte-ink-soft);
+  font-size: 13px;
+}
+
+.lte-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  width: 100%;
+  gap: var(--lte-space-4);
+}
+
+.lte-scenario-card,
+.lte-guidance-card,
+.lte-form-card {
+  min-width: 0;
+  padding: var(--lte-space-4);
+  border: 1px solid var(--lte-border);
+  border-radius: var(--lte-radius-sm);
+  background: #ffffff;
+  box-shadow: 0 8px 22px rgb(16 42 46 / 6%);
+}
+
+.lte-scenario-card {
+  width: 100%;
+  align-self: stretch;
+  gap: var(--lte-space-3);
+}
+
+.lte-card-title,
+.lte-section-title {
+  color: var(--lte-ink);
+  font-size: 16px;
+  font-weight: 650;
+}
+
+.lte-status-chip {
+  min-height: 24px;
+  color: var(--lte-ink);
+  background: #edf4f3;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.lte-status-chip--ready {
+  color: #075c53;
+  background: #d8f5ef;
+}
+
+.lte-status-chip--dem-pending,
+.lte-status-chip--boundary-ready {
+  color: #77580b;
+  background: #fff2c9;
+}
+
+.lte-status-chip--invalid {
+  color: #962f3b;
+  background: #ffe3e6;
+}
+
+.lte-card-actions,
+.lte-profile-actions {
+  align-items: center;
+  gap: var(--lte-space-2);
+}
+
+.lte-card-actions .q-btn,
+.lte-profile-actions .q-btn {
+  min-height: 34px;
+  border-radius: var(--lte-radius-sm);
+  box-shadow: none;
+}
+
+.lte-cli-guidance {
+  width: 100%;
+  overflow-x: auto;
+  border: 1px solid #d7e3e1;
+  border-radius: var(--lte-radius-sm);
+  background: #f5f8f8;
+  color: #173b3f;
+  font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+}
+
+.lte-validation-result {
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.lte-validation-result--ok {
+  color: #08766d;
+}
+
+.lte-validation-result--error {
+  color: #a12635;
+}
+
+.lte-validation-message {
+  color: var(--lte-ink-soft);
+  font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+}
+
+.lte-configure-page {
+  max-width: 1040px;
+}
+
+.lte-profile-select {
+  width: min(420px, 100%);
+}
+
+.lte-dirty-indicator {
+  color: var(--lte-ink-soft);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.lte-dirty-indicator--dirty {
+  color: #8b6100;
+}
+
+.lte-form-card {
+  width: 100%;
+  gap: var(--lte-space-4);
+}
+
+.lte-form-grid {
+  width: 100%;
+  gap: var(--lte-space-3) var(--lte-space-4);
+}
+
+.lte-form-grid > * {
+  min-width: 0;
+}
+
+.lte-callout {
+  width: 100%;
+  padding: var(--lte-space-3) var(--lte-space-4);
+  border-left: 3px solid var(--lte-accent);
+  background: #f2f8f7;
+}
+
+.lte-callout--warning {
+  border-left-color: #b17a00;
+  background: #fff8e5;
+}
+
+.lte-confirmation-dialog {
+  width: min(460px, calc(100vw - 32px));
+  gap: var(--lte-space-3);
+  border-radius: var(--lte-radius-sm);
+}
+
 a:focus-visible,
 button:focus-visible,
 [tabindex]:focus-visible,
@@ -161,6 +328,14 @@ button:disabled,
   .lte-job-status,
   .lte-app-status {
     display: none;
+  }
+
+  .lte-main {
+    padding: var(--lte-space-4);
+  }
+
+  .lte-form-grid {
+    grid-template-columns: 1fr !important;
   }
 }
 @media (prefers-reduced-motion: reduce) {

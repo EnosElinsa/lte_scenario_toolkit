@@ -5,15 +5,72 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import sys
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
+from typing import Any
 
 from ..data_catalog import CatalogError, DataCatalog, load_data_catalog
+from ..jobs import JobCoordinator
+from ..profiles import ProfileStore
+from ..selection_service import SelectionService
 from .i18n import Translator, validate_translations
 from .layout import render_app_shell
+from .pages.configure import render_configure_page, render_configure_picker
+from .pages.scenarios import (
+    get_job_coordinator,
+    render_scenarios_page,
+    shutdown_job_coordinator,
+)
 from .settings import GuiSettingsError, GuiSettingsStore
 
 GUI_INSTALL_INSTRUCTION = 'python -m pip install -e ".[gui]"'
+
+
+class _EmptyProfileStore:
+    def discover(self, scenario_id: str | None = None) -> list[Any]:
+        return []
+
+
+def _default_profile_store(catalog: Any) -> Any:
+    path = getattr(catalog, "path", None)
+    if path is None:
+        return _EmptyProfileStore()
+    return ProfileStore(catalog.root, path)
+
+
+def _default_catalog_loader(catalog: Any) -> Any:
+    path = getattr(catalog, "path", None)
+    if path is None:
+        return catalog
+    return load_data_catalog(path, repo_root=catalog.root)
+
+
+@dataclass(slots=True)
+class GuiRuntime:
+    """Mutable application services refreshed after repository profile writes."""
+
+    catalog: Any
+    profile_store: Any
+    catalog_loader: Callable[[Any], Any] = _default_catalog_loader
+    selection_service_factory: Callable[[Any], Any] = SelectionService
+    coordinator: JobCoordinator = field(default_factory=get_job_coordinator)
+    selection_service: Any = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.selection_service = self.selection_service_factory(self.catalog)
+
+    def refresh_after_profile_mutation(self) -> Any:
+        """Reload catalog-owned defaults and rebuild the selection service."""
+
+        refreshed_catalog = self.catalog_loader(self.catalog)
+        refreshed_selection_service = self.selection_service_factory(
+            refreshed_catalog
+        )
+        self.catalog = refreshed_catalog
+        self.selection_service = refreshed_selection_service
+        return self.catalog
 
 
 def _port(value: str) -> int:
@@ -59,7 +116,15 @@ def _css_text() -> str:
     )
 
 
-def create_app(catalog: DataCatalog | None = None, testing: bool = False):
+def create_app(
+    catalog: DataCatalog | None = None,
+    testing: bool = False,
+    *,
+    profile_store: Any | None = None,
+    catalog_loader: Callable[[Any], Any] | None = None,
+    selection_service_factory: Callable[[Any], Any] = SelectionService,
+    coordinator: JobCoordinator | None = None,
+):
     """Register and return the NiceGUI application for one validated catalog."""
 
     from nicegui import app, ui
@@ -74,15 +139,28 @@ def create_app(catalog: DataCatalog | None = None, testing: bool = False):
     store = GuiSettingsStore(repo_root)
     initial_settings = store.load()
     validate_translations()
+    uses_shared_coordinator = coordinator is None
+    runtime = GuiRuntime(
+        catalog,
+        profile_store=(
+            profile_store if profile_store is not None else _default_profile_store(catalog)
+        ),
+        catalog_loader=catalog_loader or _default_catalog_loader,
+        selection_service_factory=selection_service_factory,
+        coordinator=get_job_coordinator() if coordinator is None else coordinator,
+    )
 
     ui.add_css(_css_text(), shared=True)
 
-    @ui.page(
-        "/",
-        title=Translator(initial_settings.language).text("app.title"),
-        reconnect_timeout=0 if testing else 3.0,
-    )
-    def index() -> None:
+    if hasattr(app, "on_shutdown") and uses_shared_coordinator:
+        app.on_shutdown(shutdown_job_coordinator)
+
+    page_options = {
+        "title": Translator(initial_settings.language).text("app.title"),
+        "reconnect_timeout": 0 if testing else 3.0,
+    }
+
+    def render_shell(active_route: str, body: Callable[[Translator], None]) -> None:
         settings = store.load()
         translator = Translator(settings.language)
 
@@ -97,12 +175,65 @@ def create_app(catalog: DataCatalog | None = None, testing: bool = False):
                 return
             ui.navigate.reload()
 
-        render_app_shell(
+        content = render_app_shell(
             ui,
             translator,
-            active_route="/",
+            active_route=active_route,
             active_job=None,
             on_language_change=change_language,
+        )
+        with content:
+            body(translator)
+
+    @ui.page("/configure/{scenario_id}", **page_options)
+    def configure_scenario(scenario_id: str, profile: str | None = None) -> None:
+        render_shell(
+            "/configure",
+            lambda translator: render_configure_page(
+                ui,
+                translator,
+                runtime.catalog,
+                runtime.profile_store,
+                runtime.selection_service,
+                scenario_id=scenario_id,
+                selected_profile_id=profile,
+                on_profile_mutation=runtime.refresh_after_profile_mutation,
+            ),
+        )
+
+    @ui.page("/configure", **page_options)
+    def configure_picker() -> None:
+        render_shell(
+            "/configure",
+            lambda translator: render_configure_picker(
+                ui,
+                translator,
+                runtime.catalog,
+            ),
+        )
+
+    @ui.page("/scenarios", **page_options)
+    def scenarios() -> None:
+        render_shell(
+            "/scenarios",
+            lambda translator: render_scenarios_page(
+                ui,
+                translator,
+                runtime.catalog,
+                coordinator=runtime.coordinator,
+            ),
+        )
+
+    @ui.page("/", **page_options)
+    def index() -> None:
+        render_shell(
+            "/scenarios",
+            lambda translator: render_scenarios_page(
+                ui,
+                translator,
+                runtime.catalog,
+                coordinator=runtime.coordinator,
+            ),
         )
 
     return app

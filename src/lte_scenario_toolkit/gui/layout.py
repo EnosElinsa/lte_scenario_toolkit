@@ -8,7 +8,7 @@ from typing import Any
 from .i18n import Translator
 
 _NAVIGATION = (
-    ("nav.scenarios", "/"),
+    ("nav.scenarios", "/scenarios"),
     ("nav.configure", "/configure"),
     ("nav.figures", "/figures"),
     ("nav.history", "/history"),
