@@ -1843,3 +1843,881 @@ def test_custom_coordinator_does_not_create_or_own_shared_coordinator(
     )
 
     assert calls == []
+
+
+def _task14_scan_result(*, completed=True):
+    from lte_scenario_toolkit.candidate_scanner import Candidate, ScanResult
+
+    return ScanResult(
+        candidates=(
+            Candidate(0, 1, 0.0, 0.0, 0.5, 0.5),
+            Candidate(4, 2, 0.25, 0.25, 0.75, 0.75),
+        ),
+        checked_positions=10,
+        total_positions=10,
+        completed=completed,
+        algorithm_version="row-sweep-v1",
+    )
+
+
+def test_candidate_state_layout_switch_preserves_identity_map_and_layers():
+    from lte_scenario_toolkit.gui.pages.candidates import CandidatePageState
+
+    state = CandidatePageState.from_scan("job-1", _task14_scan_result())
+    state = (
+        state.with_view("map")
+        .with_selected(1)
+        .with_map_bounds((-1.0, -2.0, 3.0, 4.0))
+        .with_layer("stations", False)
+        .with_dem(opacity=0.4)
+    )
+
+    switched = state.with_view("filmstrip")
+
+    assert switched.selected_flat_grid_id == 4
+    assert switched.selected_index == 1
+    assert switched.map_bounds == (-1.0, -2.0, 3.0, 4.0)
+    assert "stations" not in switched.enabled_layers
+    assert switched.dem_opacity == pytest.approx(0.4)
+    assert switched.phase == state.phase
+    with pytest.raises(FrozenInstanceError):
+        switched.view = "map"
+
+
+def test_candidate_confirm_requires_authoritative_completed_result_and_selection():
+    from lte_scenario_toolkit.gui.pages.candidates import CandidatePageState
+
+    running = CandidatePageState.from_scan(
+        "job-1", _task14_scan_result(completed=False)
+    )
+    complete = CandidatePageState.from_scan("job-1", _task14_scan_result())
+
+    assert running.with_selected(0).can_confirm is False
+    assert complete.can_confirm is False
+    assert complete.with_selected(0).can_confirm is True
+    assert complete.with_selected_flat_grid_id(999).can_confirm is False
+
+
+def test_final_scan_reorder_preserves_selection_only_by_flat_grid_id():
+    from dataclasses import replace
+
+    from lte_scenario_toolkit.gui.pages.candidates import CandidatePageState
+
+    result = _task14_scan_result()
+    selected = CandidatePageState.from_scan("job-1", result).with_selected(1)
+    reordered = replace(result, candidates=tuple(reversed(result.candidates)))
+
+    preserved = selected.with_scan_result(reordered)
+    removed = selected.with_scan_result(
+        replace(result, candidates=(result.candidates[0],))
+    )
+
+    assert preserved.selected_flat_grid_id == 4
+    assert preserved.selected_index == 0
+    assert removed.selected_flat_grid_id is None
+    assert removed.statistics is None
+
+
+def test_final_scan_keeps_elapsed_and_failed_scan_clears_provisional_details():
+    from dataclasses import replace
+
+    from lte_scenario_toolkit.gui.pages.candidates import CandidatePageState
+
+    provisional = CandidatePageState.starting("job-1")
+    provisional = replace(
+        provisional,
+        elapsed_seconds=2.75,
+        candidates=_task14_scan_result().candidates,
+        found_count=2,
+        selected_flat_grid_id=4,
+    )
+
+    completed = provisional.with_scan_result(_task14_scan_result())
+    failed = provisional.failed(
+        "bad scan",
+        code="scan.failed",
+        details={"dataset": "points"},
+    )
+
+    assert completed.elapsed_seconds == pytest.approx(2.75)
+    assert failed.candidates == ()
+    assert failed.selected_flat_grid_id is None
+    assert failed.error_code == "scan.failed"
+    assert failed.error_details == (("dataset", "points"),)
+
+
+def test_progress_reducer_replays_deltas_and_ignores_stale_jobs():
+    from dataclasses import replace
+
+    from lte_scenario_toolkit.candidate_scanner import Candidate
+    from lte_scenario_toolkit.gui.pages.candidates import (
+        CandidatePageState,
+        CandidateProgressEvent,
+        reduce_progress,
+    )
+    from lte_scenario_toolkit.selection_service import SelectionProgress
+
+    first, selected = _task14_scan_result().candidates
+    state = CandidatePageState.starting("job-2")
+    event = SelectionProgress(
+        phase="scanning",
+        checked_positions=5,
+        total_positions=10,
+        candidate_count=2,
+        elapsed_seconds=0.25,
+        added_candidates=(first, selected),
+        removed_flat_grid_ids=(),
+        cache_status="miss",
+        cache_key="key-1",
+    )
+    state = reduce_progress(
+        state,
+        CandidateProgressEvent("job-2", event),
+    ).with_selected_flat_grid_id(4)
+    replacement = Candidate(8, 3, 1.0, 1.0, 1.5, 1.5)
+    replacing = replace(
+        event,
+        checked_positions=10,
+        candidate_count=2,
+        added_candidates=(replacement,),
+        removed_flat_grid_ids=(4,),
+        phase="completed",
+    )
+
+    updated = reduce_progress(state, CandidateProgressEvent("job-2", replacing))
+    stale = reduce_progress(updated, CandidateProgressEvent("old-job", event))
+
+    assert tuple(candidate.flat_grid_id for candidate in updated.candidates) == (0, 8)
+    assert updated.selected_flat_grid_id is None
+    assert updated.checked_positions == 10
+    assert updated.found_count == 2
+    assert updated.cache_status == "miss"
+    assert updated.scan_completed is False
+    assert stale is updated
+
+
+def test_progress_duplicate_upsert_does_not_duplicate_candidate():
+    from dataclasses import replace
+
+    from lte_scenario_toolkit.gui.pages.candidates import (
+        CandidatePageState,
+        reduce_progress,
+    )
+    from lte_scenario_toolkit.selection_service import SelectionProgress
+
+    candidate = _task14_scan_result().candidates[0]
+    event = SelectionProgress(
+        phase="scanning",
+        checked_positions=1,
+        total_positions=2,
+        candidate_count=1,
+        elapsed_seconds=0.1,
+        added_candidates=(candidate,),
+        removed_flat_grid_ids=(),
+        cache_status="hit",
+        cache_key="key",
+    )
+    state = reduce_progress(CandidatePageState.starting("job"), event)
+    state = reduce_progress(
+        state,
+        replace(event, added_candidates=(replace(candidate, point_count=9),)),
+    )
+
+    assert len(state.candidates) == 1
+    assert state.candidates[0].point_count == 9
+
+
+def test_progress_cannot_revive_a_cancelling_scan():
+    from lte_scenario_toolkit.gui.pages.candidates import (
+        CandidatePageState,
+        reduce_progress,
+    )
+    from lte_scenario_toolkit.selection_service import SelectionProgress
+
+    state = CandidatePageState.starting("job").with_phase("cancelling")
+    progress = SelectionProgress(
+        phase="scanning",
+        checked_positions=1,
+        total_positions=10,
+        candidate_count=0,
+        elapsed_seconds=0.1,
+        added_candidates=(),
+        removed_flat_grid_ids=(),
+        cache_status="miss",
+        cache_key="key",
+    )
+
+    assert reduce_progress(state, progress).phase == "cancelling"
+
+
+def test_statistics_reducer_rejects_stale_scan_job_candidate_and_stats_job():
+    from dataclasses import replace
+
+    from lte_scenario_toolkit.gui.pages.candidates import (
+        CandidatePageState,
+        CandidateStatisticsEvent,
+        reduce_statistics,
+    )
+    from lte_scenario_toolkit.selection_service import DemStatistics
+
+    state = CandidatePageState.from_scan("scan-2", _task14_scan_result())
+    state = state.with_selected_flat_grid_id(4).with_statistics_job("stats-2", 4)
+    statistics = DemStatistics(1.0, 5.0, 3.0, 4.0, 10)
+    good = CandidateStatisticsEvent("scan-2", "stats-2", 4, statistics, None)
+
+    assert reduce_statistics(
+        state,
+        replace(good, scan_job_id="scan-1"),
+    ) is state
+    assert reduce_statistics(
+        state,
+        replace(good, statistics_job_id="stats-1"),
+    ) is state
+    assert reduce_statistics(state.with_selected_flat_grid_id(0), good).statistics is None
+    applied = reduce_statistics(state, good)
+    assert applied.statistics == statistics
+    assert applied.statistics_flat_grid_id == 4
+
+
+def test_candidate_bounds_hit_testing_handles_sparse_overlaps_and_non_3857_crs():
+    from lte_scenario_toolkit.gui.pages.candidates import (
+        candidate_display_bounds,
+        hit_test_candidate_indices,
+    )
+
+    candidates = _task14_scan_result().candidates
+    bounds = candidate_display_bounds(candidates, rectangle_size=1.0, crs="EPSG:4326")
+
+    assert hit_test_candidate_indices(bounds, latitude=0.5, longitude=0.5) == (0, 1)
+    assert hit_test_candidate_indices(bounds, latitude=2.0, longitude=2.0) == ()
+    assert bounds[1].flat_grid_id == 4
+
+
+def test_online_tile_probe_is_optional_and_failure_is_nonfatal():
+    from lte_scenario_toolkit.gui.pages.candidates import online_tiles_available
+
+    assert online_tiles_available(None) is False
+    assert online_tiles_available(lambda: True) is True
+    assert online_tiles_available(lambda: (_ for _ in ()).throw(OSError("offline"))) is False
+
+
+def _task14_session(tmp_path, service, *, session_id="session-1", map_bundle=None):
+    from lte_scenario_toolkit.gui.pages.candidates import CandidateSession
+
+    profile = _task13_profile(tmp_path)
+    preflight = SimpleNamespace(profile=profile)
+    return CandidateSession(
+        session_id=session_id,
+        profile_snapshot=profile,
+        preflight=preflight,
+        selection_service=service,
+        repo_root=tmp_path.resolve(),
+        map_bundle=map_bundle,
+    )
+
+
+def test_candidate_session_registry_is_bounded_opaque_and_confirms_final_identity(tmp_path):
+    from lte_scenario_toolkit.gui.pages.candidates import CandidateSessionRegistry
+
+    service = object()
+    registry = CandidateSessionRegistry(max_sessions=2)
+    first = registry.add(_task14_session(tmp_path, service, session_id="opaque-1"))
+    second = registry.add(_task14_session(tmp_path, service, session_id="opaque-2"))
+    third = registry.add(_task14_session(tmp_path, service, session_id="opaque-3"))
+
+    assert first.session_id == "opaque-1"
+    assert registry.get("opaque-1") is None
+    assert registry.get(second.session_id) is second
+    result = _task14_scan_result()
+    updated = registry.set_scan_result(third.session_id, result)
+    confirmed = registry.confirm(third.session_id, 4)
+    assert updated.scan_result is result
+    assert confirmed.confirmed_flat_grid_id == 4
+    assert confirmed.locked_candidate is result.candidates[1]
+    with pytest.raises(ValueError, match="final scan"):
+        registry.confirm(second.session_id, 4)
+
+
+def test_candidate_registry_never_evicts_a_pinned_page_session(tmp_path):
+    from lte_scenario_toolkit.gui.pages.candidates import CandidateSessionRegistry
+
+    registry = CandidateSessionRegistry(max_sessions=1)
+    active = registry.add(_task14_session(tmp_path, object(), session_id="active"))
+    registry.pin(active.session_id)
+    try:
+        with pytest.raises(RuntimeError, match="active pages"):
+            registry.add(_task14_session(tmp_path, object(), session_id="new"))
+        assert registry.get("active") is active
+        assert registry.get("new") is None
+    finally:
+        registry.unpin(active.session_id)
+
+
+def test_scan_controller_runs_framework_free_worker_and_uses_final_result_order(tmp_path):
+    from threading import Event
+
+    from lte_scenario_toolkit.gui.pages.candidates import CandidateExplorerController
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.selection_service import SelectionProgress
+
+    result = _task14_scan_result()
+    worker_entered = Event()
+
+    class FakeService:
+        def scan(self, preflight, force=False, progress=None, cancel=None):
+            worker_entered.set()
+            progress(
+                SelectionProgress(
+                    phase="scanning",
+                    checked_positions=5,
+                    total_positions=10,
+                    candidate_count=1,
+                    elapsed_seconds=0.1,
+                    added_candidates=(result.candidates[1],),
+                    removed_flat_grid_ids=(),
+                    cache_status="miss",
+                    cache_key="key",
+                )
+            )
+            return result
+
+    coordinator = JobCoordinator()
+    controller = CandidateExplorerController(
+        _task14_session(tmp_path, FakeService()), coordinator
+    )
+    try:
+        job = controller.start_scan()
+        assert worker_entered.wait(2)
+        assert job.future is not None
+        job.future.result(timeout=2)
+        state = controller.drain_scan(job)
+
+        assert state.scan_completed is True
+        assert state.phase == "completed"
+        assert state.candidates == result.candidates
+        assert coordinator.snapshot().active is False
+    finally:
+        controller.close()
+        coordinator.shutdown()
+
+
+def test_scan_controller_cancellation_clears_provisional_only_after_worker_stops(tmp_path):
+    from threading import Event
+
+    from lte_scenario_toolkit.candidate_scanner import ScanCancelled
+    from lte_scenario_toolkit.gui.pages.candidates import CandidateExplorerController
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.selection_service import SelectionProgress
+
+    entered = Event()
+    candidate = _task14_scan_result().candidates[0]
+
+    class CancellingService:
+        def scan(self, preflight, force=False, progress=None, cancel=None):
+            progress(
+                SelectionProgress(
+                    phase="scanning",
+                    checked_positions=1,
+                    total_positions=100,
+                    candidate_count=1,
+                    elapsed_seconds=0.1,
+                    added_candidates=(candidate,),
+                    removed_flat_grid_ids=(),
+                    cache_status="miss",
+                    cache_key="key",
+                )
+            )
+            entered.set()
+            assert cancel.wait(2)
+            raise ScanCancelled()
+
+    coordinator = JobCoordinator()
+    controller = CandidateExplorerController(
+        _task14_session(tmp_path, CancellingService()), coordinator
+    )
+    try:
+        job = controller.start_scan()
+        assert entered.wait(2)
+        provisional = controller.drain_scan(job)
+        assert provisional.candidates == (candidate,)
+
+        assert controller.cancel_scan() is True
+        assert controller.state.phase == "cancelling"
+        assert controller.state.candidates == (candidate,)
+        assert job.future is not None
+        with pytest.raises(ScanCancelled):
+            job.future.result(timeout=2)
+        cancelled = controller.drain_scan(job)
+        assert cancelled.phase == "cancelled"
+        assert cancelled.candidates == ()
+        assert cancelled.can_confirm is False
+    finally:
+        controller.close()
+        coordinator.shutdown()
+
+
+def test_force_rescan_busy_preserves_completed_candidates_and_selection(tmp_path):
+    from lte_scenario_toolkit.gui.pages.candidates import (
+        CandidateExplorerController,
+        CandidatePageState,
+    )
+    from lte_scenario_toolkit.jobs import JobBusyError, JobCoordinator
+
+    class Service:
+        def scan(self, *args, **kwargs):
+            return _task14_scan_result()
+
+    coordinator = JobCoordinator()
+    initial_state = CandidatePageState.from_scan(
+        "completed-job", _task14_scan_result()
+    ).with_selected_flat_grid_id(4)
+    controller = CandidateExplorerController(
+        _task14_session(tmp_path, Service()),
+        coordinator,
+        initial_state=initial_state,
+    )
+    blocker = coordinator.start("other")
+    before = controller.state
+    try:
+        with pytest.raises(JobBusyError):
+            controller.start_scan(force=True)
+        assert controller.state is before
+    finally:
+        coordinator.finish(blocker.job_id)
+        controller.close()
+        coordinator.shutdown()
+
+
+def test_statistics_job_ignores_stale_selection_and_preview_failure_is_local(tmp_path):
+    from dataclasses import replace
+    from threading import Event
+
+    from lte_scenario_toolkit.gui.pages.candidates import CandidateExplorerController
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.map_assets import MapStyle
+    from lte_scenario_toolkit.selection_service import DemStatistics
+
+    entered = Event()
+    release = Event()
+    calls = []
+
+    class Service:
+        def candidate_statistics(self, preflight, candidate):
+            calls.append(candidate.flat_grid_id)
+            if len(calls) == 1:
+                entered.set()
+                assert release.wait(2)
+            return DemStatistics(1.0, 5.0, 3.0, 4.0, 10)
+
+    result = _task14_scan_result()
+    session = replace(
+        _task14_session(tmp_path, Service()),
+        scan_result=result,
+    )
+    coordinator = JobCoordinator()
+    controller = CandidateExplorerController(
+        session,
+        coordinator,
+        candidate_overlay_builder=lambda *_args: (_ for _ in ()).throw(
+            OSError("preview failed")
+        ),
+    )
+    try:
+        controller.select_flat_grid_id(0)
+        first = controller.request_statistics()
+        assert first is not None
+        assert entered.wait(2)
+        controller.select_flat_grid_id(4)
+        release.set()
+        assert first.future is not None
+        first.future.result(timeout=2)
+        stale = controller.drain_statistics(first)
+        assert stale.selected_flat_grid_id == 4
+        assert stale.statistics is None
+        assert coordinator.snapshot().active is False
+
+        second = controller.request_statistics()
+        assert second is not None and second.future is not None
+        second.future.result(timeout=2)
+        applied = controller.drain_statistics(second)
+        assert applied.statistics == DemStatistics(1.0, 5.0, 3.0, 4.0, 10)
+        assert applied.statistics_flat_grid_id == 4
+        assert applied.candidate_preview_asset is None
+        assert applied.candidate_preview_error == "preview failed"
+        assert applied.dem_style is MapStyle.COMBINED
+        assert coordinator.snapshot().active is False
+    finally:
+        controller.close()
+        coordinator.shutdown()
+
+
+def _task14_map_bundle(tmp_path):
+    from lte_scenario_toolkit.gui.pages.candidates import CandidateMapBundle
+    from lte_scenario_toolkit.map_assets import MapAsset, MapStyle
+
+    overlay = tmp_path / "overview.png"
+    overlay.write_bytes(b"png")
+    return CandidateMapBundle(
+        dem_asset=MapAsset(
+            path=overlay,
+            bounds=(-1.0, -1.0, 2.0, 2.0),
+            bounds_crs="EPSG:4326",
+            style=MapStyle.COMBINED,
+        ),
+        boundary_geojson={
+            "type": "Feature",
+            "properties": {},
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[-1, -1], [2, -1], [2, 2], [-1, 2], [-1, -1]]],
+            },
+        },
+        stations_geojson={"type": "FeatureCollection", "features": []},
+        map_bounds=(-1.0, -1.0, 2.0, 2.0),
+    )
+
+
+def test_map_bundle_and_selected_overlay_use_frozen_registered_dem_inputs(tmp_path):
+    from lte_scenario_toolkit.gui.pages.candidates import (
+        CandidateSession,
+        build_candidate_map_bundle,
+        build_candidate_overlay,
+    )
+    from lte_scenario_toolkit.map_assets import MapAsset, MapStyle
+
+    profile = _task13_profile(tmp_path)
+    preflight = SimpleNamespace(
+        profile=profile,
+        dem_path=tmp_path / "registered-dem.tif",
+        dem_fingerprint="dem-fingerprint",
+    )
+    prepared = SimpleNamespace(
+        boundary=SimpleNamespace(bounds=(0.0, 0.0, 2000.0, 3000.0)),
+        points=object(),
+    )
+    calls = []
+
+    class Service:
+        def prepared_selection(self, exact_preflight):
+            assert exact_preflight is preflight
+            return prepared
+
+    class Assets:
+        def dem_overlay(self, path, **kwargs):
+            calls.append(("dem", path, kwargs))
+            return MapAsset(
+                tmp_path / "cached.png",
+                kwargs["bounds"],
+                kwargs["bounds_crs"],
+                kwargs["style"],
+            )
+
+        def boundary_geojson(self, boundary, **kwargs):
+            calls.append(("boundary", boundary, kwargs))
+            return {"type": "FeatureCollection", "features": []}
+
+        def station_geojson(self, points, boundary, **kwargs):
+            calls.append(("stations", points, boundary, kwargs))
+            return {"type": "FeatureCollection", "features": []}
+
+    session = CandidateSession(
+        "opaque",
+        profile,
+        preflight,
+        Service(),
+        tmp_path,
+    )
+    assets = Assets()
+    bundle = build_candidate_map_bundle(session, assets)
+    selected = build_candidate_overlay(
+        session,
+        assets,
+        _task14_scan_result().candidates[0],
+        style=MapStyle.HILLSHADE,
+    )
+
+    assert bundle.map_bounds[0] == pytest.approx(0.0)
+    assert bundle.map_bounds[2] > bundle.map_bounds[0]
+    assert calls[0][1] is preflight.dem_path
+    assert calls[0][2]["fingerprint"] == "dem-fingerprint"
+    assert calls[0][2]["bounds_crs"] == "EPSG:4326"
+    assert selected.style is MapStyle.HILLSHADE
+    assert calls[-1][2]["bounds"] == (0.0, 0.0, 2000.0, 2000.0)
+    assert calls[-1][2]["max_dimension"] == 640
+
+
+async def test_candidate_route_uses_one_offline_leaflet_and_preserves_it_on_view_switch(
+    user, tmp_path
+):
+    from nicegui import ui
+    from nicegui.elements.leaflet.leaflet_layers import TileLayer
+
+    from lte_scenario_toolkit.gui.app import create_app
+    from lte_scenario_toolkit.gui.pages.candidates import CandidateSessionRegistry
+
+    class Service:
+        def scan(self, *args, **kwargs):
+            return _task14_scan_result()
+
+    registry = CandidateSessionRegistry()
+    registry.add(
+        _task14_session(
+            tmp_path,
+            Service(),
+            map_bundle=_task14_map_bundle(tmp_path),
+        )
+    )
+    create_app(
+        catalog=_Task13Catalog(tmp_path),
+        profile_store=object(),
+        candidate_registry=registry,
+        online_tile_probe=lambda: (_ for _ in ()).throw(OSError("offline")),
+        testing=True,
+    )
+
+    await user.open("/candidates/session-1")
+    maps = user.find(kind=ui.leaflet).elements
+    assert len(maps) == 1
+    map_element = next(iter(maps))
+    assert not any(isinstance(layer, TileLayer) for layer in map_element.layers)
+    assert not any("tile.osm" in str(layer) for layer in map_element.layers)
+
+    for _ in range(20):
+        rectangles = [
+            layer
+            for layer in map_element.layers
+            if getattr(layer, "name", None) == "rectangle"
+        ]
+        if len(rectangles) == 2:
+            break
+        await asyncio.sleep(0.05)
+    assert len(rectangles) == 2
+    assert {layer.args[1]["color"] for layer in rectangles} == {"#dc3f4f"}
+
+    user.find(marker="candidate-map").trigger(
+        "mapClick", {"latlng": {"lat": 0.005, "lng": 0.005}}
+    )
+    await user.should_see("Grid ID 0")
+    selected = next(layer for layer in rectangles if layer.args[1]["color"] == "#16a36a")
+    assert selected.args[0][0][0] <= 0.005 <= selected.args[0][1][0]
+
+    user.find(marker="candidate-map").trigger(
+        "mapClick", {"latlng": {"lat": 0.005, "lng": 0.005}}
+    )
+    await user.should_see("Grid ID 4")
+    user.find(marker="candidate-previous").click()
+    await user.should_see("Grid ID 0")
+    user.find(marker="candidate-next").click()
+    await user.should_see("Grid ID 4")
+
+    user.find(marker="candidate-layer-candidates").click()
+    user.find(marker="candidate-layer-candidates").click()
+    user.find(marker="candidate-layer-online").click()
+    await asyncio.sleep(0.1)
+    assert not any(isinstance(layer, TileLayer) for layer in map_element.layers)
+
+    user.find(marker="candidate-view-filmstrip").click()
+    await user.should_see("Candidate filmstrip")
+    assert next(iter(user.find(kind=ui.leaflet).elements)) is map_element
+    selected_card = next(iter(user.find(marker="candidate-card-4").elements))
+    assert selected_card.props["role"] == "button"
+    assert selected_card.props["aria-pressed"] == "true"
+    user.find(marker="candidate-view-map").click()
+    assert next(iter(user.find(kind=ui.leaflet).elements)) is map_element
+
+    user.find(marker="candidate-confirm").click()
+    assert registry.get("session-1").locked_candidate.flat_grid_id == 4
+
+
+async def test_direct_candidate_route_without_session_fails_closed_offline(user, tmp_path):
+    from lte_scenario_toolkit.gui.app import create_app
+
+    create_app(
+        catalog=_Task13Catalog(tmp_path),
+        profile_store=object(),
+        testing=True,
+    )
+
+    await user.open("/candidates/missing")
+
+    await user.should_see("Candidate session unavailable")
+    assert not (tmp_path / ".lte-data").exists()
+
+
+async def test_candidate_style_and_selected_preview_reuse_short_static_asset_urls(
+    user, tmp_path
+):
+    from nicegui import ui
+    from nicegui.elements.leaflet.leaflet_layers import ImageOverlay
+
+    from lte_scenario_toolkit.gui.app import create_app
+    from lte_scenario_toolkit.gui.pages.candidates import CandidateSessionRegistry
+    from lte_scenario_toolkit.map_assets import MapAsset
+    from lte_scenario_toolkit.selection_service import DemStatistics
+
+    selected_png = tmp_path / "selected.png"
+    selected_png.write_bytes(b"png")
+    hillshade_png = tmp_path / "hillshade.png"
+    hillshade_png.write_bytes(b"png")
+
+    class Service:
+        def scan(self, *args, **kwargs):
+            return _task14_scan_result()
+
+        def candidate_statistics(self, *args, **kwargs):
+            return DemStatistics(1.0, 5.0, 3.0, 4.0, 10)
+
+    registry = CandidateSessionRegistry()
+    registry.add(
+        _task14_session(
+            tmp_path,
+            Service(),
+            map_bundle=_task14_map_bundle(tmp_path),
+        )
+    )
+    create_app(
+        catalog=_Task13Catalog(tmp_path),
+        profile_store=object(),
+        candidate_registry=registry,
+        candidate_overlay_asset_builder=lambda _session, _candidate, style: MapAsset(
+            selected_png,
+            (0.0, 0.0, 1.0, 1.0),
+            "EPSG:4326",
+            style,
+        ),
+        candidate_style_asset_builder=lambda _session, style: MapAsset(
+            hillshade_png,
+            (-1.0, -1.0, 2.0, 2.0),
+            "EPSG:4326",
+            style,
+        ),
+        testing=True,
+    )
+    await user.open("/candidates/session-1")
+    map_element = next(iter(user.find(kind=ui.leaflet).elements))
+    for _ in range(20):
+        if any(getattr(layer, "name", None) == "rectangle" for layer in map_element.layers):
+            break
+        await asyncio.sleep(0.05)
+    user.find(marker="candidate-next").click()
+    await user.should_see(marker="candidate-selected-preview", retries=15)
+    preview = next(iter(user.find(marker="candidate-selected-preview").elements))
+    assert preview.props["src"].startswith("/_candidate_assets/")
+    assert not preview.props["src"].startswith("data:")
+
+    overlay = next(layer for layer in map_element.layers if isinstance(layer, ImageOverlay))
+    initial_overlay_url = overlay.url
+    user.find(marker="candidate-dem-style").click()
+    user.find("Hillshade").click()
+    for _ in range(20):
+        if overlay.url != initial_overlay_url:
+            break
+        await asyncio.sleep(0.05)
+    assert overlay.url.startswith("/_candidate_assets/")
+    assert overlay.url != initial_overlay_url
+    assert not overlay.url.startswith("data:")
+
+    user.find(marker="candidate-view-filmstrip").click()
+    unselected = next(iter(user.find(marker="candidate-thumbnail-4").elements))
+    assert "data:image" not in str(unselected._style)
+    assert "/_candidate_assets/" in str(unselected._style)
+
+
+async def test_candidate_page_retries_statistics_after_external_shared_job(user, tmp_path):
+    from dataclasses import replace
+
+    from lte_scenario_toolkit.gui.app import create_app
+    from lte_scenario_toolkit.gui.pages.candidates import CandidateSessionRegistry
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.selection_service import DemStatistics
+
+    class Service:
+        def candidate_statistics(self, *args, **kwargs):
+            return DemStatistics(1.0, 5.0, 3.0, 4.0, 10)
+
+    coordinator = JobCoordinator()
+    external = coordinator.start("external.validation")
+    registry = CandidateSessionRegistry()
+    registry.add(
+        replace(
+            _task14_session(
+                tmp_path,
+                Service(),
+                map_bundle=_task14_map_bundle(tmp_path),
+            ),
+            scan_result=_task14_scan_result(),
+        )
+    )
+    create_app(
+        catalog=_Task13Catalog(tmp_path),
+        profile_store=object(),
+        candidate_registry=registry,
+        coordinator=coordinator,
+        testing=True,
+    )
+    try:
+        await user.open("/candidates/session-1")
+        start = next(iter(user.find(marker="candidate-start").elements))
+        force = next(iter(user.find(marker="candidate-force").elements))
+        assert start.enabled is False
+        assert force.enabled is False
+
+        user.find(marker="candidate-next").click()
+        await user.should_see("Statistics load after final scan selection.")
+        assert coordinator.finish(external.job_id) is True
+
+        await user.should_see("Min 1.0 m", retries=15)
+        assert start.enabled is True
+        assert force.enabled is True
+    finally:
+        coordinator.shutdown()
+
+
+async def test_configure_start_passes_exact_frozen_preflight_to_opaque_session(
+    user, tmp_path
+):
+    from lte_scenario_toolkit.gui.app import create_app
+    from lte_scenario_toolkit.gui.pages.candidates import CandidateSessionRegistry
+
+    calls = []
+
+    class EmptyStore:
+        def discover(self, scenario_id):
+            return []
+
+    class Service:
+        def preflight(self, snapshot, output_root):
+            preflight = SimpleNamespace(profile=snapshot, output_root=output_root)
+            calls.append((snapshot, preflight))
+            return preflight
+
+        def scan(self, *args, **kwargs):
+            return _task14_scan_result()
+
+    service = Service()
+    registry = CandidateSessionRegistry()
+    create_app(
+        catalog=_Task13Catalog(tmp_path),
+        profile_store=EmptyStore(),
+        selection_service_factory=lambda _catalog: service,
+        candidate_registry=registry,
+        candidate_bundle_builder=lambda _session, _assets: _task14_map_bundle(tmp_path),
+        testing=True,
+    )
+    await user.open("/configure/without-default")
+
+    user.find(marker="profile-start-scan").click()
+    for _ in range(20):
+        if user.back_history and "/candidates/" in user.back_history[-1]:
+            break
+        await asyncio.sleep(0.05)
+
+    route = user.back_history[-1]
+    assert route.startswith("/candidates/")
+    session_id = route.rsplit("/", 1)[-1]
+    assert len(session_id) >= 32
+    session = registry.get(session_id)
+    assert session is not None
+    assert session.profile_snapshot is calls[0][0]
+    assert session.preflight is calls[0][1]
+    assert str(tmp_path) not in route

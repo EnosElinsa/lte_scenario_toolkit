@@ -595,6 +595,7 @@ def render_configure_page(
     scenario_id: str,
     selected_profile_id: str | None = None,
     on_profile_mutation: Callable[[], Any],
+    on_preflight_success: Callable[[PreflightOutcome], Any] | None = None,
 ) -> None:
     """Render profile selection, guarded CRUD, parameters, and read-only preflight."""
 
@@ -1119,7 +1120,13 @@ def render_configure_page(
             if not outcome.ok:
                 report_preflight_error(outcome)
                 return
-            ui.notify(translator.text("preflight.passed"), type="positive")
+            if on_preflight_success is None:
+                ui.notify(translator.text("preflight.passed"), type="positive")
+                return
+            try:
+                on_preflight_success(outcome)
+            except Exception as exc:
+                report_error(exc)
 
         with ui.row().classes("lte-profile-actions full-width"):
             copy_button = ui.button(

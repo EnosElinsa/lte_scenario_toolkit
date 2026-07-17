@@ -13,10 +13,22 @@ from typing import Any
 
 from ..data_catalog import CatalogError, DataCatalog, load_data_catalog
 from ..jobs import JobCoordinator
+from ..map_assets import MapAssetService
 from ..profiles import ProfileStore
 from ..selection_service import SelectionService
 from .i18n import Translator, validate_translations
 from .layout import render_app_shell
+from .pages.candidates import (
+    CandidateMapBundle,
+    CandidateSession,
+    CandidateSessionRegistry,
+    build_candidate_map_bundle,
+    build_candidate_overlay,
+    build_candidate_style_overlay,
+    default_online_tile_probe,
+    render_candidate_page,
+    render_candidate_unavailable,
+)
 from .pages.configure import render_configure_page, render_configure_picker
 from .pages.scenarios import (
     get_job_coordinator,
@@ -124,6 +136,16 @@ def create_app(
     catalog_loader: Callable[[Any], Any] | None = None,
     selection_service_factory: Callable[[Any], Any] = SelectionService,
     coordinator: JobCoordinator | None = None,
+    candidate_registry: CandidateSessionRegistry | None = None,
+    candidate_bundle_builder: Callable[
+        [CandidateSession, MapAssetService], CandidateMapBundle
+    ]
+    | None = None,
+    candidate_overlay_asset_builder: Callable[[CandidateSession, Any, Any], Any]
+    | None = None,
+    candidate_style_asset_builder: Callable[[CandidateSession, Any], Any]
+    | None = None,
+    online_tile_probe: Callable[[], bool] | None = None,
 ):
     """Register and return the NiceGUI application for one validated catalog."""
 
@@ -149,11 +171,16 @@ def create_app(
         selection_service_factory=selection_service_factory,
         coordinator=get_job_coordinator() if coordinator is None else coordinator,
     )
+    sessions = candidate_registry or CandidateSessionRegistry()
+    map_assets = MapAssetService(repo_root)
+    bundle_builder = candidate_bundle_builder or build_candidate_map_bundle
+    static_asset_urls: dict[Path, str] = {}
 
     ui.add_css(_css_text(), shared=True)
 
     if hasattr(app, "on_shutdown") and uses_shared_coordinator:
         app.on_shutdown(shutdown_job_coordinator)
+        app.on_shutdown(sessions.clear)
 
     page_options = {
         "title": Translator(initial_settings.language).text("app.title"),
@@ -185,6 +212,43 @@ def create_app(
         with content:
             body(translator)
 
+    def candidate_asset_url(path: Path) -> str:
+        raw = Path(path)
+        if raw.is_symlink():
+            raise ValueError("candidate map asset must not be redirected")
+        resolved = raw.resolve(strict=True)
+        if resolved.suffix.lower() != ".png" or not resolved.is_file():
+            raise ValueError("candidate map asset must be a regular PNG file")
+        if not testing:
+            cache_root = map_assets.cache_root.resolve(strict=True)
+            if not resolved.is_relative_to(cache_root):
+                raise ValueError("candidate map asset must stay inside the map cache")
+        existing = static_asset_urls.get(resolved)
+        if existing is not None:
+            return existing
+        url = app.add_static_file(
+            local_file=resolved,
+            url_path=f"/_candidate_assets/{len(static_asset_urls):08x}.png",
+            strict=True,
+            max_cache_age=3600,
+        )
+        static_asset_urls[resolved] = url
+        return url
+
+    def open_candidate_session(outcome: Any) -> None:
+        if getattr(outcome.preflight, "profile", None) is not outcome.snapshot:
+            ui.notify(
+                Translator(store.load().language).text("preflight.passed"),
+                type="positive",
+            )
+            return
+        session = sessions.create(
+            outcome,
+            runtime.selection_service,
+            repo_root,
+        )
+        ui.navigate.to(f"/candidates/{session.session_id}")
+
     @ui.page("/configure/{scenario_id}", **page_options)
     def configure_scenario(scenario_id: str, profile: str | None = None) -> None:
         render_shell(
@@ -198,7 +262,96 @@ def create_app(
                 scenario_id=scenario_id,
                 selected_profile_id=profile,
                 on_profile_mutation=runtime.refresh_after_profile_mutation,
+                on_preflight_success=open_candidate_session,
             ),
+        )
+
+    @ui.page("/candidates/{session_id}", **page_options)
+    async def candidate_explorer(session_id: str) -> None:
+        session = sessions.get(session_id)
+        if session is None:
+            render_shell(
+                "/configure",
+                lambda translator: render_candidate_unavailable(ui, translator),
+            )
+            return
+        if session.map_bundle is None:
+            from nicegui import run
+
+            sessions.pin(session_id)
+            try:
+                bundle = await run.io_bound(
+                    bundle_builder,
+                    session,
+                    map_assets,
+                )
+                session = sessions.set_map_bundle(session_id, bundle)
+            except Exception as error:
+                message = str(error)
+                render_shell(
+                    "/configure",
+                    lambda translator, detail=message: render_candidate_unavailable(
+                        ui,
+                        translator,
+                        detail,
+                    ),
+                )
+                return
+            finally:
+                sessions.unpin(session_id)
+        bundle = session.map_bundle
+        if bundle is None:
+            render_shell(
+                "/configure",
+                lambda translator: render_candidate_unavailable(ui, translator),
+            )
+            return
+        asset_url = candidate_asset_url(bundle.dem_asset.path)
+        render_shell(
+            "/configure",
+            lambda translator: render_candidate_page(
+                ui,
+                translator,
+                session,
+                runtime.coordinator,
+                registry=sessions,
+                dem_asset_url=asset_url,
+                dem_asset_url_builder=candidate_asset_url,
+                online_tile_probe=online_tile_probe or default_online_tile_probe,
+                candidate_overlay_builder=(
+                    candidate_overlay_asset_builder
+                    or (
+                        lambda active_session, candidate, style: (
+                            build_candidate_overlay(
+                                active_session,
+                                map_assets,
+                                candidate,
+                                style=style,
+                            )
+                        )
+                    )
+                ),
+                dem_style_builder=(
+                    candidate_style_asset_builder
+                    or (
+                        lambda active_session, style: (
+                            build_candidate_style_overlay(
+                                active_session,
+                                map_assets,
+                                bundle.map_bounds,
+                                style,
+                            )
+                        )
+                    )
+                ),
+            ),
+        )
+
+    @ui.page("/candidates", **page_options)
+    def candidate_without_session() -> None:
+        render_shell(
+            "/configure",
+            lambda translator: render_candidate_unavailable(ui, translator),
         )
 
     @ui.page("/configure", **page_options)
