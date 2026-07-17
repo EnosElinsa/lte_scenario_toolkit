@@ -22,7 +22,7 @@ from lte_scenario_toolkit.candidate_scanner import (
     ScanCancelled,
     ScanResult,
 )
-from lte_scenario_toolkit.figure_service import FigureService
+from lte_scenario_toolkit.figure_service import FigureService, FigureSpec
 from lte_scenario_toolkit.profiles import ExperimentProfile, FigureSettings, OutputSettings
 from lte_scenario_toolkit.selection_service import (
     PreparedSelection,
@@ -541,6 +541,51 @@ def selection_export_fixture(tmp_path):
     return service, preflight, result, candidate, prepared
 
 
+def test_prepare_figure_source_reuses_selection_inputs_without_export(
+    selection_export_fixture,
+):
+    service, preflight, result, candidate, prepared = selection_export_fixture
+
+    source = service.prepare_figure_source(preflight, result, candidate)
+
+    assert service.prepared_selection(preflight) is prepared
+    assert source.path is None
+    assert source.csv_path is None
+    assert source.dem_path == preflight.dem_path.resolve()
+    assert source.target_crs == preflight.profile.target_crs
+    assert source.rectangle["rect_id"] == 1
+    assert source.rectangle["pt_count"] == candidate.point_count
+    assert source.frame["cell"].tolist() == [7, 8]
+    assert source.frame["elevation"].notna().all()
+    assert source.selection_identity.scenario_id == preflight.scenario_id
+    assert source.selection_identity.profile_id == preflight.profile.profile_id
+    assert source.selection_identity.points_fingerprint == "points-a"
+    assert source.selection_identity.boundary_fingerprint == "boundary-a"
+    assert source.selection_identity.dem_fingerprint == "dem-a"
+    assert source.selection_identity.scan_algorithm_version == "row-sweep-v1"
+    assert source.selection_identity.candidate_flat_grid_id == candidate.flat_grid_id
+    assert not preflight.output_root.exists()
+
+
+@pytest.mark.parametrize("case", ["incomplete", "alien", "duplicate"])
+def test_prepare_figure_source_rejects_non_authoritative_candidate(
+    selection_export_fixture,
+    case,
+):
+    service, preflight, result, candidate, _ = selection_export_fixture
+    if case == "incomplete":
+        result = replace(result, completed=False)
+    elif case == "alien":
+        candidate = replace(candidate, flat_grid_id=999)
+    else:
+        result = replace(result, candidates=(candidate, candidate))
+
+    with pytest.raises(SelectionExportError):
+        service.prepare_figure_source(preflight, result, candidate)
+
+    assert not preflight.output_root.exists()
+
+
 def test_export_publishes_traceable_csv_preview_and_exact_run_schemas(
     selection_export_fixture,
     monkeypatch,
@@ -641,6 +686,8 @@ def test_export_publishes_traceable_csv_preview_and_exact_run_schemas(
             "candidate_id": "candidate-0001",
             "flat_grid_id": 0,
             "point_count": 2,
+            "left_x": 0.0,
+            "bottom_y": 0.0,
             "center_x": 1.0,
             "center_y": 1.0,
         },
@@ -690,6 +737,7 @@ def test_export_publishes_traceable_csv_preview_and_exact_run_schemas(
             "csv": f"{base}.csv",
             "preview_png": f"{base}.png",
         },
+        "figure_spec": FigureSpec.from_preset("publication").as_dict(),
         "git_commit": "abc123",
         "software_versions": {"python": "3.test"},
         "entrypoint": ["lte-select-sites", "--select-index", "1"],
@@ -980,6 +1028,9 @@ def test_export_allows_a_zero_station_candidate(selection_export_fixture):
     )
     assert frame.empty
     assert selection["candidates"][0]["selected_station_ids"] == []
+    figure_source = FigureService.load_source(run_dir)
+    assert figure_source.frame.empty
+    assert figure_source.rectangle["pt_count"] == 0
 
 
 def test_export_rejects_when_any_selected_station_has_no_valid_elevation(

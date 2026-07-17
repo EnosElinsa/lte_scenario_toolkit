@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from lte_scenario_toolkit.run_service import RunService, StagingRun
+from lte_scenario_toolkit.run_service import RunEntry, RunService, StagingRun
 
 CREATED_AT = "2026-07-16T10:00:00Z"
 
@@ -181,6 +181,49 @@ def test_parent_run_is_preserved_and_discovery_is_stably_sorted(tmp_path):
     assert by_id[parent.run_id]["parent_run_id"] is None
     assert by_id[child.run_id]["parent_run_id"] == parent.run_id
     assert discovered.diagnostics == ()
+
+
+def test_public_run_entry_discovery_returns_validated_paths_and_frozen_records(
+    tmp_path,
+):
+    service = RunService(tmp_path)
+    run = _begin_with_artifact(service)
+    final = service.publish(
+        run,
+        status="completed",
+        artifacts=["scenario.csv"],
+        metadata={"nested": {"value": 1}},
+    )
+
+    discovery = service.discover_entries()
+
+    assert discovery.diagnostics == ()
+    assert len(discovery.entries) == 1
+    entry = discovery.entries[0]
+    assert isinstance(entry, RunEntry)
+    assert entry.root == tmp_path.resolve()
+    assert entry.run_dir == final.resolve()
+    assert entry.record["run_id"] == run.run_id
+    with pytest.raises(TypeError):
+        entry.record["status"] = "partial"
+    with pytest.raises(TypeError):
+        entry.record["metadata"]["nested"]["value"] = 2
+    assert service.entry_for_path(final) == entry
+
+
+def test_public_run_entry_resolution_revalidates_live_manifest(tmp_path):
+    service = RunService(tmp_path / "runs")
+    run = _begin_with_artifact(service)
+    final = service.publish(run, status="completed", artifacts=["scenario.csv"])
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    with pytest.raises(ValueError, match="root|run|path"):
+        service.entry_for_path(outside)
+
+    (final / "scenario.csv").unlink()
+    with pytest.raises(ValueError, match="available|valid|run"):
+        service.entry_for_path(final)
 
 
 def test_publish_rejects_unknown_status(tmp_path):

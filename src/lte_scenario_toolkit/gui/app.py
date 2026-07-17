@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
+import os
 import sys
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
+from threading import Lock
 from typing import Any
+from uuid import uuid4
 
 from ..data_catalog import CatalogError, DataCatalog, load_data_catalog
+from ..figure_service import FigureSpec
 from ..jobs import JobCoordinator
 from ..map_assets import MapAssetService
 from ..profiles import ProfileStore
@@ -30,6 +35,13 @@ from .pages.candidates import (
     render_candidate_unavailable,
 )
 from .pages.configure import render_configure_page, render_configure_picker
+from .pages.figures import render_figures_page, render_figures_unavailable
+from .pages.generate import (
+    generation_model,
+    render_generate_page,
+    render_generation_unavailable,
+)
+from .pages.history import rebuild_history, render_history_page
 from .pages.scenarios import (
     get_job_coordinator,
     render_scenarios_page,
@@ -38,6 +50,47 @@ from .pages.scenarios import (
 from .settings import GuiSettingsError, GuiSettingsStore
 
 GUI_INSTALL_INSTRUCTION = 'python -m pip install -e ".[gui]"'
+
+
+@dataclass(frozen=True, slots=True)
+class _FigureRouteRequest:
+    source: Path | None = None
+    session_id: str | None = None
+    output_root: Path | None = None
+    formats: tuple[str, ...] = ()
+    figure_spec: FigureSpec | None = None
+    parent_run_id: str | None = None
+    parent_run_path: Path | None = None
+
+    def __post_init__(self) -> None:
+        if (self.source is None) == (self.session_id is None):
+            raise ValueError("figure route request requires one source or session")
+
+
+class _FigureRouteRegistry:
+    def __init__(self, max_requests: int = 64) -> None:
+        self.max_requests = max_requests
+        self._lock = Lock()
+        self._requests: OrderedDict[str, _FigureRouteRequest] = OrderedDict()
+
+    def add(self, request: _FigureRouteRequest) -> str:
+        token = uuid4().hex
+        with self._lock:
+            self._requests[token] = request
+            while len(self._requests) > self.max_requests:
+                self._requests.popitem(last=False)
+        return token
+
+    def get(self, token: str) -> _FigureRouteRequest | None:
+        with self._lock:
+            request = self._requests.get(token)
+            if request is not None:
+                self._requests.move_to_end(token)
+            return request
+
+    def clear(self) -> None:
+        with self._lock:
+            self._requests.clear()
 
 
 class _EmptyProfileStore:
@@ -172,15 +225,20 @@ def create_app(
         coordinator=get_job_coordinator() if coordinator is None else coordinator,
     )
     sessions = candidate_registry or CandidateSessionRegistry()
+    figure_requests = _FigureRouteRegistry()
+    ephemeral_roots: set[Path] = set()
+    ephemeral_roots_lock = Lock()
     map_assets = MapAssetService(repo_root)
     bundle_builder = candidate_bundle_builder or build_candidate_map_bundle
     static_asset_urls: dict[Path, str] = {}
 
     ui.add_css(_css_text(), shared=True)
 
-    if hasattr(app, "on_shutdown") and uses_shared_coordinator:
-        app.on_shutdown(shutdown_job_coordinator)
+    if hasattr(app, "on_shutdown"):
+        if uses_shared_coordinator:
+            app.on_shutdown(shutdown_job_coordinator)
         app.on_shutdown(sessions.clear)
+        app.on_shutdown(figure_requests.clear)
 
     page_options = {
         "title": Translator(initial_settings.language).text("app.title"),
@@ -190,13 +248,11 @@ def create_app(
     def render_shell(active_route: str, body: Callable[[Translator], None]) -> None:
         settings = store.load()
         translator = Translator(settings.language)
+        job_snapshot = runtime.coordinator.snapshot()
 
         def change_language(event) -> None:
             try:
-                store.save(
-                    language=event.value,
-                    output_roots=settings.output_roots,
-                )
+                store.update(language=event.value)
             except GuiSettingsError as exc:
                 ui.notify(str(exc), type="negative")
                 return
@@ -206,7 +262,7 @@ def create_app(
             ui,
             translator,
             active_route=active_route,
-            active_job=None,
+            active_job=job_snapshot.kind if job_snapshot.active else None,
             on_language_change=change_language,
         )
         with content:
@@ -235,6 +291,49 @@ def create_app(
         static_asset_urls[resolved] = url
         return url
 
+    def preview_asset_url(path: Path) -> str:
+        raw = Path(path)
+        if raw.is_symlink():
+            raise ValueError("figure preview asset must not be redirected")
+        resolved = raw.resolve(strict=True)
+        if resolved.suffix.casefold() != ".png" or not resolved.is_file():
+            raise ValueError("figure preview asset must be a regular PNG file")
+        preview_root = (
+            repo_root / ".lte-data" / "cache" / "previews"
+        ).resolve(strict=True)
+        if not resolved.is_relative_to(preview_root):
+            raise ValueError("figure preview asset must stay inside the preview cache")
+        existing = static_asset_urls.get(resolved)
+        if existing is not None:
+            return existing
+        url = app.add_static_file(
+            local_file=resolved,
+            url_path=f"/_preview_assets/{len(static_asset_urls):08x}.png",
+            strict=True,
+            max_cache_age=3600,
+        )
+        static_asset_urls[resolved] = url
+        return url
+
+    def remember_output_root(root: str | os.PathLike[str]) -> None:
+        resolved = Path(root).expanduser().resolve(strict=False)
+        with ephemeral_roots_lock:
+            ephemeral_roots.add(resolved)
+        store.update(add_output_roots=(resolved,))
+
+    def history_output_roots() -> tuple[Path, ...]:
+        configured = store.load().output_roots
+        with ephemeral_roots_lock:
+            current = tuple(ephemeral_roots)
+        return (*configured, *current)
+
+    def remember_published_run(path: Path) -> None:
+        try:
+            root = path.parents[2]
+        except IndexError as exc:
+            raise GuiSettingsError("Published run has no output root") from exc
+        remember_output_root(root)
+
     def open_candidate_session(outcome: Any) -> None:
         if getattr(outcome.preflight, "profile", None) is not outcome.snapshot:
             ui.notify(
@@ -248,6 +347,9 @@ def create_app(
             repo_root,
         )
         ui.navigate.to(f"/candidates/{session.session_id}")
+
+    def open_generation_session(confirmed: CandidateSession) -> None:
+        ui.navigate.to(f"/generate/{confirmed.session_id}")
 
     @ui.page("/configure/{scenario_id}", **page_options)
     def configure_scenario(scenario_id: str, profile: str | None = None) -> None:
@@ -344,6 +446,7 @@ def create_app(
                         )
                     )
                 ),
+                on_confirm=open_generation_session,
             ),
         )
 
@@ -352,6 +455,167 @@ def create_app(
         render_shell(
             "/configure",
             lambda translator: render_candidate_unavailable(ui, translator),
+        )
+
+    def generation_body(translator: Translator, session_id: str) -> None:
+        session = sessions.get(session_id)
+        try:
+            if session is None:
+                raise ValueError("candidate session is unavailable")
+            generation_model(session)
+        except ValueError:
+            render_generation_unavailable(ui, translator)
+            return
+        render_generate_page(
+            ui,
+            translator,
+            session,
+            runtime.coordinator,
+            on_published=lambda _path: remember_output_root(
+                session.preflight.output_root
+            ),
+            on_complete=lambda _state: ui.navigate.to("/history"),
+            on_open_figures=lambda: ui.navigate.to(
+                "/figures/"
+                + figure_requests.add(
+                    _FigureRouteRequest(session_id=session.session_id)
+                )
+            ),
+        )
+
+    @ui.page("/generate/{session_id}", **page_options)
+    def generate_session(session_id: str) -> None:
+        render_shell(
+            "/configure",
+            lambda translator: generation_body(translator, session_id),
+        )
+
+    @ui.page("/generate", **page_options)
+    def generate_without_session() -> None:
+        render_shell(
+            "/configure",
+            lambda translator: render_generation_unavailable(ui, translator),
+        )
+
+    def request_figure_session(
+        request: _FigureRouteRequest | None,
+    ) -> CandidateSession | None:
+        session = (
+            None
+            if request is None or request.session_id is None
+            else sessions.get(request.session_id)
+        )
+        try:
+            if session is not None:
+                generation_model(session)
+        except ValueError:
+            return None
+        return session
+
+    def figures_body(
+        translator: Translator,
+        request: _FigureRouteRequest | None = None,
+    ) -> None:
+        render_figures_page(
+            ui,
+            translator,
+            repo_root,
+            runtime.coordinator,
+            initial_source=None if request is None else request.source,
+            current_session=request_figure_session(request),
+            output_root=None if request is None else request.output_root,
+            initial_formats=(
+                None if request is None or not request.formats else request.formats
+            ),
+            initial_spec=None if request is None else request.figure_spec,
+            parent_run_id=None if request is None else request.parent_run_id,
+            parent_run_path=None if request is None else request.parent_run_path,
+            on_published=remember_published_run,
+            preview_url_builder=preview_asset_url,
+        )
+
+    @ui.page("/figures/{request_id}", **page_options)
+    def figures_request(request_id: str) -> None:
+        request = figure_requests.get(request_id)
+        valid_request = request is not None and (
+            request.source is not None
+            or request_figure_session(request) is not None
+        )
+        render_shell(
+            "/figures",
+            lambda translator: (
+                render_figures_unavailable(ui, translator)
+                if not valid_request
+                else figures_body(translator, request)
+            ),
+        )
+
+    @ui.page("/figures", **page_options)
+    def figures() -> None:
+        render_shell("/figures", lambda translator: figures_body(translator))
+
+    def open_history_source(
+        path: Path,
+        output_root: Path | None = None,
+        parent_run_id: str | None = None,
+        parent_run_path: Path | None = None,
+        formats: tuple[str, ...] = (),
+        figure_spec: FigureSpec | None = None,
+    ) -> None:
+        if output_root is None:
+            try:
+                output_root = path.parents[2]
+            except IndexError:
+                output_root = None
+        token = figure_requests.add(
+            _FigureRouteRequest(
+                source=path,
+                output_root=output_root,
+                formats=formats,
+                figure_spec=figure_spec,
+                parent_run_id=parent_run_id,
+                parent_run_path=parent_run_path,
+            )
+        )
+        ui.navigate.to(f"/figures/{token}")
+
+    def reveal_directory(path: Path) -> None:
+        startfile = getattr(os, "startfile", None)
+        if startfile is None:
+            raise OSError("Directory reveal is unavailable on this platform")
+        startfile(str(path))
+
+    @ui.page("/history", **page_options)
+    async def history() -> None:
+        from nicegui import run
+
+        roots = history_output_roots()
+        snapshot = await run.io_bound(rebuild_history, repo_root, roots)
+        render_shell(
+            "/history",
+            lambda translator: render_history_page(
+                ui,
+                translator,
+                repo_root,
+                roots,
+                snapshot=snapshot,
+                on_reveal=reveal_directory,
+                on_open_figures=lambda path, root, parent, parent_path, figure_spec: open_history_source(
+                    path,
+                    root,
+                    parent,
+                    parent_path,
+                    figure_spec=figure_spec,
+                ),
+                on_retry_missing=lambda path, root, parent, parent_path, formats, figure_spec: open_history_source(
+                    path,
+                    root,
+                    parent,
+                    parent_path,
+                    formats,
+                    figure_spec,
+                ),
+            ),
         )
 
     @ui.page("/configure", **page_options)

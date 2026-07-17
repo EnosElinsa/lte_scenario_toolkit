@@ -1401,6 +1401,7 @@ def render_candidate_page(
     ]
     | None = None,
     dem_style_builder: Callable[[CandidateSession, MapStyle], MapAsset] | None = None,
+    on_confirm: Callable[[CandidateSession], None] | None = None,
     auto_start: bool = True,
 ) -> CandidatePageView:
     """Render one progressive, offline-first candidate selection page."""
@@ -2046,6 +2047,8 @@ def render_candidate_page(
             type="positive",
         )
         refresh(controller.state)
+        if on_confirm is not None:
+            on_confirm(confirmed)
 
     def toggle_simple_layer(layer_name: str, layer: Any, enabled: bool) -> None:
         controller.set_layer(layer_name, enabled)

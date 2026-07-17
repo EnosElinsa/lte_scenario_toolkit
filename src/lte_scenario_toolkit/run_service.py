@@ -14,6 +14,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from .io import _json_safe, atomic_write_json
@@ -54,6 +55,68 @@ class StagingRun:
 @dataclass(frozen=True)
 class RunDiscovery:
     records: tuple[dict[str, Any], ...]
+    diagnostics: tuple[dict[str, Any], ...]
+
+
+def _freeze_record(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {str(key): _freeze_record(item) for key, item in deepcopy(dict(value)).items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_record(item) for item in deepcopy(list(value)))
+    return deepcopy(value)
+
+
+def _thaw_record(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _thaw_record(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_record(item) for item in value]
+    return deepcopy(value)
+
+
+@dataclass(frozen=True)
+class RunEntry:
+    """One live, path-validated run and its immutable manifest snapshot."""
+
+    root: Path
+    run_dir: Path
+    record: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        raw_root = Path(self.root)
+        raw_run_dir = Path(self.run_dir)
+        if not raw_root.is_absolute() or not raw_run_dir.is_absolute():
+            raise ValueError("run entry paths must be absolute")
+        if raw_root.is_symlink() or raw_run_dir.is_symlink():
+            raise ValueError("run entry paths must not use symlinks")
+        root = raw_root.resolve(strict=True)
+        run_dir = raw_run_dir.resolve(strict=True)
+        if not root.is_dir() or not run_dir.is_dir():
+            raise ValueError("run entry paths must be real directories")
+        try:
+            lexical_relative = raw_run_dir.relative_to(raw_root)
+            run_dir.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("run entry directory must remain inside its output root") from exc
+        current = raw_root
+        for part in lexical_relative.parts:
+            current /= part
+            if current.is_symlink():
+                raise ValueError("run entry directory must not use symlinks")
+        object.__setattr__(self, "root", root)
+        object.__setattr__(self, "run_dir", run_dir)
+        object.__setattr__(self, "record", _freeze_record(self.record))
+
+    @property
+    def run_id(self) -> str:
+        return str(self.record["run_id"])
+
+
+@dataclass(frozen=True)
+class RunEntryDiscovery:
+    entries: tuple[RunEntry, ...]
     diagnostics: tuple[dict[str, Any], ...]
 
 
@@ -486,11 +549,13 @@ class RunService:
         record["artifacts"] = artifacts
         return record, parsed_created_at
 
-    def discover(self) -> RunDiscovery:
-        if not self.output_root.is_dir():
-            return RunDiscovery(records=(), diagnostics=())
+    def discover_entries(self) -> RunEntryDiscovery:
+        """Discover live runs together with their validated final directories."""
 
-        records: list[tuple[datetime, dict[str, Any]]] = []
+        if not self.output_root.is_dir():
+            return RunEntryDiscovery(entries=(), diagnostics=())
+
+        entries: list[tuple[datetime, RunEntry]] = []
         diagnostics: list[dict[str, Any]] = []
         candidates = sorted(
             self.output_root.glob("*/*/*/run.json"),
@@ -513,11 +578,62 @@ class RunService:
                     }
                 )
                 continue
-            records.append((parsed_created_at, record))
+            entries.append(
+                (
+                    parsed_created_at,
+                    RunEntry(
+                        root=self.output_root,
+                        run_dir=record_path.parent,
+                        record=record,
+                    ),
+                )
+            )
 
-        records.sort(key=lambda item: (item[0], item[1]["run_id"]))
+        entries.sort(key=lambda item: (item[0], item[1].run_id))
         diagnostics.sort(key=lambda item: item["path"])
-        return RunDiscovery(
-            records=tuple(record for _, record in records),
+        return RunEntryDiscovery(
+            entries=tuple(entry for _, entry in entries),
             diagnostics=tuple(diagnostics),
         )
+
+    def discover(self) -> RunDiscovery:
+        """Return backward-compatible manifest dictionaries for valid live runs."""
+
+        discovered = self.discover_entries()
+        return RunDiscovery(
+            records=tuple(_thaw_record(entry.record) for entry in discovered.entries),
+            diagnostics=discovered.diagnostics,
+        )
+
+    def entry_for_path(self, path: str | os.PathLike[str]) -> RunEntry:
+        """Re-discover and resolve exactly one live run directory by path."""
+
+        if not isinstance(path, (str, os.PathLike)):
+            raise ValueError("run path must be path-like")
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            raise ValueError("run path must be absolute")
+        if candidate.is_symlink():
+            raise ValueError("run path must not be a symlink")
+        resolved = candidate.resolve(strict=False)
+        try:
+            resolved.relative_to(self.output_root)
+        except ValueError as exc:
+            raise ValueError("run path is outside this service output root") from exc
+        matches = [
+            entry
+            for entry in self.discover_entries().entries
+            if entry.run_dir == resolved
+        ]
+        if len(matches) != 1:
+            raise ValueError("run path is not one currently available valid run")
+        return matches[0]
+
+
+__all__ = [
+    "RunDiscovery",
+    "RunEntry",
+    "RunEntryDiscovery",
+    "RunService",
+    "StagingRun",
+]

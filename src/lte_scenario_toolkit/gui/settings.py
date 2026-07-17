@@ -69,21 +69,47 @@ class GuiSettingsStore:
 
         settings = self._validated_settings(language, output_roots)
         with _SETTINGS_WRITE_LOCK:
-            self._validate_storage_path()
-            try:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-            except OSError as exc:
-                raise GuiSettingsError(
-                    f"Could not create GUI settings directory: {self.path.parent}"
-                ) from exc
-            self._validate_storage_path()
-            payload = {
-                "schema_version": SETTINGS_SCHEMA_VERSION,
-                "language": settings.language,
-                "output_roots": [str(path) for path in settings.output_roots],
-            }
-            self._atomic_write(payload)
+            self._persist_locked(settings)
         return settings
+
+    def update(
+        self,
+        *,
+        language: str | None = None,
+        add_output_roots: Iterable[str | os.PathLike[str]] = (),
+    ) -> GuiSettings:
+        """Atomically merge one preference change with the latest file contents."""
+
+        if isinstance(add_output_roots, (str, bytes, os.PathLike)):
+            raise GuiSettingsError("GUI output_roots must be a path collection")
+        try:
+            additions = tuple(add_output_roots)
+        except TypeError as exc:
+            raise GuiSettingsError("GUI output_roots must be a path collection") from exc
+        with _SETTINGS_WRITE_LOCK:
+            current = self.load()
+            settings = self._validated_settings(
+                current.language if language is None else language,
+                (*current.output_roots, *additions),
+            )
+            self._persist_locked(settings)
+        return settings
+
+    def _persist_locked(self, settings: GuiSettings) -> None:
+        self._validate_storage_path()
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise GuiSettingsError(
+                f"Could not create GUI settings directory: {self.path.parent}"
+            ) from exc
+        self._validate_storage_path()
+        payload = {
+            "schema_version": SETTINGS_SCHEMA_VERSION,
+            "language": settings.language,
+            "output_roots": [str(path) for path in settings.output_roots],
+        }
+        self._atomic_write(payload)
 
     def _settings_from_document(self, document: object) -> GuiSettings:
         if not isinstance(document, dict):

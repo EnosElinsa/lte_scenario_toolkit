@@ -13,7 +13,12 @@ import yaml
 from rasterio.transform import from_origin
 
 from lte_scenario_toolkit import io
-from lte_scenario_toolkit.figure_service import FigureResult, FigureService, FigureSpec
+from lte_scenario_toolkit.figure_service import (
+    FigureResult,
+    FigureService,
+    FigureSpec,
+    SelectionFigureIdentity,
+)
 from lte_scenario_toolkit.run_service import RunService
 
 REQUIRED_ROW = {
@@ -155,6 +160,39 @@ def write_current_selection_run(tmp_path: Path) -> tuple[Path, Path]:
     return run_dir, dem_path
 
 
+def write_in_memory_selection_source(tmp_path: Path):
+    source = FigureService.load_source(write_single_csv(tmp_path))
+    return replace(
+        source,
+        path=None,
+        csv_path=None,
+        csv_identity=None,
+        source_kind="selection",
+        dem_path=write_dem(tmp_path),
+        dem_fingerprint="dem-selection",
+        scenario_id="city",
+        profile_id="fixture",
+        selection_identity=SelectionFigureIdentity(
+            scenario_id="city",
+            profile_id="fixture",
+            profile_fingerprint="profile-selection",
+            points_fingerprint="points-selection",
+            boundary_fingerprint="boundary-selection",
+            dem_fingerprint="dem-selection",
+            scan_algorithm_version="row-sweep-v1",
+            scan_checked_positions=10,
+            scan_total_positions=10,
+            candidate_index=1,
+            candidate_flat_grid_id=9,
+            candidate_point_count=1,
+            candidate_left_x=0.0,
+            candidate_bottom_y=0.0,
+            candidate_center_x=500.0,
+            candidate_center_y=500.0,
+        ),
+    )
+
+
 def test_legacy_multi_rectangle_csv_requires_rect_id(tmp_path):
     path = tmp_path / "multi.csv"
     pd.DataFrame(
@@ -172,6 +210,11 @@ def test_legacy_multi_rectangle_csv_requires_rect_id(tmp_path):
 
     with pytest.raises(ValueError, match="rect_id"):
         FigureService.load_source(path)
+    inspection = FigureService.inspect_source(path)
+    assert inspection.rectangle_ids == (1, 2)
+    assert inspection.requires_rectangle is True
+    assert inspection.source_kind == "csv"
+    assert any("EPSG:3857" in warning for warning in inspection.warnings)
     loaded = FigureService.load_source(path, rect_id=2)
     assert loaded.rectangle["rect_id"] == 2
     assert loaded.frame["rect_id"].unique().tolist() == [2]
@@ -449,7 +492,11 @@ def test_render_publishes_full_spec_parent_and_self_contained_outputs(tmp_path):
         "fingerprint": hashlib.sha256(dem_path.read_bytes()).hexdigest(),
         "fingerprint_source": "sha256",
     }
-    assert set(record["artifacts"]) == {"terrain.png", "terrain.html"}
+    assert set(record["artifacts"]) == {
+        "source.csv",
+        "terrain.png",
+        "terrain.html",
+    }
     html = (run_dir / "terrain.html").read_text(encoding="utf-8")
     assert "plotly.js" in html.lower()
     assert '<script src="http' not in html.lower()
@@ -518,7 +565,7 @@ def test_render_publishes_partial_run_for_per_format_failure(
 
     record = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
     assert record["status"] == "partial"
-    assert record["artifacts"] == ["terrain.png"]
+    assert record["artifacts"] == ["source.csv", "terrain.png"]
     assert record["errors"] == [
         {
             "artifact": "html",
@@ -526,6 +573,64 @@ def test_render_publishes_partial_run_for_per_format_failure(
             "message": "RuntimeError: HTML failed",
         }
     ]
+    reloaded = FigureService.load_source(run_dir)
+    assert reloaded.rectangle == source.rectangle
+    assert reloaded.dem_path == dem_path.resolve()
+
+
+def test_rendered_selection_run_contains_reloadable_validated_source_snapshot(
+    tmp_path,
+):
+    source = write_in_memory_selection_source(tmp_path)
+
+    run_dir = FigureService.render(
+        source,
+        FigureSpec.from_preset("preview"),
+        RunService(tmp_path / "runs"),
+        ("png",),
+    )
+
+    record = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    assert record["artifacts"] == ["source.csv", "terrain.png"]
+    assert record["metadata"]["source"]["artifact"] == "source.csv"
+    assert record["metadata"]["inputs"]["selection"][
+        "candidate_flat_grid_id"
+    ] == 9
+    loaded = FigureService.load_source(run_dir)
+    assert loaded.source_kind == "run"
+    assert loaded.rectangle == source.rectangle
+    assert loaded.frame["X"].tolist() == source.frame["X"].tolist()
+    assert loaded.dem_path == source.dem_path.resolve()
+    assert loaded.target_crs == source.target_crs
+
+    (run_dir / "source.csv").unlink()
+    with pytest.raises(ValueError, match="artifact|source|CSV"):
+        FigureService.load_source(run_dir)
+
+
+def test_zero_station_selection_figure_snapshot_is_reloadable(tmp_path):
+    source = write_in_memory_selection_source(tmp_path)
+    rectangle = {**source.rectangle, "pt_count": 0}
+    identity = replace(source.selection_identity, candidate_point_count=0)
+    zero_source = replace(
+        source,
+        frame=source.frame.iloc[:0].copy(),
+        points=source.points.iloc[:0].copy(),
+        rectangle=rectangle,
+        selection_identity=identity,
+    )
+
+    run_dir = FigureService.render(
+        zero_source,
+        FigureSpec.from_preset("preview"),
+        RunService(tmp_path / "zero-runs"),
+        ("png",),
+    )
+    loaded = FigureService.load_source(run_dir)
+
+    assert loaded.frame.empty
+    assert loaded.points.empty
+    assert loaded.rectangle == rectangle
 
 
 def test_render_abandons_run_when_no_requested_format_succeeds(tmp_path, monkeypatch):

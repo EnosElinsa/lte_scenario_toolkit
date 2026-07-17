@@ -1,16 +1,15 @@
+import builtins
 from dataclasses import replace
 
 import geopandas as gpd
 import matplotlib
-import matplotlib.pyplot as plt
 import numpy as np
 import plotly.graph_objects as go
 import pytest
+from matplotlib.figure import Figure as MatplotlibFigure
 from rasterio.io import MemoryFile
 from rasterio.transform import from_origin
 from shapely.geometry import Point, box
-
-matplotlib.use("Agg")
 
 from lte_scenario_toolkit.figure_service import FigureSpec  # noqa: E402
 from lte_scenario_toolkit.visualization import (  # noqa: E402
@@ -20,7 +19,10 @@ from lte_scenario_toolkit.visualization import (  # noqa: E402
 )
 
 
-def test_save_preview_writes_noninteractive_png(tmp_path):
+def test_save_preview_writes_noninteractive_png_without_pyplot_or_backend_change(
+    tmp_path,
+    monkeypatch,
+):
     points = gpd.GeoDataFrame(geometry=[Point(1, 1)], crs="EPSG:3857")
     selected = [
         {
@@ -32,6 +34,17 @@ def test_save_preview_writes_noninteractive_png(tmp_path):
         }
     ]
     output = tmp_path / "preview.png"
+    backend = matplotlib.get_backend()
+    actual_import = builtins.__import__
+
+    def reject_pyplot(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "matplotlib.pyplot" or (
+            name == "matplotlib" and fromlist and "pyplot" in fromlist
+        ):
+            raise AssertionError("file rendering must not import pyplot")
+        return actual_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", reject_pyplot)
 
     save_preview(
         points,
@@ -42,6 +55,7 @@ def test_save_preview_writes_noninteractive_png(tmp_path):
 
     assert output.is_file()
     assert output.stat().st_size > 0
+    assert matplotlib.get_backend() == backend
 
 
 def test_render_3d_terrain_writes_png_and_html(tmp_path):
@@ -191,7 +205,10 @@ def test_prepare_terrain_arrays_normalises_nan_and_infinity():
     assert np.isnan(arrays["z"]).sum() == 2
 
 
-def test_render_3d_terrain_accepts_spec_and_independent_eps_path(tmp_path):
+def test_render_3d_terrain_accepts_spec_without_pyplot_or_backend_change(
+    tmp_path,
+    monkeypatch,
+):
     profile = {
         "driver": "GTiff",
         "height": 4,
@@ -205,6 +222,17 @@ def test_render_3d_terrain_accepts_spec_and_independent_eps_path(tmp_path):
         {"elevation": [2.0]}, geometry=[Point(1.5, 1.5)], crs="EPSG:3857"
     )
     eps_path = tmp_path / "terrain.eps"
+    backend = matplotlib.get_backend()
+    actual_import = builtins.__import__
+
+    def reject_pyplot(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "matplotlib.pyplot" or (
+            name == "matplotlib" and fromlist and "pyplot" in fromlist
+        ):
+            raise AssertionError("file rendering must not import pyplot")
+        return actual_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", reject_pyplot)
 
     with MemoryFile() as memory_file:
         with memory_file.open(**profile) as dataset:
@@ -222,6 +250,7 @@ def test_render_3d_terrain_accepts_spec_and_independent_eps_path(tmp_path):
     assert outputs == [eps_path]
     assert eps_path.stat().st_size > 0
     assert not (tmp_path / "terrain.png").exists()
+    assert matplotlib.get_backend() == backend
 
 
 def test_render_3d_terrain_closes_static_figure_when_save_fails(
@@ -240,19 +269,19 @@ def test_render_3d_terrain_closes_static_figure_when_save_fails(
     selected = gpd.GeoDataFrame(
         {"elevation": [2.0]}, geometry=[Point(1.5, 1.5)], crs="EPSG:3857"
     )
-    closed = []
-    actual_close = plt.close
+    cleared = []
+    actual_clear = MatplotlibFigure.clear
     monkeypatch.setattr(
-        matplotlib.figure.Figure,
+        MatplotlibFigure,
         "savefig",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("save failed")),
     )
 
-    def record_close(figure):
-        closed.append(figure)
-        actual_close(figure)
+    def record_clear(figure, *args, **kwargs):
+        cleared.append(figure)
+        return actual_clear(figure, *args, **kwargs)
 
-    monkeypatch.setattr(plt, "close", record_close)
+    monkeypatch.setattr(MatplotlibFigure, "clear", record_clear)
 
     with MemoryFile() as memory_file:
         with memory_file.open(**profile) as dataset:
@@ -268,7 +297,8 @@ def test_render_3d_terrain_closes_static_figure_when_save_fails(
                     png_path=tmp_path / "terrain.png",
                 )
 
-    assert len(closed) == 1
+    assert cleared
+    assert len({id(figure) for figure in cleared}) == 1
 
 
 def test_html_camera_uses_spec_azimuth_and_elevation(tmp_path, monkeypatch):

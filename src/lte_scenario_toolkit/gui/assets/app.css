@@ -412,6 +412,47 @@ body,
   font-weight: 650;
 }
 
+.lte-generate-page,
+.lte-figures-page,
+.lte-history-page {
+  max-width: 1180px;
+}
+
+.lte-generate-summary,
+.lte-generate-artifacts,
+.lte-figure-source,
+.lte-figure-style,
+.lte-figure-export {
+  gap: var(--lte-space-3);
+  padding: var(--lte-space-4);
+  border: 1px solid var(--lte-border);
+  border-radius: var(--lte-radius-sm);
+  box-shadow: 0 8px 22px rgb(16 42 46 / 6%);
+}
+
+.lte-artifact-status {
+  color: var(--lte-ink-soft);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.lte-figure-preview {
+  width: 100%;
+  max-height: 620px;
+  object-fit: contain;
+  border: 1px solid var(--lte-border);
+  border-radius: var(--lte-radius-sm);
+  background: #f5f8f8;
+}
+
+.lte-figure-warnings,
+.lte-figure-errors,
+.lte-generate-warnings,
+.lte-generate-errors {
+  width: 100%;
+  gap: var(--lte-space-2);
+}
+
 a:focus-visible,
 button:focus-visible,
 [tabindex]:focus-visible,

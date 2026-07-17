@@ -1,0 +1,520 @@
+"""Explicit, coordinated publication of one locked candidate session."""
+
+from __future__ import annotations
+
+import os
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, replace
+from pathlib import Path
+from threading import Lock
+from typing import Any
+
+from ...jobs import Job, JobBusyError, JobCoordinator
+from ...run_service import RunService
+
+ARTIFACT_ORDER = (
+    "csv",
+    "preview_png",
+    "terrain_png",
+    "terrain_eps",
+    "terrain_html",
+)
+_ARTIFACT_SET = frozenset(ARTIFACT_ORDER)
+
+
+def _ordered_artifacts(values: Iterable[str]) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes, os.PathLike)):
+        raise ValueError("artifacts must be a collection")
+    try:
+        requested = tuple(values)
+    except TypeError as exc:
+        raise ValueError("artifacts must be a collection") from exc
+    if any(type(value) is not str or value not in _ARTIFACT_SET for value in requested):
+        raise ValueError(
+            "artifact must be one of: " + ", ".join(ARTIFACT_ORDER)
+        )
+    if len(set(requested)) != len(requested):
+        raise ValueError("artifact selection must not contain duplicates")
+    selected = set(requested)
+    return tuple(token for token in ARTIFACT_ORDER if token in selected)
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationModel:
+    """Read-only confirmation model derived from one frozen candidate session."""
+
+    scenario_id: str
+    profile_id: str
+    candidate: Any
+    output_root: Path
+    selected_artifacts: tuple[str, ...] = ARTIFACT_ORDER
+
+    @property
+    def can_generate(self) -> bool:
+        return bool(self.selected_artifacts)
+
+    def with_artifact(self, token: str, enabled: bool) -> GenerationModel:
+        if token not in _ARTIFACT_SET:
+            raise ValueError(f"Unknown artifact: {token!r}")
+        selected = set(self.selected_artifacts)
+        if enabled:
+            selected.add(token)
+        else:
+            selected.discard(token)
+        return replace(self, selected_artifacts=_ordered_artifacts(selected))
+
+    def require_artifacts(self) -> tuple[str, ...]:
+        if not self.selected_artifacts:
+            raise ValueError("At least one artifact must be selected")
+        return self.selected_artifacts
+
+
+def generation_model(session: Any) -> GenerationModel:
+    """Validate a locked final candidate without touching the filesystem."""
+
+    candidate = getattr(session, "locked_candidate", None)
+    if candidate is None:
+        raise ValueError("generation requires one locked candidate")
+    result = getattr(session, "scan_result", None)
+    if result is None or getattr(result, "completed", None) is not True:
+        raise ValueError("generation requires a completed final scan")
+    matches = tuple(item for item in getattr(result, "candidates", ()) if item == candidate)
+    if len(matches) != 1:
+        raise ValueError("locked candidate must occur in exactly one final scan position")
+    preflight = getattr(session, "preflight", None)
+    profile = getattr(session, "profile_snapshot", None)
+    if preflight is None or getattr(preflight, "profile", None) is not profile:
+        raise ValueError("generation requires the validated frozen profile snapshot")
+    output_value = getattr(preflight, "output_root", None)
+    if not isinstance(output_value, (str, os.PathLike)):
+        raise ValueError("generation requires a validated output root")
+    output_root = Path(output_value).expanduser().resolve(strict=False)
+    scenario_id = getattr(profile, "scenario_id", None)
+    profile_id = getattr(profile, "profile_id", None)
+    if type(scenario_id) is not str or not scenario_id:
+        raise ValueError("generation requires a scenario ID")
+    if type(profile_id) is not str or not profile_id:
+        raise ValueError("generation requires a profile ID")
+    return GenerationModel(
+        scenario_id=scenario_id,
+        profile_id=profile_id,
+        candidate=candidate,
+        output_root=output_root,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationState:
+    """Immutable generation status suitable for UI polling."""
+
+    phase: str
+    requested_artifacts: tuple[str, ...]
+    run_path: Path | None = None
+    artifact_states: tuple[tuple[str, str], ...] = ()
+    errors: tuple[dict[str, Any], ...] = ()
+    warnings: tuple[dict[str, Any], ...] = ()
+    message: str | None = None
+
+    def artifact_status(self, token: str) -> str:
+        for name, status in self.artifact_states:
+            if name == token:
+                return status
+        return "not-requested" if token not in self.requested_artifacts else "pending"
+
+
+def _published_state(
+    value: Any,
+    *,
+    model: GenerationModel,
+    requested: tuple[str, ...],
+) -> GenerationState:
+    if not isinstance(value, (str, os.PathLike)):
+        raise ValueError("selection export did not return a run directory")
+    entry = RunService(model.output_root).entry_for_path(value)
+    run_path = entry.run_dir
+    record = entry.record
+    if record.get("scenario_id") != model.scenario_id:
+        raise ValueError("published run scenario does not match the locked session")
+    if record.get("profile_id") != model.profile_id:
+        raise ValueError("published run profile does not match the locked session")
+    status = record.get("status")
+    if status not in {"completed", "partial"}:
+        raise ValueError("published run status must be completed or partial")
+    artifacts = record.get("artifacts")
+    errors = record.get("errors")
+    metadata = record.get("metadata")
+    if not isinstance(artifacts, (list, tuple)) or any(
+        type(item) is not str for item in artifacts
+    ):
+        raise ValueError("published run artifacts must be a list of paths")
+    if not isinstance(errors, (list, tuple)) or any(
+        not isinstance(item, Mapping) for item in errors
+    ):
+        raise ValueError("published run errors must be a list of objects")
+    if not isinstance(metadata, Mapping):
+        raise ValueError("published run metadata must be an object")
+    if metadata.get("run_kind") != "selection":
+        raise ValueError("published run must be a selection run")
+    candidate = metadata.get("candidate")
+    if not isinstance(candidate, Mapping):
+        raise ValueError("published run is missing candidate metadata")
+    if candidate.get("flat_grid_id") != model.candidate.flat_grid_id:
+        raise ValueError("published run candidate does not match the locked candidate")
+    if candidate.get("point_count") != model.candidate.point_count:
+        raise ValueError("published run station count does not match the locked candidate")
+    for name in ("center_x", "center_y"):
+        if name not in candidate or candidate.get(name) != getattr(model.candidate, name):
+            raise ValueError("published run candidate geometry does not match")
+    recorded_request = metadata.get("requested_artifacts")
+    if not isinstance(recorded_request, (list, tuple)) or tuple(
+        recorded_request
+    ) != requested:
+        raise ValueError("published run requested artifacts do not match the request")
+    artifact_paths = metadata.get("artifact_paths")
+    if not isinstance(artifact_paths, Mapping):
+        raise ValueError("published run artifact_paths must be an object")
+    states: list[tuple[str, str]] = []
+    for token in requested:
+        relative = artifact_paths.get(token)
+        if relative is None:
+            states.append((token, "failed"))
+            continue
+        if relative not in artifacts:
+            raise ValueError("published artifact path is absent from run artifacts")
+        states.append((token, "published"))
+    published_count = sum(state == "published" for _, state in states)
+    if published_count == 0:
+        raise ValueError("published run contains none of the requested artifacts")
+    if status == "completed" and published_count != len(requested):
+        raise ValueError("completed run is missing requested artifacts")
+    if status == "completed" and errors:
+        raise ValueError("completed run must not contain errors")
+    failed_tokens = {
+        item.get("artifact") for item in errors if isinstance(item, Mapping)
+    }
+    missing_tokens = {
+        token for token, artifact_status in states if artifact_status == "failed"
+    }
+    if status == "partial" and failed_tokens != missing_tokens:
+        raise ValueError("partial run errors do not match failed artifacts")
+    return GenerationState(
+        phase=status,
+        requested_artifacts=requested,
+        run_path=run_path,
+        artifact_states=tuple(states),
+        errors=tuple(dict(item) for item in errors),
+    )
+
+
+class GenerationController:
+    """Publish one immutable candidate through the shared job coordinator."""
+
+    def __init__(
+        self,
+        session: Any,
+        coordinator: JobCoordinator,
+        *,
+        on_published: Callable[[Path], None] | None = None,
+    ) -> None:
+        self.session = session
+        self.model = generation_model(session)
+        self.coordinator = coordinator
+        self.on_published = on_published
+        self._lock = Lock()
+        self._job: Job | None = None
+        self._state = GenerationState("ready", self.model.selected_artifacts)
+        self._published_notified = False
+        self._closed = False
+
+    @property
+    def state(self) -> GenerationState:
+        with self._lock:
+            return self._state
+
+    @property
+    def job(self) -> Job | None:
+        with self._lock:
+            return self._job
+
+    def _notify_published(self, path: Path) -> dict[str, Any] | None:
+        callback: Callable[[Path], None] | None
+        with self._lock:
+            if self._published_notified:
+                return None
+            self._published_notified = True
+            callback = self.on_published
+        if callback is not None:
+            try:
+                callback(path)
+            except Exception as exc:
+                # The run is already authoritative; a workstation preference failure
+                # must not downgrade or delete it.
+                return {
+                    "code": "generation.settings_failed",
+                    "message": str(exc),
+                }
+        return None
+
+    def start(self, artifacts: Iterable[str]) -> Job:
+        requested = _ordered_artifacts(artifacts)
+        if not requested:
+            raise ValueError("At least one artifact must be selected")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("generation controller is closed")
+            if self._job is not None:
+                if self._job.future is not None and not self._job.future.done():
+                    raise JobBusyError(
+                        "Generation is already running",
+                        active_job_id=self._job.job_id,
+                        active_kind=self._job.kind,
+                        requested_kind="generate",
+                    )
+                raise RuntimeError("this locked selection has already been generated")
+
+        session = self.session
+        service = getattr(session, "selection_service", None)
+        preflight = session.preflight
+        scan_result = session.scan_result
+        candidate = session.locked_candidate
+        output_root = self.model.output_root
+
+        def worker(_cancel: Any, _emit: Callable[[Any], None]) -> GenerationState:
+            try:
+                published = service.export(
+                    preflight,
+                    scan_result,
+                    candidate,
+                    output_root=output_root,
+                    artifacts=requested,
+                    entrypoint=("lte-gui", "generate"),
+                )
+                result = _published_state(
+                    published,
+                    model=self.model,
+                    requested=requested,
+                )
+            except Exception as exc:
+                result = GenerationState(
+                    phase="error",
+                    requested_artifacts=requested,
+                    artifact_states=tuple((token, "failed") for token in requested),
+                    errors=(
+                        {
+                            "code": getattr(exc, "code", "generation.failed"),
+                            "message": str(exc),
+                        },
+                    ),
+                    message=str(exc),
+                )
+            if result.run_path is not None:
+                warning = self._notify_published(result.run_path)
+                if warning is not None:
+                    result = replace(result, warnings=(warning,))
+            return result
+
+        job = self.coordinator.submit("generate", worker)
+        with self._lock:
+            self._job = job
+            self._state = GenerationState("running", requested)
+
+        def release(_future: Any) -> None:
+            self.coordinator.finish(job.job_id)
+
+        assert job.future is not None
+        job.future.add_done_callback(release)
+        return job
+
+    def drain(self, job: Job | None = None) -> GenerationState:
+        active = self.job if job is None else job
+        if active is None or active.future is None or not active.future.done():
+            return self.state
+        try:
+            state = active.future.result()
+        except Exception as exc:
+            state = GenerationState(
+                phase="error",
+                requested_artifacts=self.state.requested_artifacts,
+                errors=({"code": "generation.failed", "message": str(exc)},),
+                message=str(exc),
+            )
+        with self._lock:
+            if self._job is None or self._job.job_id == active.job_id:
+                self._state = state
+        self.coordinator.finish(active.job_id)
+        return state
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationPageView:
+    controller: GenerationController
+    timer: Any
+
+
+def render_generation_unavailable(ui: Any, translator: Any) -> None:
+    """Render a fail-closed route when no locked opaque session is present."""
+
+    with ui.column().classes("lte-page lte-generate-page"):
+        ui.label(translator.text("generate.unavailable")).classes("lte-page-title")
+        ui.label(translator.text("generate.unavailable_body")).classes(
+            "lte-callout lte-callout--warning"
+        )
+        ui.button(
+            translator.text("candidates.back_to_configure"),
+            on_click=lambda: ui.navigate.to("/configure"),
+        ).props("outline")
+
+
+def render_generate_page(
+    ui: Any,
+    translator: Any,
+    session: Any,
+    coordinator: JobCoordinator,
+    *,
+    on_published: Callable[[Path], None] | None = None,
+    on_complete: Callable[[GenerationState], None] | None = None,
+    on_open_figures: Callable[[], None] | None = None,
+) -> GenerationPageView:
+    """Render immutable confirmation controls and one explicit Generate action."""
+
+    controller = GenerationController(
+        session,
+        coordinator,
+        on_published=on_published,
+    )
+    model = controller.model
+    checkboxes: dict[str, Any] = {}
+    artifact_labels: dict[str, Any] = {}
+    navigated = False
+
+    with ui.column().classes("lte-page lte-generate-page"):
+        ui.label(translator.text("generate.title")).classes("lte-page-title")
+        ui.label(translator.text("generate.subtitle")).classes("lte-page-subtitle")
+        with ui.card().classes("lte-generate-summary full-width"):
+            ui.label(translator.text("generate.summary")).classes("lte-section-title")
+            ui.label(f"{model.scenario_id} / {model.profile_id}")
+            ui.label(
+                translator.text(
+                    "generate.candidate",
+                    grid_id=model.candidate.flat_grid_id,
+                    count=model.candidate.point_count,
+                )
+            )
+            ui.label(
+                translator.text("generate.destination", path=str(model.output_root))
+            ).classes("lte-path")
+        with ui.card().classes("lte-generate-artifacts full-width"):
+            ui.label(translator.text("generate.artifacts")).classes("lte-section-title")
+            for token in ARTIFACT_ORDER:
+                checkboxes[token] = ui.checkbox(
+                    translator.text(f"generate.artifact.{token}"),
+                    value=True,
+                )
+                artifact_labels[token] = ui.label(
+                    translator.text(
+                        "generate.artifact_status",
+                        artifact=token,
+                        status=translator.text("status.pending"),
+                    )
+                ).classes("lte-artifact-status")
+        message = ui.label("").classes("lte-validation-result")
+        warning_box = ui.column().classes("lte-generate-warnings")
+        error_box = ui.column().classes("lte-generate-errors")
+        submit = ui.button(translator.text("generate.action")).mark(
+            "generation-submit"
+        )
+        if on_open_figures is not None:
+            ui.button(
+                translator.text("action.open_figures"),
+                on_click=on_open_figures,
+            ).props("outline").mark("generation-open-figures")
+
+    def tick() -> None:
+        nonlocal navigated
+        state = controller.drain()
+        for token, label in artifact_labels.items():
+            raw_status = state.artifact_status(token)
+            label.set_text(
+                translator.text(
+                    "generate.artifact_status",
+                    artifact=token,
+                    status=translator.text(
+                        f"status.{raw_status.replace('-', '_')}"
+                    ),
+                )
+            )
+        if state.phase == "running":
+            return
+        timer.deactivate()
+        submit.disable()
+        warning_box.clear()
+        error_box.clear()
+        with warning_box:
+            for warning in state.warnings:
+                if warning.get("code") == "generation.settings_failed":
+                    text = translator.text(
+                        "generate.warning.settings_failed",
+                        detail=warning.get("message", ""),
+                    )
+                else:
+                    text = (
+                        f"{warning.get('code', 'generation.warning')}: "
+                        f"{warning.get('message', '')}"
+                    )
+                ui.label(text).classes("lte-callout lte-callout--warning")
+        with error_box:
+            for error in state.errors:
+                ui.label(
+                    f"{error.get('code', 'generation.error')}: "
+                    f"{error.get('message', '')}"
+                ).classes("lte-validation-result lte-validation-result--error")
+        if state.phase in {"completed", "partial"}:
+            message.set_text(translator.text(f"generate.status.{state.phase}"))
+            if not navigated and on_complete is not None:
+                navigated = True
+                on_complete(state)
+            return
+        if state.phase == "error":
+            message.set_text(state.message or translator.text("operation.failed"))
+
+    def start() -> None:
+        selected = tuple(
+            token for token in ARTIFACT_ORDER if bool(checkboxes[token].value)
+        )
+        try:
+            controller.start(selected)
+        except JobBusyError:
+            ui.notify(translator.text("error.job_busy"), type="warning")
+            return
+        except (RuntimeError, ValueError) as exc:
+            ui.notify(str(exc), type="warning")
+            return
+        submit.disable()
+        message.set_text(translator.text("generate.status.running"))
+        timer.activate()
+
+    submit.on("click", start)
+    timer = ui.timer(0.1, tick, active=False)
+
+    def cleanup() -> None:
+        timer.deactivate()
+        controller.close()
+
+    ui.context.client.on_delete(cleanup)
+    return GenerationPageView(controller=controller, timer=timer)
+
+
+__all__ = [
+    "ARTIFACT_ORDER",
+    "GenerationController",
+    "GenerationModel",
+    "GenerationPageView",
+    "GenerationState",
+    "generation_model",
+    "render_generate_page",
+    "render_generation_unavailable",
+]

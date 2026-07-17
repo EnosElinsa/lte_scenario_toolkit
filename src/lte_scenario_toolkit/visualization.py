@@ -12,47 +12,90 @@ import geopandas as gpd
 import numpy as np
 
 
+def _geometry_line_segments(geometry) -> list[np.ndarray]:
+    """Return two-dimensional line segments without invoking GeoPandas plotting."""
+
+    if geometry is None or geometry.is_empty:
+        return []
+    geometry_type = geometry.geom_type
+    if geometry_type == "Polygon":
+        return [
+            np.asarray(ring.coords, dtype=float)[:, :2]
+            for ring in (geometry.exterior, *geometry.interiors)
+        ]
+    if geometry_type in {
+        "MultiPolygon",
+        "MultiLineString",
+        "GeometryCollection",
+    }:
+        return [
+            segment
+            for child in geometry.geoms
+            for segment in _geometry_line_segments(child)
+        ]
+    if geometry_type in {"LineString", "LinearRing"}:
+        return [np.asarray(geometry.coords, dtype=float)[:, :2]]
+    raise ValueError(f"Unsupported boundary geometry: {geometry_type}")
+
+
 def save_preview(points_gdf, boundary, selected_rectangles, config) -> Path:
     """Save a non-blocking 2D preview of the chosen scenarios."""
 
-    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.collections import LineCollection
+    from matplotlib.figure import Figure
     from matplotlib.patches import Rectangle
 
     rectangle_size = float(config["rect_size"])
     output = Path(config["preview_png"])
     output.parent.mkdir(parents=True, exist_ok=True)
-    figure, axis = plt.subplots(figsize=(12, 10))
-    gpd.GeoSeries([boundary], crs=points_gdf.crs).plot(
-        ax=axis, facecolor="none", edgecolor="black", linewidth=1.5
-    )
-    points_gdf.plot(ax=axis, color="gray", markersize=0.5, alpha=0.3)
-    for index, result in enumerate(selected_rectangles, start=1):
-        patch = Rectangle(
-            (result["left_x"], result["bottom_y"]),
-            rectangle_size,
-            rectangle_size,
-            facecolor="green",
-            edgecolor="green",
-            alpha=0.35,
-            linewidth=1.5,
+    figure = Figure(figsize=(12, 10))
+    FigureCanvasAgg(figure)
+    try:
+        axis = figure.add_subplot(111)
+        boundary_lines = LineCollection(
+            _geometry_line_segments(boundary),
+            colors="black",
+            linewidths=1.5,
         )
-        axis.add_patch(patch)
-        axis.annotate(
-            f"{index}\n({result['pt_count']})",
-            xy=(result["center_x"], result["center_y"]),
-            ha="center",
-            va="center",
-            fontsize=7,
-            color="darkgreen",
+        axis.add_collection(boundary_lines)
+        point_geometry = points_gdf.geometry
+        axis.scatter(
+            point_geometry.x.to_numpy(),
+            point_geometry.y.to_numpy(),
+            color="gray",
+            s=0.5,
+            alpha=0.3,
         )
-    axis.set_title(
-        f"{config.get('boundary_layer', 'boundary')} | {len(selected_rectangles)} selected "
-        f"({rectangle_size:g}m x {rectangle_size:g}m)"
-    )
-    axis.set_aspect("equal")
-    figure.tight_layout()
-    figure.savefig(output, dpi=150, bbox_inches="tight")
-    plt.close(figure)
+        for index, result in enumerate(selected_rectangles, start=1):
+            patch = Rectangle(
+                (result["left_x"], result["bottom_y"]),
+                rectangle_size,
+                rectangle_size,
+                facecolor="green",
+                edgecolor="green",
+                alpha=0.35,
+                linewidth=1.5,
+            )
+            axis.add_patch(patch)
+            axis.annotate(
+                f"{index}\n({result['pt_count']})",
+                xy=(result["center_x"], result["center_y"]),
+                ha="center",
+                va="center",
+                fontsize=7,
+                color="darkgreen",
+            )
+        axis.set_title(
+            f"{config.get('boundary_layer', 'boundary')} | {len(selected_rectangles)} selected "
+            f"({rectangle_size:g}m x {rectangle_size:g}m)"
+        )
+        axis.set_aspect("equal")
+        axis.autoscale_view()
+        figure.tight_layout()
+        figure.savefig(output, dpi=150, bbox_inches="tight")
+    finally:
+        figure.clear()
     return output
 
 
@@ -308,9 +351,6 @@ def render_3d_terrain(
     adapter for the pre-service selection exporter.
     """
 
-    import matplotlib.pyplot as plt
-    import plotly.graph_objects as go
-
     if isinstance(spec, Mapping):
         (
             spec,
@@ -364,9 +404,13 @@ def render_3d_terrain(
     outputs: list[Path] = []
 
     if png_path is not None or eps_path is not None:
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+
         static_parent = png_path.parent if png_path is not None else eps_path.parent
         static_parent.mkdir(parents=True, exist_ok=True)
-        figure = plt.figure(figsize=(14, 10))
+        figure = Figure(figsize=(14, 10))
+        FigureCanvasAgg(figure)
         try:
             axis = figure.add_subplot(111, projection="3d")
             surface = axis.plot_surface(
@@ -412,9 +456,11 @@ def render_3d_terrain(
                 )
                 outputs.append(eps_path)
         finally:
-            plt.close(figure)
+            figure.clear()
 
     if html_path is not None:
+        import plotly.graph_objects as go
+
         html_path.parent.mkdir(parents=True, exist_ok=True)
         surface = go.Surface(
             x=arrays["x"],

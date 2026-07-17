@@ -598,6 +598,33 @@ def test_gui_settings_concurrent_saves_publish_one_complete_document(tmp_path):
     assert not list(store.path.parent.glob("*.tmp"))
 
 
+def test_gui_settings_updates_merge_against_latest_document(tmp_path):
+    module = _gui_module("settings")
+    store = module.GuiSettingsStore(tmp_path)
+    first_root = tmp_path / "output-a"
+    second_root = tmp_path / "output-b"
+    store.save(language="en", output_roots=[first_root])
+
+    barrier = Barrier(2)
+
+    def change_language():
+        barrier.wait()
+        store.update(language="zh-CN")
+
+    def remember_root():
+        barrier.wait()
+        store.update(add_output_roots=(second_root,))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(change_language), executor.submit(remember_root)]
+        for future in futures:
+            future.result()
+
+    settings = store.load()
+    assert settings.language == "zh-CN"
+    assert settings.output_roots == (first_root.resolve(), second_root.resolve())
+
+
 async def test_gui_shell_renders_and_switches_language_offline(
     tmp_path, monkeypatch, user
 ):
@@ -1842,7 +1869,11 @@ def test_custom_coordinator_does_not_create_or_own_shared_coordinator(
         testing=True,
     )
 
-    assert calls == []
+    assert len(calls) == 2
+    assert all(callable(callback) for callback in calls)
+    assert module.shutdown_job_coordinator not in calls
+    for callback in calls:
+        callback()
 
 
 def _task14_scan_result(*, completed=True):
@@ -2721,3 +2752,1031 @@ async def test_configure_start_passes_exact_frozen_preflight_to_opaque_session(
     assert session.profile_snapshot is calls[0][0]
     assert session.preflight is calls[0][1]
     assert str(tmp_path) not in route
+
+
+def _task15_locked_session(tmp_path, service, *, session_id="generate-session"):
+    from dataclasses import replace
+
+    result = _task14_scan_result()
+    session = _task14_session(tmp_path, service, session_id=session_id)
+    return replace(
+        session,
+        preflight=SimpleNamespace(
+            profile=session.profile_snapshot,
+            output_root=tmp_path / "results",
+        ),
+        scan_result=result,
+        confirmed_flat_grid_id=4,
+        locked_candidate=result.candidates[1],
+    )
+
+
+def test_generate_model_requires_one_locked_candidate():
+    from dataclasses import replace
+
+    from lte_scenario_toolkit.gui.pages.generate import generation_model
+
+    with pytest.raises(ValueError, match="locked candidate"):
+        generation_model(SimpleNamespace(locked_candidate=None))
+
+    session = _task15_locked_session(Path.cwd(), object())
+    with pytest.raises(ValueError, match="completed"):
+        generation_model(
+            replace(
+                session,
+                scan_result=replace(session.scan_result, completed=False),
+            )
+        )
+    with pytest.raises(ValueError, match="exactly one"):
+        generation_model(
+            replace(
+                session,
+                scan_result=replace(
+                    session.scan_result,
+                    candidates=(session.locked_candidate, session.locked_candidate),
+                ),
+            )
+        )
+
+
+def test_generation_model_is_read_only_and_requires_one_artifact(tmp_path):
+    from dataclasses import replace
+
+    from lte_scenario_toolkit.gui.pages.generate import generation_model
+
+    output_root = tmp_path / "results"
+    session = _task15_locked_session(tmp_path, object())
+    session = replace(
+        session,
+        preflight=SimpleNamespace(
+            profile=session.profile_snapshot,
+            output_root=output_root,
+        ),
+    )
+
+    model = generation_model(session)
+
+    assert model.scenario_id == session.profile_snapshot.scenario_id
+    assert model.profile_id == session.profile_snapshot.profile_id
+    assert model.candidate is session.locked_candidate
+    assert model.output_root == output_root.resolve()
+    assert model.can_generate is True
+    assert not output_root.exists()
+    empty = model.with_artifact("csv", False)
+    for token in tuple(empty.selected_artifacts):
+        empty = empty.with_artifact(token, False)
+    assert empty.can_generate is False
+    with pytest.raises(ValueError, match="artifact"):
+        empty.require_artifacts()
+    with pytest.raises(ValueError, match="artifact"):
+        model.with_artifact("pdf", True)
+
+
+def test_generation_controller_publishes_partial_record_and_remembers_root(tmp_path):
+    from dataclasses import replace
+
+    from lte_scenario_toolkit.gui.pages.generate import GenerationController
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.run_service import RunService
+
+    output_root = tmp_path / "results"
+    remembered = []
+
+    class Service:
+        def export(
+            self,
+            preflight,
+            scan_result,
+            candidate,
+            *,
+            output_root,
+            artifacts,
+            entrypoint,
+        ):
+            assert candidate is session.locked_candidate
+            assert scan_result is session.scan_result
+            assert preflight is session.preflight
+            assert tuple(artifacts) == ("csv", "terrain_png")
+            assert tuple(entrypoint) == ("lte-gui", "generate")
+            run_service = RunService(output_root)
+            run = run_service.begin("ready-city", "default")
+            (run.path / "scenario.csv").write_text("X,Y\n1,2\n", encoding="utf-8")
+            return run_service.publish(
+                run,
+                status="partial",
+                artifacts=["scenario.csv"],
+                metadata={
+                    "run_kind": "selection",
+                    "requested_artifacts": list(artifacts),
+                    "artifact_paths": {"csv": "scenario.csv"},
+                    "candidate": {
+                        "flat_grid_id": candidate.flat_grid_id,
+                        "point_count": candidate.point_count,
+                        "center_x": candidate.center_x,
+                        "center_y": candidate.center_y,
+                    },
+                },
+                errors=[{"artifact": "terrain_png", "code": "png.failed"}],
+            )
+
+    profile = _task13_profile(tmp_path)
+    preflight = SimpleNamespace(profile=profile, output_root=output_root)
+    session = _task15_locked_session(tmp_path, Service())
+    session = replace(
+        session,
+        profile_snapshot=profile,
+        preflight=preflight,
+    )
+    coordinator = JobCoordinator()
+    controller = GenerationController(
+        session,
+        coordinator,
+        on_published=lambda path: remembered.append(path),
+    )
+    try:
+        assert not output_root.exists()
+        job = controller.start({"csv", "terrain_png"})
+        assert job.future is not None
+        job.future.result(timeout=2)
+        state = controller.drain(job)
+
+        assert state.phase == "partial"
+        assert state.run_path is not None and state.run_path.is_dir()
+        assert state.errors[0]["code"] == "png.failed"
+        assert state.artifact_status("csv") == "published"
+        assert state.artifact_status("terrain_png") == "failed"
+        assert remembered == [state.run_path]
+        assert coordinator.snapshot().active is False
+    finally:
+        controller.close()
+        coordinator.shutdown()
+
+
+@pytest.mark.parametrize("result_kind", ["malformed", "escaped"])
+def test_generation_controller_rejects_untrusted_publish_result(tmp_path, result_kind):
+    from lte_scenario_toolkit.gui.pages.generate import GenerationController
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    output_root = tmp_path / "results"
+
+    class Service:
+        def export(self, *args, **kwargs):
+            if result_kind == "escaped":
+                published = tmp_path / "escaped"
+                published.mkdir()
+            else:
+                published = output_root / "city" / "default" / "run"
+                published.mkdir(parents=True)
+            (published / "run.json").write_text(
+                "not-json" if result_kind == "malformed" else json.dumps({}),
+                encoding="utf-8",
+            )
+            return published
+
+    session = _task15_locked_session(tmp_path, Service())
+    controller = GenerationController(session, JobCoordinator())
+    try:
+        job = controller.start({"csv"})
+        assert job.future is not None
+        job.future.result(timeout=2)
+        state = controller.drain(job)
+
+        assert state.phase == "error"
+        assert state.run_path is None
+        assert controller.coordinator.snapshot().active is False
+    finally:
+        controller.close()
+        controller.coordinator.shutdown()
+
+
+def test_generation_controller_preserves_the_shared_busy_slot(tmp_path):
+    from lte_scenario_toolkit.gui.pages.generate import GenerationController
+    from lte_scenario_toolkit.jobs import JobBusyError, JobCoordinator
+
+    coordinator = JobCoordinator()
+    active = coordinator.start("scan")
+    controller = GenerationController(
+        _task15_locked_session(tmp_path, object()),
+        coordinator,
+    )
+    try:
+        with pytest.raises(JobBusyError):
+            controller.start({"csv"})
+        assert coordinator.snapshot().job_id == active.job_id
+    finally:
+        assert coordinator.finish(active.job_id) is True
+        controller.close()
+        coordinator.shutdown()
+
+
+def test_generation_done_callback_releases_slot_after_page_cleanup(tmp_path):
+    from threading import Event
+
+    from lte_scenario_toolkit.gui.pages.generate import GenerationController
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    entered = Event()
+    release = Event()
+    published = tmp_path / "published"
+
+    class Service:
+        def export(self, *args, **kwargs):
+            entered.set()
+            assert release.wait(2)
+            published.mkdir()
+            (published / "run.json").write_text(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "artifacts": ["scenario.csv"],
+                        "metadata": {
+                            "requested_artifacts": ["csv"],
+                            "artifact_paths": {"csv": "scenario.csv"},
+                        },
+                        "errors": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return published
+
+    controller = GenerationController(
+        _task15_locked_session(tmp_path, Service()),
+        JobCoordinator(),
+    )
+    try:
+        job = controller.start({"csv"})
+        assert entered.wait(2)
+        controller.close()
+        release.set()
+        assert job.future is not None
+        job.future.result(timeout=2)
+        for _ in range(20):
+            if not controller.coordinator.snapshot().active:
+                break
+            Event().wait(0.01)
+        assert controller.coordinator.snapshot().active is False
+    finally:
+        controller.coordinator.shutdown()
+
+
+def test_generation_settings_failure_is_a_warning_and_generation_is_one_shot(
+    tmp_path,
+):
+    from lte_scenario_toolkit.gui.pages.generate import GenerationController
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.run_service import RunService
+
+    class Service:
+        def export(
+            self,
+            preflight,
+            scan_result,
+            candidate,
+            *,
+            output_root,
+            artifacts,
+            entrypoint,
+        ):
+            run_service = RunService(output_root)
+            run = run_service.begin("ready-city", "default")
+            (run.path / "scenario.csv").write_text("ok\n", encoding="utf-8")
+            return run_service.publish(
+                run,
+                status="completed",
+                artifacts=["scenario.csv"],
+                metadata={
+                    "run_kind": "selection",
+                    "requested_artifacts": list(artifacts),
+                    "artifact_paths": {"csv": "scenario.csv"},
+                    "candidate": {
+                        "flat_grid_id": candidate.flat_grid_id,
+                        "point_count": candidate.point_count,
+                        "center_x": candidate.center_x,
+                        "center_y": candidate.center_y,
+                    },
+                    "entrypoint": list(entrypoint),
+                },
+            )
+
+    coordinator = JobCoordinator()
+    controller = GenerationController(
+        _task15_locked_session(tmp_path, Service()),
+        coordinator,
+        on_published=lambda _path: (_ for _ in ()).throw(
+            OSError("settings unavailable")
+        ),
+    )
+    try:
+        job = controller.start(("csv",))
+        assert job.future is not None
+        job.future.result(timeout=2)
+        state = controller.drain(job)
+
+        assert state.phase == "completed"
+        assert state.warnings == (
+            {
+                "code": "generation.settings_failed",
+                "message": "settings unavailable",
+            },
+        )
+        with pytest.raises(RuntimeError, match="already"):
+            controller.start(("csv",))
+        controller.close()
+        with pytest.raises(RuntimeError, match="closed"):
+            controller.start(("csv",))
+    finally:
+        coordinator.shutdown()
+
+
+def test_history_model_includes_partial_and_parent_runs(tmp_path):
+    from lte_scenario_toolkit.gui.pages.history import history_rows
+    from lte_scenario_toolkit.run_service import RunService
+
+    service = RunService(tmp_path)
+    parent = service.begin("city", "default", created_at="2026-07-16T10:00:00Z")
+    (parent.path / "scenario.csv").write_text("X,Y\n1,2\n", encoding="utf-8")
+    service.publish(parent, status="completed", artifacts=["scenario.csv"])
+    child = service.begin(
+        "city",
+        "default",
+        created_at="2026-07-16T10:00:01Z",
+        parent_run_id=parent.run_id,
+    )
+    (child.path / "terrain.png").write_bytes(b"png")
+    service.publish(
+        child,
+        status="partial",
+        artifacts=["terrain.png"],
+        errors=[{"code": "html.failed"}],
+    )
+
+    rows = history_rows(service)
+
+    assert {row.status for row in rows} == {"completed", "partial"}
+    derived = next(row for row in rows if row.parent_run_id)
+    assert derived.can_open_figures is True
+    assert derived.figure_source_path == next(
+        row.path for row in rows if row.run_id == parent.run_id
+    )
+
+
+def test_history_rows_sort_fractional_seconds_newest_first(tmp_path):
+    from lte_scenario_toolkit.gui.pages.history import history_rows
+    from lte_scenario_toolkit.run_service import RunService
+
+    service = RunService(tmp_path)
+    earlier = service.begin("city", "default", created_at="2026-07-16T10:00:00Z")
+    (earlier.path / "scenario.csv").write_text("ok\n", encoding="utf-8")
+    service.publish(earlier, status="completed", artifacts=["scenario.csv"])
+    later = service.begin(
+        "city",
+        "default",
+        created_at="2026-07-16T10:00:00.500000Z",
+    )
+    (later.path / "scenario.csv").write_text("ok\n", encoding="utf-8")
+    service.publish(later, status="completed", artifacts=["scenario.csv"])
+
+    rows = history_rows(service)
+
+    assert [row.run_id for row in rows] == [later.run_id, earlier.run_id]
+
+
+def test_history_rebuild_deduplicates_roots_and_index_is_not_authoritative(tmp_path):
+    from lte_scenario_toolkit.gui.pages.history import rebuild_history
+    from lte_scenario_toolkit.run_service import RunService
+
+    root = tmp_path / "results"
+    service = RunService(root)
+    first = service.begin("city", "default", created_at="2026-07-16T10:00:00Z")
+    (first.path / "scenario.csv").write_text("ok\n", encoding="utf-8")
+    service.publish(first, status="completed", artifacts=["scenario.csv"])
+    index = tmp_path / ".lte-data/cache/history-index.json"
+
+    initial = rebuild_history(tmp_path, (root, root / "."), index_path=index)
+    assert [row.run_id for row in initial.rows] == [first.run_id]
+    assert index.is_file()
+
+    second = service.begin("city", "default", created_at="2026-07-16T10:00:01Z")
+    (second.path / "scenario.csv").write_text("ok\n", encoding="utf-8")
+    service.publish(second, status="completed", artifacts=["scenario.csv"])
+    refreshed = rebuild_history(tmp_path, (root,), index_path=index)
+
+    assert {row.run_id for row in refreshed.rows} == {first.run_id, second.run_id}
+    cached = json.loads(index.read_text(encoding="utf-8"))
+    assert {item["run_id"] for item in cached["rows"]} == {
+        first.run_id,
+        second.run_id,
+    }
+
+
+def test_history_rebuild_keeps_live_rows_when_derived_index_is_unsafe(tmp_path):
+    from lte_scenario_toolkit.gui.pages.history import rebuild_history
+    from lte_scenario_toolkit.run_service import RunService
+
+    root = tmp_path / "results"
+    service = RunService(root)
+    run = service.begin("city", "default")
+    (run.path / "scenario.csv").write_text("ok\n", encoding="utf-8")
+    service.publish(run, status="completed", artifacts=["scenario.csv"])
+    cache_parent = tmp_path / ".lte-data"
+    cache_parent.mkdir()
+    (cache_parent / "cache").write_text("occupied", encoding="utf-8")
+
+    snapshot = rebuild_history(tmp_path, (root,))
+
+    assert [row.run_id for row in snapshot.rows] == [run.run_id]
+    assert any("History index was not updated" in item.error for item in snapshot.diagnostics)
+    assert snapshot.index_path == (cache_parent / "cache/history-index.json").absolute()
+
+
+def test_figure_form_does_not_render_until_refresh():
+    from dataclasses import replace
+
+    from lte_scenario_toolkit.gui.pages.figures import FigurePageState, preview_spec
+
+    state = FigurePageState.for_source(object()).with_dpi(200)
+
+    assert state.preview_path is None
+    assert state.preview_stale is True
+    bounded = preview_spec(
+        replace(state.spec, preset="publication", dpi=600, max_pixels=5000)
+    )
+    assert bounded.dpi == 120
+    assert bounded.max_pixels == 600
+
+
+def test_legacy_figure_source_lists_rectangles_before_required_choice(tmp_path):
+    import pandas as pd
+
+    from lte_scenario_toolkit.gui.pages.figures import load_figure_source
+
+    rows = [
+        {
+            "rect_id": rect_id,
+            "pt_count": 1,
+            "left_x": float(rect_id * 10),
+            "bottom_y": 0.0,
+            "center_x": float(rect_id * 10 + 5),
+            "center_y": 5.0,
+            "X": float(rect_id * 10 + 1),
+            "Y": 1.0,
+        }
+        for rect_id in (1, 7)
+    ]
+    csv_path = tmp_path / "legacy.csv"
+    pd.DataFrame(rows).to_csv(csv_path, index=False)
+
+    choice = load_figure_source(csv_path)
+
+    assert choice.rectangle_ids == (1, 7)
+    assert choice.source is None
+    assert choice.requires_rectangle is True
+    selected = load_figure_source(csv_path, rect_id=7)
+    assert selected.source.rectangle["rect_id"] == 7
+    assert selected.source.dem_path is None
+    assert any("EPSG:3857" in warning for warning in selected.warnings)
+
+
+def test_preview_cache_is_explicit_and_style_changes_only_mark_stale(tmp_path):
+    from dataclasses import replace
+
+    from lte_scenario_toolkit.figure_service import FigureService
+    from lte_scenario_toolkit.gui.pages.figures import (
+        FigurePageState,
+        preview_cache_path,
+    )
+
+    source_path = tmp_path / "single.csv"
+    source_path.write_text(
+        "rect_id,pt_count,left_x,bottom_y,center_x,center_y,X,Y\n"
+        "1,1,0,0,5,5,1,1\n",
+        encoding="utf-8",
+    )
+    source = FigureService.load_source(source_path)
+    expected = preview_cache_path(tmp_path, source, FigurePageState.for_source(source).spec)
+    assert expected.parent == tmp_path / ".lte-data/cache/previews"
+    assert not expected.exists()
+    assert not expected.parent.exists()
+
+    rendered = replace(
+        FigurePageState.for_source(source),
+        preview_path=expected,
+        preview_stale=False,
+    )
+    changed = rendered.with_dpi(200)
+    assert changed.preview_path == expected
+    assert changed.preview_stale is True
+
+
+def _task15_figure_source(tmp_path):
+    from dataclasses import replace
+
+    from lte_scenario_toolkit.figure_service import FigureService
+
+    csv_path = tmp_path / "controller.csv"
+    csv_path.write_text(
+        "rect_id,pt_count,left_x,bottom_y,center_x,center_y,X,Y\n"
+        "1,1,0,0,5,5,1,1\n",
+        encoding="utf-8",
+    )
+    dem_path = tmp_path / "controller-dem.tif"
+    dem_path.write_bytes(b"dem identity")
+    return replace(FigureService.load_source(csv_path), dem_path=dem_path)
+
+
+def test_figure_controller_busy_submission_does_not_leave_running_phase(tmp_path):
+    from lte_scenario_toolkit.gui.pages.figures import FigureController
+    from lte_scenario_toolkit.jobs import JobBusyError, JobCoordinator
+
+    coordinator = JobCoordinator()
+    active = coordinator.start("scan")
+    controller = FigureController(
+        tmp_path,
+        coordinator,
+        source=_task15_figure_source(tmp_path),
+        output_root=tmp_path / "runs",
+    )
+    try:
+        with pytest.raises(JobBusyError):
+            controller.refresh_preview()
+        assert controller.state.phase == "ready"
+        with pytest.raises(JobBusyError):
+            controller.export(("png",))
+        assert controller.state.phase == "ready"
+    finally:
+        assert coordinator.finish(active.job_id) is True
+        controller.close()
+        coordinator.shutdown()
+
+
+def test_figure_target_does_not_infer_cross_root_parent_and_revalidates_explicit_parent(
+    tmp_path,
+):
+    from dataclasses import replace
+
+    from lte_scenario_toolkit.gui.pages.figures import FigureController
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.run_service import RunService
+
+    source_root = tmp_path / "source-runs"
+    destination_root = tmp_path / "destination-runs"
+    source_service = RunService(source_root)
+    source_run = source_service.begin("city", "default")
+    (source_run.path / "source.csv").write_text(
+        "rect_id,pt_count,left_x,bottom_y,center_x,center_y,X,Y\n"
+        "1,1,0,0,5,5,1,1\n",
+        encoding="utf-8",
+    )
+    source_path = source_service.publish(
+        source_run,
+        status="completed",
+        artifacts=["source.csv"],
+    )
+    source = replace(
+        _task15_figure_source(tmp_path),
+        source_kind="run",
+        path=source_path,
+        run_id=source_run.run_id,
+        scenario_id="city",
+        profile_id="default",
+    )
+    destination_service = RunService(destination_root)
+    parent = destination_service.begin("city", "default")
+    (parent.path / "source.csv").write_text("ok\n", encoding="utf-8")
+    parent_path = destination_service.publish(
+        parent,
+        status="completed",
+        artifacts=["source.csv"],
+    )
+    coordinator = JobCoordinator()
+    controller = FigureController(
+        tmp_path,
+        coordinator,
+        source=source,
+        output_root=destination_root,
+    )
+    try:
+        assert controller._target(source) == (destination_root.resolve(), None)
+        controller.set_source(
+            source,
+            output_root=destination_root,
+            parent_run_id=parent.run_id,
+            parent_run_path=parent_path,
+        )
+        assert controller._target(source) == (
+            destination_root.resolve(),
+            parent.run_id,
+        )
+        (parent_path / "source.csv").unlink()
+        with pytest.raises(ValueError, match="no longer|changed"):
+            controller._target(source)
+    finally:
+        controller.close()
+        coordinator.shutdown()
+
+
+def test_stale_preview_job_cannot_replace_changed_style(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from threading import Event
+
+    from lte_scenario_toolkit.figure_service import FigureService
+    from lte_scenario_toolkit.gui.pages import figures
+    from lte_scenario_toolkit.gui.pages.figures import FigureController
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    entered = Event()
+    release = Event()
+
+    def preview(source, spec, output):
+        entered.set()
+        assert release.wait(2)
+        Path(output).parent.mkdir(parents=True, exist_ok=True)
+        Path(output).write_bytes(b"png")
+        return Path(output)
+
+    monkeypatch.setattr(FigureService, "preview", staticmethod(preview))
+    monkeypatch.setattr(figures, "_valid_preview", lambda path: path.is_file())
+    controller = FigureController(
+        tmp_path,
+        JobCoordinator(),
+        source=_task15_figure_source(tmp_path),
+    )
+    try:
+        job = controller.refresh_preview()
+        assert job is not None and entered.wait(2)
+        controller.update_spec(replace(controller.state.spec, dpi=200))
+        release.set()
+        assert job.future is not None
+        job.future.result(timeout=2)
+        state = controller.drain(job)
+
+        assert state.spec.dpi == 200
+        assert state.preview_path is None
+        assert state.preview_stale is True
+    finally:
+        controller.close()
+        controller.coordinator.shutdown()
+
+
+@pytest.mark.parametrize("phase", ["partial", "error"])
+def test_stale_figure_export_preserves_current_inputs_and_true_result(
+    tmp_path,
+    phase,
+):
+    from dataclasses import replace
+
+    from lte_scenario_toolkit.gui.pages import figures
+    from lte_scenario_toolkit.gui.pages.figures import FigureController
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    coordinator = JobCoordinator()
+    controller = FigureController(
+        tmp_path,
+        coordinator,
+        source=_task15_figure_source(tmp_path),
+    )
+    original_revision = controller.state.revision
+    run_path = tmp_path / "published-figure"
+    errors = ({"artifact": "html", "code": "figure.html.failed"},)
+    result = figures._FigureJobResult(
+        "export",
+        original_revision,
+        path=run_path if phase == "partial" else None,
+        phase=phase,
+        warnings=("figure.settings_failed:read only",),
+        errors=errors,
+    )
+    job = coordinator.submit("figure-export", lambda _cancel, _emit: result)
+    controller._job = job
+    try:
+        assert job.future is not None
+        job.future.result(timeout=2)
+        controller.update_spec(replace(controller.state.spec, dpi=200))
+        state = controller.drain(job)
+
+        assert state.spec.dpi == 200
+        assert state.phase == phase
+        assert state.errors == errors
+        if phase == "partial":
+            assert state.run_path == run_path
+            assert "figure.stale_published" in state.warnings
+            assert "figure.settings_failed:read only" in state.warnings
+        else:
+            assert state.run_path is None
+            assert "figure.stale_published" not in state.warnings
+    finally:
+        controller.close()
+        coordinator.shutdown()
+
+
+def test_history_page_model_has_no_delete_action(tmp_path):
+    from lte_scenario_toolkit.gui.pages.history import HistoryAction
+
+    assert "delete" not in {action.value for action in HistoryAction}
+
+
+def test_history_cross_root_source_uses_path_and_run_id_without_collision(tmp_path):
+    import shutil
+    from dataclasses import replace
+
+    from lte_scenario_toolkit.figure_service import FigureSpec
+    from lte_scenario_toolkit.gui.pages.history import (
+        HistoryAction,
+        rebuild_history,
+        resolve_history_action,
+    )
+    from lte_scenario_toolkit.run_service import RunService
+
+    source_root = tmp_path / "source-runs"
+    child_root = tmp_path / "child-runs"
+    duplicate_root = tmp_path / "duplicate-runs"
+    source_service = RunService(source_root)
+    parent = source_service.begin("city", "default")
+    (parent.path / "scenario.csv").write_text("ok\n", encoding="utf-8")
+    parent_path = source_service.publish(
+        parent,
+        status="completed",
+        artifacts=["scenario.csv"],
+    )
+    duplicate_path = duplicate_root / parent_path.relative_to(source_root)
+    duplicate_path.parent.mkdir(parents=True)
+    shutil.copytree(parent_path, duplicate_path)
+
+    child_service = RunService(child_root)
+    retry_spec = replace(
+        FigureSpec.from_preset("publication"),
+        dpi=240,
+        azimuth=-35.0,
+    )
+    child = child_service.begin(
+        "city",
+        "default",
+        parent_run_id=parent.run_id,
+    )
+    (child.path / "terrain.png").write_bytes(b"png")
+    child_service.publish(
+        child,
+        status="partial",
+        artifacts=["terrain.png"],
+        metadata={
+            "run_kind": "figure",
+            "source": {"path": str(parent_path), "run_id": parent.run_id},
+            "requested_formats": ["png", "html"],
+            "artifact_paths": {"png": "terrain.png"},
+            "figure_spec": retry_spec.as_dict(),
+        },
+        errors=[{"artifact": "html", "code": "figure.html.failed"}],
+    )
+
+    snapshot = rebuild_history(
+        tmp_path,
+        (source_root, child_root, duplicate_root),
+    )
+
+    child_row = next(row for row in snapshot.rows if row.root == child_root.resolve())
+    assert child_row.figure_source_path == parent_path.resolve()
+    assert child_row.retry_formats == ("html",)
+    action = resolve_history_action(child_row, HistoryAction.RETRY_MISSING)
+    assert action.retry_formats == ("html",)
+    assert action.figure_spec == retry_spec
+    assert action.path == parent_path.resolve()
+    assert action.destination_root == child_root.resolve()
+    assert action.derived_parent_run_id == child.run_id
+
+
+def test_history_source_cycle_is_non_actionable_instead_of_recursive(tmp_path):
+    from lte_scenario_toolkit.gui.pages.history import history_rows
+    from lte_scenario_toolkit.run_service import RunService
+
+    service = RunService(tmp_path / "runs")
+    first = service.begin("city", "default")
+    second = service.begin("city", "default")
+    for run in (first, second):
+        (run.path / "terrain.png").write_bytes(b"png")
+    service.publish(
+        first,
+        status="completed",
+        artifacts=["terrain.png"],
+        metadata={
+            "run_kind": "figure",
+            "source": {"path": str(second.final_path), "run_id": second.run_id},
+        },
+    )
+    service.publish(
+        second,
+        status="completed",
+        artifacts=["terrain.png"],
+        metadata={
+            "run_kind": "figure",
+            "source": {"path": str(first.final_path), "run_id": first.run_id},
+        },
+    )
+
+    rows = history_rows(service)
+
+    assert len(rows) == 2
+    assert all(row.can_open_figures is False for row in rows)
+
+
+def test_history_action_revalidates_clicked_child_before_opening_parent(tmp_path):
+    from lte_scenario_toolkit.gui.pages.history import (
+        HistoryAction,
+        HistoryActionError,
+        history_rows,
+        resolve_history_action,
+    )
+    from lte_scenario_toolkit.run_service import RunService
+
+    service = RunService(tmp_path / "runs")
+    parent = service.begin("city", "default")
+    (parent.path / "scenario.csv").write_text("ok\n", encoding="utf-8")
+    service.publish(parent, status="completed", artifacts=["scenario.csv"])
+    child = service.begin("city", "default", parent_run_id=parent.run_id)
+    (child.path / "terrain.png").write_bytes(b"png")
+    child_path = service.publish(
+        child,
+        status="completed",
+        artifacts=["terrain.png"],
+    )
+    child_row = next(row for row in history_rows(service) if row.run_id == child.run_id)
+    (child_path / "terrain.png").unlink()
+
+    with pytest.raises(HistoryActionError, match="no longer"):
+        resolve_history_action(child_row, HistoryAction.OPEN_FIGURES)
+
+
+async def test_task15_output_routes_render_offline(user, tmp_path, monkeypatch):
+    import socket
+    import urllib.request
+
+    from lte_scenario_toolkit.gui.app import create_app
+    from lte_scenario_toolkit.gui.settings import GuiSettingsStore
+    from lte_scenario_toolkit.run_service import RunService
+
+    def forbid_network(*args, **kwargs):
+        pytest.fail("Task 15 pages must remain offline")
+
+    monkeypatch.setattr(socket, "create_connection", forbid_network)
+    monkeypatch.setattr(urllib.request, "urlopen", forbid_network)
+    run_root = tmp_path / "external-runs"
+    service = RunService(run_root)
+    run = service.begin("city", "default", created_at="2026-07-16T10:00:00Z")
+    (run.path / "scenario.csv").write_text("ok\n", encoding="utf-8")
+    service.publish(run, status="completed", artifacts=["scenario.csv"])
+    GuiSettingsStore(tmp_path).save(language="en", output_roots=[run_root])
+    create_app(
+        catalog=_Task13Catalog(tmp_path),
+        profile_store=object(),
+        testing=True,
+    )
+
+    await user.open("/generate")
+    await user.should_see("Generation session unavailable")
+    await user.open("/figures")
+    await user.should_see("Figures")
+    await user.should_see("Figure source")
+    await user.open("/history")
+    await user.should_see("Run History")
+    await user.should_see("city", retries=15)
+    await user.should_not_see("Delete")
+
+
+async def test_offline_candidate_to_history_flow(user, tmp_path, monkeypatch):
+    import socket
+    import urllib.request
+
+    from lte_scenario_toolkit.gui.app import create_app
+    from lte_scenario_toolkit.gui.settings import GuiSettingsStore
+    from lte_scenario_toolkit.run_service import RunService
+
+    export_calls = []
+
+    def forbid_network(*args, **kwargs):
+        pytest.fail("candidate-to-history flow attempted external network access")
+
+    monkeypatch.setattr(socket, "create_connection", forbid_network)
+    monkeypatch.setattr(urllib.request, "urlopen", forbid_network)
+
+    class EmptyStore:
+        def discover(self, scenario_id):
+            return []
+
+    class Service:
+        def preflight(self, snapshot, output_root):
+            return SimpleNamespace(profile=snapshot, output_root=Path(output_root))
+
+        def scan(self, *args, **kwargs):
+            return _task14_scan_result()
+
+        def export(
+            self,
+            preflight,
+            scan_result,
+            candidate,
+            *,
+            output_root,
+            artifacts,
+            entrypoint,
+        ):
+            export_calls.append(
+                (
+                    preflight,
+                    scan_result,
+                    candidate,
+                    Path(output_root),
+                    tuple(artifacts),
+                    tuple(entrypoint),
+                )
+            )
+            names = {
+                "csv": "scenario.csv",
+                "preview_png": "preview.png",
+                "terrain_png": "terrain.png",
+                "terrain_eps": "terrain.eps",
+                "terrain_html": "terrain.html",
+            }
+            service = RunService(output_root)
+            run = service.begin(
+                preflight.profile.scenario_id,
+                preflight.profile.profile_id,
+            )
+            published = []
+            artifact_paths = {}
+            for token in artifacts:
+                name = names[token]
+                (run.path / name).write_bytes(f"{token}\n".encode("ascii"))
+                published.append(name)
+                artifact_paths[token] = name
+            return service.publish(
+                run,
+                status="completed",
+                artifacts=published,
+                metadata={
+                    "run_kind": "selection",
+                    "requested_artifacts": list(artifacts),
+                    "artifact_paths": artifact_paths,
+                    "candidate": {
+                        "flat_grid_id": candidate.flat_grid_id,
+                        "point_count": candidate.point_count,
+                        "center_x": candidate.center_x,
+                        "center_y": candidate.center_y,
+                    },
+                    "parameters": {
+                        "rectangle_size_m": preflight.profile.rect_size,
+                    },
+                },
+            )
+
+    service = Service()
+    create_app(
+        catalog=_Task13Catalog(tmp_path),
+        profile_store=EmptyStore(),
+        selection_service_factory=lambda _catalog: service,
+        candidate_bundle_builder=lambda _session, _assets: _task14_map_bundle(tmp_path),
+        testing=True,
+    )
+    output_root = (tmp_path / "results").resolve()
+    assert not output_root.exists()
+    await user.open("/configure/without-default")
+    user.find(marker="profile-start-scan").click()
+    for _ in range(30):
+        if user.back_history and "/candidates/" in user.back_history[-1]:
+            break
+        await asyncio.sleep(0.05)
+    assert "/candidates/" in user.back_history[-1]
+    for _ in range(30):
+        next_button = next(iter(user.find(marker="candidate-next").elements))
+        if next_button.enabled:
+            break
+        await asyncio.sleep(0.05)
+    user.find(marker="candidate-next").click()
+    await user.should_see("Grid ID 0")
+    user.find(marker="candidate-confirm").click()
+    for _ in range(30):
+        if user.back_history and "/generate/" in user.back_history[-1]:
+            break
+        await asyncio.sleep(0.05)
+    assert "/generate/" in user.back_history[-1]
+    assert not output_root.exists()
+    await user.should_see("Generate Scenario")
+
+    user.find(marker="generation-submit").click()
+    for _ in range(40):
+        if user.back_history and user.back_history[-1] == "/history":
+            break
+        await asyncio.sleep(0.05)
+    assert user.back_history[-1] == "/history"
+    await user.should_see("Run History")
+    await user.should_see("without-default", retries=15)
+    assert len(export_calls) == 1
+    assert export_calls[0][3] == output_root
+    assert export_calls[0][4] == (
+        "csv",
+        "preview_png",
+        "terrain_png",
+        "terrain_eps",
+        "terrain_html",
+    )
+    assert export_calls[0][5] == ("lte-gui", "generate")
+    assert output_root in GuiSettingsStore(tmp_path).load().output_roots
