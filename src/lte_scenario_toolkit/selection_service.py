@@ -23,7 +23,7 @@ from shapely.geometry import box, mapping
 from shapely.ops import transform as transform_geometry
 
 from . import io, visualization
-from .candidate_cache import CACHE_SCHEMA_VERSION, CandidateCache, cache_key
+from .candidate_cache import CandidateCache, cache_key
 from .candidate_scanner import (
     Candidate,
     ScanCancelled,
@@ -179,8 +179,8 @@ def _manifest_records(catalog: Any) -> dict[str, dict[str, Any]]:
         document = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"Scenario manifest is unreadable: {manifest_path}") from exc
-    if not isinstance(document, dict) or document.get("schema_version") != 2:
-        raise ValueError("Scenario manifest schema_version must be 2")
+    if not isinstance(document, dict):
+        raise ValueError("Scenario manifest must be a JSON object")
     datasets = document.get("datasets")
     if not isinstance(datasets, list):
         raise ValueError("Scenario manifest datasets must be a list")
@@ -966,7 +966,7 @@ class SelectionService:
         return selected
 
     @staticmethod
-    def _legacy_candidate(
+    def _render_candidate(
         preflight: SelectionPreflight,
         candidate: Candidate,
         geometry: Any,
@@ -1069,7 +1069,6 @@ class SelectionService:
             bottom_y=candidate.bottom_y,
             center_x=candidate.center_x,
             center_y=candidate.center_y,
-            rect_size=preflight.profile.rect_size,
             scenario_id=preflight.scenario_id,
             profile_id=preflight.profile.profile_id,
             candidate_id=candidate_id,
@@ -1212,7 +1211,6 @@ class SelectionService:
                 bottom_y=candidate.bottom_y,
                 center_x=candidate.center_x,
                 center_y=candidate.center_y,
-                rect_size=preflight.profile.rect_size,
                 run_id=run.run_id,
                 scenario_id=preflight.scenario_id,
                 profile_id=preflight.profile.profile_id,
@@ -1220,7 +1218,6 @@ class SelectionService:
                 target_crs=preflight.profile.target_crs,
             )
             selection_document = {
-                "schema_version": 1,
                 "run_id": run.run_id,
                 "scenario_id": preflight.scenario_id,
                 "profile_id": preflight.profile.profile_id,
@@ -1264,7 +1261,7 @@ class SelectionService:
             }
             artifact_paths: dict[str, str] = {}
             errors: list[dict[str, str]] = []
-            legacy_candidate = self._legacy_candidate(
+            render_candidate = self._render_candidate(
                 preflight,
                 candidate,
                 geometry,
@@ -1279,7 +1276,7 @@ class SelectionService:
                         visualization.save_preview(
                             prepared.points,
                             prepared.boundary,
-                            [legacy_candidate],
+                            [render_candidate],
                             {
                                 "rect_size": size,
                                 "boundary_layer": preflight.scenario_id,
@@ -1290,7 +1287,7 @@ class SelectionService:
                         _render_terrain_artifact(
                             token,
                             temporary,
-                            rectangle=legacy_candidate,
+                            rectangle=render_candidate,
                             selected_points=selected,
                             dem_path=preflight.dem_path,
                             rectangle_size=size,
@@ -1323,7 +1320,6 @@ class SelectionService:
             _require_nonempty_regular_file(selection_path)
             profile = preflight.profile
             metadata = {
-                "schema_version": 1,
                 "run_kind": "selection",
                 "candidate": {
                     "candidate_id": candidate_id,
@@ -1340,7 +1336,6 @@ class SelectionService:
                     "total_positions": scan_result.total_positions,
                 },
                 "cache": {
-                    "schema_version": CACHE_SCHEMA_VERSION,
                     "key": key,
                 },
                 "inputs": {
@@ -1373,7 +1368,6 @@ class SelectionService:
                 "sidecars": {
                     "config": "run-config.yaml",
                     "selection": "selection.json",
-                    "compatibility_records": [],
                 },
                 "requested_artifacts": list(requested),
                 "artifact_paths": dict(artifact_paths),

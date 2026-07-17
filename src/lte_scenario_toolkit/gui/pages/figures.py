@@ -28,38 +28,10 @@ PREVIEW_PIXEL_LIMIT = 600
 FIGURE_FORMAT_ORDER = ("png", "eps", "html")
 
 
-@dataclass(frozen=True, slots=True)
-class FigureSourceChoice:
-    """One inspected file source, possibly awaiting an explicit rectangle."""
+def load_figure_source(path: str | Path) -> FigureSource:
+    """Load one completed current run as a figure source."""
 
-    path: Path
-    rectangle_ids: tuple[Any, ...]
-    source: FigureSource | None
-    warnings: tuple[str, ...]
-
-    @property
-    def requires_rectangle(self) -> bool:
-        return self.source is None and len(self.rectangle_ids) > 1
-
-
-def load_figure_source(path: str | Path, rect_id: Any = None) -> FigureSourceChoice:
-    """Inspect first so multi-rectangle CSVs never depend on exception text."""
-
-    inspection = FigureService.inspect_source(path)
-    if rect_id is None and inspection.requires_rectangle:
-        return FigureSourceChoice(
-            path=inspection.path,
-            rectangle_ids=inspection.rectangle_ids,
-            source=None,
-            warnings=inspection.warnings,
-        )
-    source = FigureService.load_source(path, rect_id=rect_id)
-    return FigureSourceChoice(
-        path=inspection.path,
-        rectangle_ids=inspection.rectangle_ids,
-        source=source,
-        warnings=source.warnings,
-    )
+    return FigureService.load_source(path)
 
 
 def _jsonable(value: Any) -> Any:
@@ -538,7 +510,7 @@ class FigureController:
                 entry = RunService(output_root).entry_for_path(path)
                 record = entry.record
                 metadata = record.get("metadata")
-                if record.get("scenario_id") != (source_snapshot.scenario_id or "legacy"):
+                if record.get("scenario_id") != (source_snapshot.scenario_id or "figures"):
                     raise ValueError("figure run scenario does not match its source")
                 if record.get("profile_id") != (source_snapshot.profile_id or "figures"):
                     raise ValueError("figure run profile does not match its source")
@@ -773,10 +745,6 @@ def render_figures_page(
         parent_run_path=parent_run_path,
         on_published=on_published,
     )
-    choice: FigureSourceChoice | None = None
-    choice_output_root: Path | None = None
-    choice_parent_run_id: str | None = None
-    choice_parent_run_path: Path | None = None
     route_output_root = controller.output_root
     route_parent_run_id = controller.parent_run_id
     route_parent_run_path = controller.parent_run_path
@@ -807,19 +775,6 @@ def render_figures_page(
                     ).props("outline").mark("figure-current-selection")
                 else:
                     current_button = None
-            rectangle_select = ui.select(
-                {},
-                label=translator.text("figures.rectangle"),
-                value=None,
-            ).mark("figure-rectangle")
-            rectangle_select.set_visibility(False)
-            with ui.row().classes("items-end full-width"):
-                dem_input = ui.input(translator.text("figures.dem_path")).classes(
-                    "grow"
-                ).mark("figure-dem-path")
-                dem_button = ui.button(
-                    translator.text("figures.attach_dem")
-                ).props("outline").mark("figure-attach-dem")
             source_status = ui.label(translator.text("figures.no_source"))
             warning_box = ui.column().classes("lte-figure-warnings")
 
@@ -949,10 +904,6 @@ def render_figures_page(
                 rect_id=source.rectangle["rect_id"],
             )
         )
-        if source.dem_path is not None:
-            dem_input.value = str(source.dem_path)
-        else:
-            dem_input.value = ""
         try:
             destination, _parent = controller._target(source)
         except ValueError:
@@ -965,55 +916,22 @@ def render_figures_page(
         render_messages()
 
     def load_path(
-        rect_id: Any = None,
         *,
         source_output_root: Path | None = None,
         source_parent_run_id: str | None = None,
         source_parent_run_path: Path | None = None,
     ) -> None:
-        nonlocal choice, choice_output_root, choice_parent_run_id
-        nonlocal choice_parent_run_path
         try:
-            choice = load_figure_source(source_input.value, rect_id=rect_id)
+            source = load_figure_source(source_input.value)
         except Exception as exc:
             ui.notify(str(exc), type="negative")
             return
-        if rect_id is None:
-            choice_output_root = source_output_root
-            choice_parent_run_id = source_parent_run_id
-            choice_parent_run_path = source_parent_run_path
-        if choice.requires_rectangle:
-            controller.clear_source()
-            rectangle_select.options = {
-                str(value): str(value) for value in choice.rectangle_ids
-            }
-            rectangle_select.value = None
-            rectangle_select.set_visibility(True)
-            source_status.set_text(translator.text("figures.choose_rectangle"))
-            return
-        rectangle_select.set_visibility(False)
-        if choice.source is not None:
-            apply_source(
-                choice.source,
-                source_output_root=choice_output_root,
-                source_parent_run_id=choice_parent_run_id,
-                source_parent_run_path=choice_parent_run_path,
-            )
-
-    def attach_dem() -> None:
-        state = controller.state
-        if not isinstance(state.source, FigureSource):
-            ui.notify(translator.text("figures.no_source"), type="warning")
-            return
-        try:
-            apply_source(
-                FigureService.attach_dem(state.source, dem_input.value),
-                source_output_root=controller.output_root,
-                source_parent_run_id=controller.parent_run_id,
-                source_parent_run_path=controller.parent_run_path,
-            )
-        except Exception as exc:
-            ui.notify(str(exc), type="negative")
+        apply_source(
+            source,
+            source_output_root=source_output_root,
+            source_parent_run_id=source_parent_run_id,
+            source_parent_run_path=source_parent_run_path,
+        )
 
     def changed_spec() -> bool:
         try:
@@ -1143,19 +1061,6 @@ def render_figures_page(
         render_messages()
 
     load_button.on("click", lambda: load_path())
-    rectangle_select.on_value_change(
-        lambda event: (
-            load_path(
-                event.value,
-                source_output_root=choice_output_root,
-                source_parent_run_id=choice_parent_run_id,
-                source_parent_run_path=choice_parent_run_path,
-            )
-            if event.value is not None
-            else None
-        )
-    )
-    dem_button.on("click", attach_dem)
     refresh_button.on("click", refresh_preview)
     export_button.on("click", final_export)
     preset.on_value_change(lambda event: apply_preset(event.value))
@@ -1194,7 +1099,6 @@ __all__ = [
     "FigureController",
     "FigurePageState",
     "FigurePageView",
-    "FigureSourceChoice",
     "load_figure_source",
     "preview_cache_path",
     "preview_spec",

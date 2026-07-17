@@ -18,14 +18,6 @@ from ...profiles import (
 )
 from ...selection_service import SelectionError
 
-LEGACY_MIGRATION_MESSAGE = (
-    "This is a read-only preview of the legacy profile's effective values. "
-    "Explicit Save converts it to schema version 2."
-)
-LEGACY_MANAGEMENT_MESSAGE = (
-    "Profile discovery is temporarily unavailable because the repository contains "
-    "legacy YAML. The in-memory draft can still run, but profile writes are disabled."
-)
 PROFILE_SELECTION_MESSAGE = (
     "The requested or configured default profile cannot be resolved safely."
 )
@@ -66,21 +58,14 @@ class ConfigureModel:
     is_default: bool
     dirty: bool
     output_root_default: Path
-    migration_error: str | None = None
-    management_error: str | None = None
     selection_error: str | None = None
 
     @property
     def can_start(self) -> bool:
         return (
             self.status == "ready"
-            and self.migration_error is None
             and self.selection_error is None
         )
-
-    @property
-    def is_legacy_preview(self) -> bool:
-        return self.profile.is_legacy_preview
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,7 +213,6 @@ def _points_dataset_id(catalog: Any) -> str:
 
 def _draft_profile(catalog: Any, scenario_id: str, display_name: str) -> ExperimentProfile:
     return ExperimentProfile(
-        schema_version=2,
         profile_id="default",
         display_name=f"{display_name} Default",
         scenario_id=scenario_id,
@@ -250,11 +234,6 @@ def _draft_profile(catalog: Any, scenario_id: str, display_name: str) -> Experim
     )
 
 
-def _is_legacy_profile_error(error: ValueError) -> bool:
-    message = str(error).casefold().replace("_", " ")
-    return "schema version" in message and ("missing" in message or "legacy" in message)
-
-
 def configure_model(
     catalog: Any,
     store: Any,
@@ -262,42 +241,20 @@ def configure_model(
     *,
     selected_profile_id: str | None = None,
 ) -> ConfigureModel:
-    """Build a saved/default profile model or an explicit schema-v2 draft."""
+    """Build a saved/default profile model or an explicit current draft."""
 
     scenario = catalog.scenario(scenario_id)
     display_name = str(scenario["display_name"])
     status = str(catalog.scenario_status(scenario_id))
-    migration_error: str | None = None
-    management_error: str | None = None
     selection_error: str | None = None
-    discovery_blocked = False
-    try:
-        profiles = tuple(store.discover(scenario_id))
-    except ValueError as exc:
-        if not _is_legacy_profile_error(exc):
-            raise
-        discovery_blocked = True
-        profiles = ()
-        management_error = LEGACY_MANAGEMENT_MESSAGE
-        migration_error = (
-            LEGACY_MIGRATION_MESSAGE
-            if scenario.get("config_path") is not None
-            else None
-        )
-        if (
-            scenario.get("config_path") is None
-            and selected_profile_id not in {None, "__new__"}
-        ):
-            selection_error = PROFILE_SELECTION_MESSAGE
+    profiles = tuple(store.discover(scenario_id))
 
     default_path = _catalog_profile_path(catalog, scenario)
     if selected_profile_id == "__new__":
         selected = None
     elif selected_profile_id is not None:
         selected = (
-            None
-            if discovery_blocked
-            else next(
+            next(
                 (
                     profile
                     for profile in profiles
@@ -306,7 +263,7 @@ def configure_model(
                 None,
             )
         )
-        if selected is None and not discovery_blocked:
+        if selected is None:
             selection_error = PROFILE_SELECTION_MESSAGE
     else:
         if default_path is None:
@@ -320,12 +277,10 @@ def configure_model(
                 ),
                 None,
             )
-            if selected is None and not discovery_blocked:
+            if selected is None:
                 selection_error = PROFILE_SELECTION_MESSAGE
     persisted = selected is not None
     profile = selected or _draft_profile(catalog, scenario_id, display_name)
-    if profile.is_legacy_preview:
-        migration_error = LEGACY_MIGRATION_MESSAGE
     output_root_default = (Path(catalog.root) / "results").resolve()
     return ConfigureModel(
         scenario_id=scenario_id,
@@ -344,8 +299,6 @@ def configure_model(
         ),
         dirty=False,
         output_root_default=output_root_default,
-        migration_error=migration_error,
-        management_error=management_error,
         selection_error=selection_error,
     )
 
@@ -396,10 +349,6 @@ def profile_with_form_values(
 ) -> ExperimentProfile:
     """Apply validated form values without mutating or truncating the source profile."""
 
-    if profile.is_legacy_preview and values:
-        raise ValueError(
-            "Legacy profile preview is read-only; use explicit Save to convert it"
-        )
     unknown = set(values) - _FORM_FIELDS
     if unknown:
         raise ValueError(f"Unknown profile form fields: {', '.join(sorted(unknown))}")
@@ -544,10 +493,6 @@ def _profile_route(scenario_id: str, profile_id: str) -> str:
     return f"/configure/{scenario_id}?profile={quote(profile_id, safe='')}"
 
 
-def _powershell_quote(value: str | Path) -> str:
-    return "'" + str(value).replace("'", "''") + "'"
-
-
 def render_configure_picker(ui: Any, translator: Any, catalog: Any) -> None:
     """Render a valid `/configure` route instead of leaving a dead navigation link."""
 
@@ -645,38 +590,12 @@ def render_configure_page(
             ui.label(
                 translator.text("configure.not_ready", status=model.status)
             ).classes("lte-callout lte-callout--warning")
-        if model.migration_error is not None:
-            with ui.card().classes("lte-callout lte-callout--warning"):
-                ui.label(translator.text("configure.migration_title")).classes(
-                    "lte-section-title"
-                )
-                ui.label(translator.text("configure.migration_body"))
-                if model.is_legacy_preview:
-                    ui.label(
-                        translator.text("configure.migration_revision", revision=(
-                            profile.legacy_source.source_revision
-                        ))
-                    ).classes("lte-technical-detail")
-                else:
-                    ui.code(
-                        "lte-select-sites --config "
-                        + _powershell_quote(
-                            str(catalog.scenario(scenario_id).get("config_path"))
-                        ),
-                        language="powershell",
-                    ).classes("lte-cli-guidance")
-        elif model.selection_error is not None:
+        if model.selection_error is not None:
             with ui.card().classes("lte-callout lte-callout--warning"):
                 ui.label(translator.text("configure.selection_title")).classes(
                     "lte-section-title"
                 )
                 ui.label(translator.text("configure.selection_body"))
-        elif model.management_error is not None:
-            with ui.card().classes("lte-callout lte-callout--warning"):
-                ui.label(translator.text("configure.management_title")).classes(
-                    "lte-section-title"
-                )
-                ui.label(translator.text("configure.management_body"))
 
         form_values: dict[str, Any] = {}
         field_elements: dict[str, Any] = {}
@@ -691,10 +610,7 @@ def render_configure_page(
             value=selected_option,
             label=translator.text("label.profile"),
         ).classes("lte-profile-select").mark("profile-select")
-        profile_select.set_enabled(
-            (model.migration_error is None or model.is_legacy_preview)
-            and model.management_error is None
-        )
+        profile_select.set_enabled(True)
 
         def navigate_to_profile(selected_id: str) -> None:
             ui.navigate.to(_profile_route(scenario_id, selected_id))
@@ -851,28 +767,9 @@ def render_configure_page(
                         dirty_label.set_text(translator.text("configure.dirty"))
                         dirty_label.classes(add="lte-dirty-indicator--dirty")
 
-                browse_button = ui.button(
+                ui.button(
                     translator.text("action.browse"), on_click=browse
                 ).props("outline").mark("profile-browse")
-
-        if model.is_legacy_preview:
-            for field in (
-                profile_id,
-                display_name,
-                target_crs,
-                rect_size,
-                target_count,
-                scan_step,
-                max_rects,
-                tolerance,
-                strategy,
-                random_seed,
-                min_spacing,
-                scan_mode,
-                output_root,
-                browse_button,
-            ):
-                field.set_enabled(False)
 
         error_area = ui.column().classes("lte-form-errors full-width")
 
@@ -968,17 +865,8 @@ def render_configure_page(
             title_key="confirmation.overwrite",
             on_confirm=lambda: perform_save(confirmed=True),
         )
-        migration_dialog = _confirmation_dialog(
-            ui,
-            translator,
-            title_key="confirmation.migrate",
-            on_confirm=lambda: perform_save(confirmed=True),
-        )
-
         def request_save() -> None:
-            if model.is_legacy_preview:
-                migration_dialog.open()
-            elif model.is_persisted:
+            if model.is_persisted:
                 save_dialog.open()
             else:
                 perform_save(confirmed=False)
@@ -987,8 +875,6 @@ def render_configure_page(
         persisted_actions_enabled = (
             model.is_persisted
             and source_path is not None
-            and model.migration_error is None
-            and model.management_error is None
             and model.status == "ready"
         )
 
@@ -1214,24 +1100,17 @@ def render_configure_page(
                 )
             )
             writes_enabled = (
-                model.migration_error is None
-                and model.management_error is None
-                and model.selection_error is None
+                model.selection_error is None
                 and model.status == "ready"
             )
-            save.set_enabled(writes_enabled or (
-                model.is_legacy_preview and model.status == "ready"
-            ))
-            discard.set_enabled(
-                model.migration_error is None or model.is_legacy_preview
-            )
+            save.set_enabled(writes_enabled)
+            discard.set_enabled(True)
             start.set_enabled(model.can_start)
 
 
 __all__ = [
     "ConfigureModel",
     "ConfirmationRequiredError",
-    "LEGACY_MIGRATION_MESSAGE",
     "PreflightOutcome",
     "ProfileActions",
     "ProfileRefreshError",

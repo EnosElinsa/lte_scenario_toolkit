@@ -13,7 +13,6 @@ from threading import Lock
 
 from .i18n import DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES
 
-SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_RELATIVE_PATH = Path(".lte-data") / "gui-settings.json"
 _SETTINGS_WRITE_LOCK = Lock()
 
@@ -71,7 +70,7 @@ class GuiSettingsStore:
         self.path = self.repo_root / SETTINGS_RELATIVE_PATH
 
     def load(self) -> GuiSettings:
-        """Load settings, returning English defaults when the file is absent."""
+        """Load current settings or return defaults for stale local content."""
 
         self._validate_storage_path()
         if not self.path.exists():
@@ -80,9 +79,9 @@ class GuiSettingsStore:
             raise GuiSettingsError(f"GUI settings path is not a file: {self.path}")
         try:
             document = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise GuiSettingsError(f"Could not read GUI settings: {self.path}") from exc
-        return self._settings_from_document(document)
+            return self._settings_from_document(document)
+        except (OSError, UnicodeError, json.JSONDecodeError, GuiSettingsError):
+            return GuiSettings()
 
     def save(
         self,
@@ -130,7 +129,6 @@ class GuiSettingsStore:
             ) from exc
         self._validate_storage_path()
         payload = {
-            "schema_version": SETTINGS_SCHEMA_VERSION,
             "language": settings.language,
             "output_roots": [str(path) for path in settings.output_roots],
         }
@@ -139,19 +137,10 @@ class GuiSettingsStore:
     def _settings_from_document(self, document: object) -> GuiSettings:
         if not isinstance(document, dict):
             raise GuiSettingsError("GUI settings must be a JSON object")
-        expected = {"schema_version", "language", "output_roots"}
+        expected = {"language", "output_roots"}
         if set(document) != expected:
             raise GuiSettingsError(
-                "GUI settings must contain schema_version, language, and output_roots"
-            )
-        schema_version = document["schema_version"]
-        if (
-            not isinstance(schema_version, int)
-            or isinstance(schema_version, bool)
-            or schema_version != SETTINGS_SCHEMA_VERSION
-        ):
-            raise GuiSettingsError(
-                f"Unsupported GUI settings schema: {schema_version!r}"
+                "GUI settings must contain language and output_roots"
             )
         roots = document["output_roots"]
         if not isinstance(roots, list):

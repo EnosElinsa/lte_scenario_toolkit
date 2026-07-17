@@ -66,7 +66,7 @@ def _write_empty_catalog(root: Path) -> Path:
     catalog_path.parent.mkdir(parents=True)
     catalog_path.write_text(
         yaml.safe_dump(
-            {"schema_version": 2, "datasets": [], "scenarios": []},
+            {"datasets": [], "scenarios": []},
             sort_keys=False,
         ),
         encoding="utf-8",
@@ -241,7 +241,7 @@ def test_register_scenario_does_not_overwrite_a_concurrent_catalog_update(
     source = _write_geojson(tmp_path / "boundary.geojson", [box(0, 0, 1, 1)])
     catalog_path = _write_empty_catalog(tmp_path)
     concurrent_bytes = yaml.safe_dump(
-        {"schema_version": 2, "datasets": [], "scenarios": []},
+        {"datasets": [], "scenarios": []},
         sort_keys=False,
     ).replace("scenarios: []", "scenarios: []\n# concurrent writer\n").encode()
 
@@ -522,7 +522,7 @@ def test_register_scenario_rejects_malformed_manifest_location_before_staging(
         catalog_path = tmp_path / "datasets.yaml"
         catalog_path.write_text(
             yaml.safe_dump(
-                {"schema_version": 2, "datasets": [], "scenarios": []},
+                {"datasets": [], "scenarios": []},
                 sort_keys=False,
             ),
             encoding="utf-8",

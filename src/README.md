@@ -7,7 +7,7 @@ logic.
 
 ## Data lifecycle
 
-- `data_catalog.py`: schema-v2 catalog loading, safe paths, indexed
+- `data_catalog.py`: catalog loading, safe paths, indexed
   dataset/scenario links, atomic saves, and incremental manifests.
 - `boundary_data.py`: local or HTTP(S) staging, safe archive handling, polygon
   normalization, provenance, and atomic scenario registration.
@@ -20,28 +20,27 @@ Registration, Earth Engine export, and DEM ingest remain CLI-only.
 
 ## Experiment services
 
-- `profiles.py`: schema-v2 profile models, validation, discovery, CRUD,
-  defaults, and explicit legacy conversion.
+- `profiles.py`: current profile models, validation, discovery, CRUD, and
+  defaults.
 - `candidate_scanner.py`: deterministic memory-bounded row sweep, exact
   boundary/count/spacing checks, fast/complete modes, progress, and
   cancellation.
-- `candidate_cache.py`: content-addressed versioned candidate cache and
-  revalidated legacy import below `.lte-data/cache`.
+- `candidate_cache.py`: content-addressed candidate cache below
+  `.lte-data/cache`.
 - `selection_service.py`: catalog/profile preflight, cached scanning, DEM
   statistics, one-candidate locking, and partial-safe artifact publication.
 - `map_assets.py`: bounded local DEM overlays and hillshade cache assets.
-- `figure_service.py`: validated run/CSV loading, explicit multi-rectangle
-  choice, bounded previews, configurable final figures, and provenance.
+- `figure_service.py`: validated completed-run loading, bounded previews,
+  configurable final figures, and provenance.
 - `run_service.py`: unique staging/publication directories, immutable run
-  discovery, legacy record normalization, parent links, and diagnostics.
+  discovery, parent links, and diagnostics.
 - `jobs.py`: shared single-job coordination, progress events, and cancellation.
 - `web_selector.py`: blocking CLI adapter for the local browser selector.
 - `benchmark.py`: opt-in production-path scanner measurements without cache or
   output writes.
 
 `select_sites.py` and `generate_figures.py` are installed CLI adapters around
-these services. Compatibility flags and artifacts are handled at the adapter
-boundary.
+these services.
 
 ## Local GUI
 

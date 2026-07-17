@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
+import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pytest
@@ -16,6 +16,7 @@ from lte_scenario_toolkit import io
 from lte_scenario_toolkit.figure_service import (
     FigureResult,
     FigureService,
+    FigureSource,
     FigureSpec,
     SelectionFigureIdentity,
 )
@@ -71,7 +72,6 @@ def write_figure_run(
     (run_dir / "run-config.yaml").write_text(
         yaml.safe_dump(
             {
-                "schema_version": 2,
                 "profile": {
                     "id": "fixture",
                     "display_name": "Fixture",
@@ -161,12 +161,28 @@ def write_current_selection_run(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def write_in_memory_selection_source(tmp_path: Path):
-    source = FigureService.load_source(write_single_csv(tmp_path))
-    return replace(
-        source,
+    frame = pd.DataFrame([REQUIRED_ROW])
+    points = gpd.GeoDataFrame(
+        frame.copy(),
+        geometry=gpd.points_from_xy(frame["X"], frame["Y"]),
+        crs="EPSG:3857",
+    )
+    return FigureSource(
         path=None,
         csv_path=None,
         csv_identity=None,
+        frame=frame,
+        rectangle={key: REQUIRED_ROW[key] for key in (
+            "rect_id",
+            "pt_count",
+            "left_x",
+            "bottom_y",
+            "center_x",
+            "center_y",
+        )},
+        points=points,
+        target_crs="EPSG:3857",
+        rectangle_size_m=1000.0,
         source_kind="selection",
         dem_path=write_dem(tmp_path),
         dem_fingerprint="dem-selection",
@@ -193,31 +209,6 @@ def write_in_memory_selection_source(tmp_path: Path):
     )
 
 
-def test_legacy_multi_rectangle_csv_requires_rect_id(tmp_path):
-    path = tmp_path / "multi.csv"
-    pd.DataFrame(
-        [
-            {**REQUIRED_ROW, "rect_id": 1},
-            {
-                **REQUIRED_ROW,
-                "rect_id": 2,
-                "left_x": 1000.0,
-                "center_x": 1500.0,
-                "X": 1100.0,
-            },
-        ]
-    ).to_csv(path, index=False)
-
-    with pytest.raises(ValueError, match="rect_id"):
-        FigureService.load_source(path)
-    inspection = FigureService.inspect_source(path)
-    assert inspection.rectangle_ids == (1, 2)
-    assert inspection.requires_rectangle is True
-    assert inspection.source_kind == "csv"
-    assert any("EPSG:3857" in warning for warning in inspection.warnings)
-    loaded = FigureService.load_source(path, rect_id=2)
-    assert loaded.rectangle["rect_id"] == 2
-    assert loaded.frame["rect_id"].unique().tolist() == [2]
 
 
 def test_run_snapshot_is_authoritative_crs_and_rectangle_size(tmp_path):
@@ -249,19 +240,6 @@ def test_run_json_is_an_accepted_source_and_dem_path_is_validated(tmp_path):
     assert source.run_id == "a" * 32
 
 
-def test_csv_inside_run_uses_its_verified_snapshot_and_dem_context(tmp_path):
-    dem_path = write_dem(tmp_path)
-    run_dir = write_figure_run(
-        tmp_path,
-        target_crs="EPSG:3857",
-        dem_path=dem_path,
-    )
-
-    source = FigureService.load_source(run_dir / "scenario.csv")
-
-    assert source.path == run_dir.resolve()
-    assert source.dem_path == dem_path.resolve()
-    assert source.warnings == ()
 
 
 def test_run_source_rejects_ambiguous_and_escaping_csv_artifacts(tmp_path):
@@ -290,14 +268,6 @@ def test_run_source_rejects_ambiguous_and_escaping_csv_artifacts(tmp_path):
         FigureService.load_source(run_dir)
 
 
-def test_legacy_csv_falls_back_with_warning(tmp_path):
-    path = write_single_csv(tmp_path)
-
-    source = FigureService.load_source(path)
-
-    assert source.target_crs == "EPSG:3857"
-    assert "EPSG:3857" in source.warnings[0]
-    assert source.dem_path is None
 
 
 @pytest.mark.parametrize(
@@ -310,7 +280,10 @@ def test_legacy_csv_falls_back_with_warning(tmp_path):
     ],
 )
 def test_source_rejects_non_finite_required_numeric_values(tmp_path, column, value):
-    path = write_single_csv(tmp_path, row={**REQUIRED_ROW, column: value})
+    path = write_figure_run(tmp_path, target_crs="EPSG:3857")
+    pd.DataFrame([{**REQUIRED_ROW, column: value}]).to_csv(
+        path / "scenario.csv", index=False
+    )
 
     with pytest.raises(ValueError, match="finite"):
         FigureService.load_source(path)
@@ -318,9 +291,9 @@ def test_source_rejects_non_finite_required_numeric_values(tmp_path, column, val
 
 @pytest.mark.parametrize("point_count", [-1, 1.5, 2, True])
 def test_source_requires_integer_nonnegative_matching_point_count(tmp_path, point_count):
-    path = write_single_csv(
-        tmp_path,
-        row={**REQUIRED_ROW, "pt_count": point_count},
+    path = write_figure_run(tmp_path, target_crs="EPSG:3857")
+    pd.DataFrame([{**REQUIRED_ROW, "pt_count": point_count}]).to_csv(
+        path / "scenario.csv", index=False
     )
 
     with pytest.raises(ValueError, match="pt_count"):
@@ -413,7 +386,7 @@ def test_current_selection_run_rejects_cross_source_drift(tmp_path, case):
 def test_figure_models_are_immutable_and_presets_are_validated(tmp_path):
     preview = FigureSpec.from_preset("preview")
     publication = FigureSpec.from_preset("publication")
-    source = FigureService.load_source(write_single_csv(tmp_path))
+    source = write_in_memory_selection_source(tmp_path)
     result = FigureResult(path=tmp_path, artifacts=())
 
     assert preview.dpi == 120
@@ -431,11 +404,11 @@ def test_figure_models_are_immutable_and_presets_are_validated(tmp_path):
         result.path = tmp_path / "changed"
 
 
-def test_preview_writes_only_requested_path_and_requires_resolved_dem(tmp_path):
-    source = FigureService.load_source(write_single_csv(tmp_path))
+def test_preview_writes_only_requested_path_and_requires_recorded_dem(tmp_path):
+    source = replace(write_in_memory_selection_source(tmp_path), dem_path=None)
     output = tmp_path / "preview" / "terrain.png"
 
-    with pytest.raises(ValueError, match="DEM.*resolved"):
+    with pytest.raises(ValueError, match="DEM provenance"):
         FigureService.preview(source, FigureSpec.from_preset("preview"), output)
     assert not output.exists()
 
@@ -458,7 +431,7 @@ def test_render_publishes_full_spec_parent_and_self_contained_outputs(
 ):
     dem_path = write_dem(tmp_path)
     source = replace(
-        FigureService.load_source(write_single_csv(tmp_path)),
+        write_in_memory_selection_source(tmp_path),
         dem_path=dem_path,
     )
     spec = replace(
@@ -495,16 +468,12 @@ def test_render_publishes_full_spec_parent_and_self_contained_outputs(
     assert record["metadata"]["git_commit"] == "abc123"
     assert record["metadata"]["software_versions"] == {"python": "3.test"}
     inputs = record["metadata"]["inputs"]
-    assert inputs["csv"] == {
-        "path": str(source.csv_path.resolve()),
-        "size_bytes": source.csv_path.stat().st_size,
-        "sha256": hashlib.sha256(source.csv_path.read_bytes()).hexdigest(),
-    }
+    assert inputs["selection"] == source.selection_identity.as_dict()
     assert inputs["dem"] == {
         "path": str(dem_path.resolve()),
         "size_bytes": dem_path.stat().st_size,
-        "fingerprint": hashlib.sha256(dem_path.read_bytes()).hexdigest(),
-        "fingerprint_source": "sha256",
+        "fingerprint": "dem-selection",
+        "fingerprint_source": "run",
     }
     assert set(record["artifacts"]) == {
         "source.csv",
@@ -522,8 +491,9 @@ def test_render_prepares_terrain_once_for_all_requested_formats(
 ):
     dem_path = write_dem(tmp_path)
     source = replace(
-        FigureService.load_source(write_single_csv(tmp_path)),
+        write_in_memory_selection_source(tmp_path),
         dem_path=dem_path,
+        dem_fingerprint=None,
     )
     from lte_scenario_toolkit import figure_service
 
@@ -556,7 +526,7 @@ def test_render_publishes_partial_run_for_per_format_failure(
 ):
     dem_path = write_dem(tmp_path)
     source = replace(
-        FigureService.load_source(write_single_csv(tmp_path)),
+        write_in_memory_selection_source(tmp_path),
         dem_path=dem_path,
     )
     from lte_scenario_toolkit import figure_service
@@ -650,7 +620,7 @@ def test_zero_station_selection_figure_snapshot_is_reloadable(tmp_path):
 def test_render_abandons_run_when_no_requested_format_succeeds(tmp_path, monkeypatch):
     dem_path = write_dem(tmp_path)
     source = replace(
-        FigureService.load_source(write_single_csv(tmp_path)),
+        write_in_memory_selection_source(tmp_path),
         dem_path=dem_path,
     )
     from lte_scenario_toolkit import figure_service
@@ -681,7 +651,7 @@ def test_render_abandons_run_when_no_requested_format_succeeds(tmp_path, monkeyp
 def test_render_rejects_invalid_formats_before_creating_run(tmp_path, formats):
     dem_path = write_dem(tmp_path)
     source = replace(
-        FigureService.load_source(write_single_csv(tmp_path)),
+        write_in_memory_selection_source(tmp_path),
         dem_path=dem_path,
     )
     output_root = tmp_path / "runs"
@@ -703,7 +673,7 @@ def test_render_abandons_incomplete_staging_when_publish_fails_early(
 ):
     dem_path = write_dem(tmp_path)
     source = replace(
-        FigureService.load_source(write_single_csv(tmp_path)),
+        write_in_memory_selection_source(tmp_path),
         dem_path=dem_path,
     )
     output_root = tmp_path / "runs"
@@ -759,8 +729,9 @@ def test_render_reuses_recorded_dem_fingerprint_and_hashes_csv(tmp_path, monkeyp
 def test_input_identity_failure_happens_before_run_begin(tmp_path, monkeypatch):
     dem_path = write_dem(tmp_path)
     source = replace(
-        FigureService.load_source(write_single_csv(tmp_path)),
+        write_in_memory_selection_source(tmp_path),
         dem_path=dem_path,
+        dem_fingerprint=None,
     )
     output_root = tmp_path / "runs"
     monkeypatch.setattr(

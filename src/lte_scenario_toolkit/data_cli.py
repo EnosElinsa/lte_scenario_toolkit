@@ -135,7 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--catalog",
         type=Path,
         default=Path("data/datasets.yaml"),
-        help="schema-v2 dataset catalog (default: data/datasets.yaml)",
+        help="dataset catalog (default: data/datasets.yaml)",
     )
     commands = parser.add_subparsers(dest="command", required=True)
     scenario = commands.add_parser("scenario", help="manage scenario registrations")

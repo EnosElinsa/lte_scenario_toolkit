@@ -1,20 +1,20 @@
 # Tests
 
-The suite exercises the installed package, local GUI, compatibility adapters,
-and thin wrappers without live network services or full private/local data.
+The suite exercises the installed package, local GUI, current data model, and
+thin wrappers without live network services or full private/local data.
 
 Coverage includes:
 
-- schema-v2 catalog and profile validation, multiple profiles, defaults,
-  guarded CRUD, rollback, and explicit legacy YAML migration;
+- catalog and profile validation, multiple profiles, defaults, guarded CRUD,
+  rollback, and rejection of removed document fields;
 - memory-bounded deterministic row-sweep scanning, fast/complete modes,
   progress, cancellation, cache reuse, force refresh, and corruption handling;
 - boundary registration, mocked Earth Engine preflight/submission, disk-backed
   DEM shard ingest, and fast/full scenario validation;
 - one-candidate selection, DEM overlays and statistics, selectable artifact
   generation, partial runs, figure preview/publication, and file-based history;
-- legacy YAML, candidate-cache JSON, multi-rectangle CSV, selection/figure run
-  records, CLI flags, and the Matplotlib selector;
+- candidate-cache JSON, selection/figure run records, current CLI flags, and
+  rejection of incomplete standalone figure sources;
 - NiceGUI routes, bilingual strings, allowlisted files, loopback warnings,
   path containment, and socket-blocked offline flows;
 - the opt-in benchmark API with production inputs monkeypatched to tiny
@@ -34,7 +34,7 @@ python -m compileall -q src/lte_scenario_toolkit scripts
 python -m pytest -q
 ```
 
-Focused GUI and legacy compatibility runs:
+Focused GUI and service runs:
 
 ```powershell
 python -m pytest tests/test_gui.py -q

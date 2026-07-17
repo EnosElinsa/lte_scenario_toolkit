@@ -356,12 +356,15 @@ def _validate_scenario(scenario: Any, root: Path, index: int) -> tuple[str, dict
 
 
 def validate_catalog_document(document: dict[str, Any], root: str | Path) -> None:
-    """Validate a schema-v2 catalog document."""
+    """Validate the current catalog document."""
 
-    if not isinstance(document, dict) or type(document.get("schema_version")) is not int:
-        raise CatalogError("Data catalog schema_version must be 2")
-    if document["schema_version"] != 2:
-        raise CatalogError("Data catalog schema_version must be 2")
+    if not isinstance(document, dict):
+        raise CatalogError("Data catalog must be a mapping")
+    unexpected = sorted(set(document) - {"datasets", "scenarios"})
+    if unexpected:
+        raise CatalogError(
+            "Data catalog has unexpected fields: " + ", ".join(unexpected)
+        )
     if not isinstance(document.get("datasets"), list):
         raise CatalogError("Data catalog must contain a datasets list")
     if not isinstance(document.get("scenarios"), list):
@@ -647,7 +650,6 @@ def update_data_manifest(
         datasets.append(dataset)
 
     payload = {
-        "schema_version": 2,
         "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "datasets": datasets,
         "scenarios": _manifest_json_safe(catalog.document["scenarios"]),

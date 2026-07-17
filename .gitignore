@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+.pytest-tmp-*/
 .ruff_cache/
 .mypy_cache/
 .venv/
@@ -39,7 +40,7 @@ results/**
 *.html
 
 # Locally generated user profiles
-configs/new-york-city/
+configs/*/
 
 # Generated GEEMu runs; keep only reusable artifacts
 runs/**

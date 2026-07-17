@@ -799,7 +799,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--catalog",
         type=Path,
         default=Path("data/datasets.yaml"),
-        help="schema-v2 dataset catalog, relative to --repo-root by default",
+        help="dataset catalog, relative to --repo-root by default",
     )
     parser.add_argument("--host", default="127.0.0.1", help="server bind host")
     parser.add_argument("--port", type=_port, default=8080, help="server port")

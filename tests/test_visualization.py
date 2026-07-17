@@ -58,7 +58,7 @@ def test_save_preview_writes_noninteractive_png_without_pyplot_or_backend_change
     assert matplotlib.get_backend() == backend
 
 
-def test_render_3d_terrain_writes_png_and_html(tmp_path):
+def test_render_3d_terrain_writes_explicit_png_and_html(tmp_path):
     profile = {
         "driver": "GTiff",
         "height": 4,
@@ -71,15 +71,8 @@ def test_render_3d_terrain_writes_png_and_html(tmp_path):
     selected = gpd.GeoDataFrame(
         {"elevation": [2.0]}, geometry=[Point(1.5, 1.5)], crs="EPSG:3857"
     )
-    config = {
-        "rect_size": 2,
-        "target_crs": "EPSG:3857",
-        "output_3d_png": tmp_path / "terrain.png",
-        "output_3d_html": tmp_path / "terrain.html",
-        "save_terrain_png": True,
-        "save_terrain_eps": False,
-        "save_terrain_html": True,
-    }
+    png_path = tmp_path / "terrain.png"
+    html_path = tmp_path / "terrain.html"
     rectangle = {
         "left_x": 1,
         "bottom_y": 1,
@@ -89,12 +82,21 @@ def test_render_3d_terrain_writes_png_and_html(tmp_path):
     with MemoryFile() as memory_file:
         with memory_file.open(**profile) as dataset:
             dataset.write(np.arange(16, dtype="float32").reshape(4, 4), 1)
-            outputs = render_3d_terrain(rectangle, selected, dataset, config)
+            outputs = render_3d_terrain(
+                rectangle,
+                selected,
+                dataset,
+                FigureSpec.from_preset("preview"),
+                rectangle_size=2,
+                target_crs="EPSG:3857",
+                png_path=png_path,
+                html_path=html_path,
+            )
 
-    assert config["output_3d_png"] in outputs
-    assert config["output_3d_html"] in outputs
-    assert config["output_3d_png"].stat().st_size > 0
-    assert config["output_3d_html"].stat().st_size > 0
+    assert png_path in outputs
+    assert html_path in outputs
+    assert png_path.stat().st_size > 0
+    assert html_path.stat().st_size > 0
 
 
 def test_prepare_terrain_arrays_bounds_the_raster_read_shape():

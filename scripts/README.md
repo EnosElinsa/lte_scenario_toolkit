@@ -24,14 +24,14 @@ permits the normalized boundary to be tracked.
 ## Experiment workflow
 
 - `select_sites.py` delegates to `lte-select-sites`. Its default interactive
-  selector is the local web candidate explorer; use `--selector legacy` for the
-  Matplotlib window or `--select-index N` for a headless deterministic choice.
+  selector is the local web candidate explorer; use `--select-index N` for a
+  headless deterministic choice.
 - `generate_scenario_figures.py` delegates to `lte-generate-figures`. It accepts
-  a profile, selection run, or compatible CSV and supports preview/publication
-  presets plus explicit PNG, EPS, and offline HTML formats.
+  a completed toolkit run and supports preview/publication presets plus
+  explicit PNG, EPS, and offline HTML formats.
 - `benchmark_candidate_scan.py` runs the opt-in production-path scanner
   benchmark with cache and run writes disabled and prints sorted JSON metrics.
-- `create_data_manifest.py` delegates to schema-v2 manifest generation.
+- `create_data_manifest.py` delegates to catalog manifest generation.
 
 Examples:
 
@@ -42,8 +42,7 @@ python scripts/generate_scenario_figures.py --run-dir <selection-run> `
 python scripts/benchmark_candidate_scan.py --config configs/example.yaml
 ```
 
-`--output-root` creates a unique run hierarchy. The legacy `--output-dir`
-option targets one exact final directory and refuses to overwrite conflicts.
+`--output-root` creates a unique run hierarchy.
 
 The local GUI is installed as `lte-gui`; it intentionally has no source-tree
 wrapper. Install the GUI extra and run `lte-gui --check` before starting it.

@@ -11,8 +11,8 @@ installed CLI commands and a modern local browser interface.
 boundary_shp/                 # Registered boundary bundles and import guidance
 points_shp/                   # Public LTE base stations; large files use Git LFS
 dem/                          # External local DEMs; ignored by Git
-configs/                      # Legacy configs and schema-v2 experiment profiles
-data/datasets.yaml            # Schema-v2 dataset and scenario catalog
+configs/                      # Tracked examples and ignored local profiles
+data/datasets.yaml            # Dataset and scenario catalog
 data/manifest.json            # Generated file sizes and SHA256 values
 src/lte_scenario_toolkit/     # Installed implementation package
 scripts/                      # Thin source-tree wrappers
@@ -27,7 +27,7 @@ The public contracts are documented in:
 - [data/README.md](data/README.md) for the dataset catalog, manifest, and
   scenario readiness states;
 - [dem/README.md](dem/README.md) for Earth Engine export and local shard ingest;
-- [configs/README.md](configs/README.md) for versioned experiment profiles;
+- [configs/README.md](configs/README.md) for experiment profiles;
 - [runs/README.md](runs/README.md) for selection and figure run artifacts.
 
 ## Installation
@@ -80,12 +80,12 @@ catalog links, boundary sidecars and geometry, manifest containment and sizes,
 a usable DEM, and the linked default profile. Full Checksum additionally
 streams SHA256 values.
 
-The Configure page supports multiple schema-v2 profiles per scenario. The
-catalog's `config_path` identifies the default profile. Existing legacy YAML is
-readable and shown as a read-only migration preview. An explicit Save verifies
-that the source has not changed, writes a canonical v2 profile, and atomically
-keeps or repoints the scenario default. Profile paths and dataset IDs are
-validated before a scan starts.
+The Configure page supports multiple profiles per scenario. The catalog's
+`config_path` identifies the default profile. Save writes the one current
+profile format and atomically keeps or repoints the scenario default. Profile
+paths and dataset IDs are validated before a scan starts. Profiles created by
+the GUI under `configs/<scenario-id>/` are local workstation files and are
+ignored by Git.
 
 ## Candidate selection workflow
 
@@ -96,9 +96,9 @@ profile, seed, and scanner version:
 - `fast` stops after the configured number of valid, spaced candidates;
 - `complete` evaluates the full bounded grid and retains a bounded result set.
 
-Versioned candidate caches live under `.lte-data/cache`, independently of final
-run directories. The GUI reports cache hits, supports Force Rescan, streams
-progress, and cancels without returning a partial candidate set. The candidate
+Content-addressed candidate caches live under `.lte-data/cache`, independently
+of final run directories. The GUI reports cache hits, supports Force Rescan,
+streams progress, and cancels without returning a partial candidate set. The candidate
 explorer overlays the registered boundary, base stations, candidate rectangles,
 and local DEM terrain. It provides map and filmstrip layouts and locks exactly
 one candidate before generation.
@@ -109,17 +109,13 @@ CLI selection uses the local web explorer by default:
 lte-select-sites --config configs/example.yaml --output-root results
 ```
 
-Use the original Matplotlib selector or a reproducible headless choice when
-needed:
+Use a reproducible one-based candidate index in a headless environment:
 
 ```powershell
-lte-select-sites --config configs/example.yaml --selector legacy
 lte-select-sites --config configs/example.yaml --select-index 1 --output-root results
 ```
 
-`--select-index` is one-based. The compatibility option `--output-dir` names an
-exact final directory and fails on conflicting artifacts; `--output-root`
-creates a unique `scenario/profile/timestamp-run` directory.
+`--output-root` creates a unique `scenario/profile/timestamp-run` directory.
 
 ## Generation, figures, and history
 
@@ -131,22 +127,20 @@ error envelope. Selection metadata adds the frozen profile, candidate, cache,
 and input provenance; figure metadata adds the source, validated style,
 provenance, and format-specific warnings.
 
-Figures can also be derived from an existing selection run or CSV without
+Figures are derived from a completed selection or figure run without
 rescanning:
 
 ```powershell
 lte-generate-figures --run-dir results/chicago/default/<run-directory> `
   --output-root results --preset publication --format png --format html
-
-lte-generate-figures --csv legacy-scenario.csv --config configs/example.yaml `
-  --rect-id 1 --output-root results
 ```
 
-A legacy CSV containing multiple `rect_id` values requires an explicit
-`--rect-id`; no first-row rectangle is selected silently. The GUI provides a
-bounded preview before final publication. Its History page discovers valid runs
-from registered roots, links derived figure runs to their parent, identifies
-missing artifacts, and rebuilds entirely from files without a database.
+Standalone CSV files are not figure sources because they do not contain the
+frozen profile, selected-candidate identity, and DEM provenance required for a
+reproducible render. The GUI provides a bounded preview before final
+publication. Its History page discovers valid runs from registered roots,
+links derived figure runs to their parent, identifies missing artifacts, and
+rebuilds entirely from files without a database.
 
 ## CLI-only data lifecycle
 
@@ -218,7 +212,7 @@ python -m compileall -q src/lte_scenario_toolkit scripts
 python -m pytest -q
 ```
 
-Focused GUI and compatibility checks:
+Focused GUI and service checks:
 
 ```powershell
 python -m pytest tests/test_gui.py -q
