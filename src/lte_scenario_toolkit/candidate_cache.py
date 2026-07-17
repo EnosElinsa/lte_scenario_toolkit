@@ -41,6 +41,7 @@ _RESULT_FIELDS = frozenset(
     }
 )
 _CANDIDATE_FIELDS = frozenset(field.name for field in fields(Candidate))
+_LEGACY_COORDINATE_DECIMALS = 2
 _THREAD_LOCKS_GUARD = Lock()
 _THREAD_LOCKS: dict[Path, Lock] = {}
 
@@ -87,6 +88,28 @@ def _is_redirected_path(path: Path) -> bool:
         return False
     reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     return bool(attributes & reparse_point)
+
+
+def _assert_unredirected_regular_file(path: Path, *, description: str) -> Path:
+    """Reject traversal and every existing redirected component in one file path."""
+
+    candidate = path.expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    if ".." in candidate.parts:
+        raise ValueError(f"{description} must not contain path traversal: {path}")
+    current = Path(candidate.anchor)
+    for part in candidate.parts[1:]:
+        current /= part
+        if os.path.lexists(current) and _is_redirected_path(current):
+            raise ValueError(f"{description} must not use redirected paths: {path}")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"{description} is not a readable regular file: {path}") from exc
+    if resolved != candidate or not resolved.is_file():
+        raise ValueError(f"{description} must be an unredirected regular file: {path}")
+    return resolved
 
 
 def _thread_lock_for(path: Path) -> Lock:
@@ -206,6 +229,44 @@ def cache_key(
         ensure_ascii=False,
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _legacy_filename_number(value: Real, *, field: str) -> str:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{field} must be finite")
+    return str(int(number)) if number.is_integer() else format(number, ".15g")
+
+
+def legacy_cache_filename(scenario_tag: str, request: ScanRequest) -> str:
+    """Return the exact cache basename emitted by the legacy CLI workflow."""
+
+    if (
+        type(scenario_tag) is not str
+        or not scenario_tag.strip()
+        or scenario_tag != scenario_tag.strip()
+        or Path(scenario_tag).name != scenario_tag
+        or "/" in scenario_tag
+        or "\\" in scenario_tag
+    ):
+        raise ValueError("scenario_tag must be one non-empty path-safe filename token")
+    if not isinstance(request, ScanRequest):
+        raise ValueError("request must be a ScanRequest")
+    rectangle_size = _legacy_filename_number(
+        request.rectangle_size,
+        field="request.rectangle_size",
+    )
+    step = _legacy_filename_number(request.step, field="request.step")
+    spacing = _legacy_filename_number(
+        request.minimum_spacing,
+        field="request.minimum_spacing",
+    )
+    return (
+        f"{scenario_tag}_{rectangle_size}m_"
+        f"target{request.target_count}_tol{request.tolerance}_"
+        f"step{step}_sp{spacing}_{request.strategy}_"
+        f"seed{request.random_seed}_cache.json"
+    )
 
 
 def _strict_mapping(
@@ -632,8 +693,13 @@ class CandidateCache:
 
     @staticmethod
     def _axis_index(axis: np.ndarray, value: float, *, field: str) -> int:
+        serialized_axis = np.fromiter(
+            (round(float(item), _LEGACY_COORDINATE_DECIMALS) for item in axis),
+            dtype=float,
+            count=len(axis),
+        )
         matches = np.flatnonzero(
-            np.isclose(axis, value, rtol=1e-9, atol=1e-9),
+            np.isclose(serialized_axis, value, rtol=0.0, atol=1e-12),
         )
         if len(matches) != 1:
             raise ValueError(f"{field} does not map unambiguously to the scan grid")
@@ -646,11 +712,27 @@ class CandidateCache:
         request: ScanRequest,
         boundary: Any,
         coordinates: Any,
+        *,
+        scenario_tag: str,
     ) -> ScanResult:
         validated_key = _validated_key(key)
         if not isinstance(request, ScanRequest):
             raise ValueError("request must be a ScanRequest")
-        source = Path(legacy_path)
+        if request.mode != "fast":
+            raise ValueError(
+                "Legacy candidate caches lack exhaustive coverage metadata and "
+                "cannot be imported for complete mode"
+            )
+        source = _assert_unredirected_regular_file(
+            Path(legacy_path),
+            description="Legacy candidate cache",
+        )
+        expected_filename = legacy_cache_filename(scenario_tag, request)
+        if source.name != expected_filename:
+            raise ValueError(
+                "Legacy candidate cache filename does not match its effective "
+                f"configuration: expected {expected_filename!r}, got {source.name!r}"
+            )
         try:
             document = json.loads(source.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -705,18 +787,6 @@ class CandidateCache:
                 field=f"{prefix}.pt_count",
                 minimum=0,
             )
-            if not math.isclose(
-                center_x,
-                left_x + request.rectangle_size / 2.0,
-                rel_tol=1e-12,
-                abs_tol=1e-12,
-            ) or not math.isclose(
-                center_y,
-                bottom_y + request.rectangle_size / 2.0,
-                rel_tol=1e-12,
-                abs_tol=1e-12,
-            ):
-                raise ValueError(f"{prefix} center is inconsistent")
             original_x_index = self._axis_index(
                 x_origins,
                 left_x,
@@ -727,11 +797,27 @@ class CandidateCache:
                 bottom_y,
                 field=f"{prefix}.bottom_y",
             )
+            original_left_x = float(x_origins[original_x_index])
+            original_bottom_y = float(y_origins[original_y_index])
+            original_center_x = original_left_x + request.rectangle_size / 2.0
+            original_center_y = original_bottom_y + request.rectangle_size / 2.0
+            if not math.isclose(
+                center_x,
+                round(original_center_x, _LEGACY_COORDINATE_DECIMALS),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ) or not math.isclose(
+                center_y,
+                round(original_center_y, _LEGACY_COORDINATE_DECIMALS),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise ValueError(f"{prefix} center is inconsistent")
             geometry = box(
-                left_x,
-                bottom_y,
-                left_x + request.rectangle_size,
-                bottom_y + request.rectangle_size,
+                original_left_x,
+                original_bottom_y,
+                original_left_x + request.rectangle_size,
+                original_bottom_y + request.rectangle_size,
             )
             if not bool(shapely.contains(boundary, geometry)) or bool(
                 shapely.intersects(boundary.boundary, geometry)
@@ -742,16 +828,16 @@ class CandidateCache:
                 Candidate(
                     flat_grid_id=flat_grid_id,
                     point_count=point_count,
-                    left_x=left_x,
-                    bottom_y=bottom_y,
-                    center_x=center_x,
-                    center_y=center_y,
+                    left_x=original_left_x,
+                    bottom_y=original_bottom_y,
+                    center_x=original_center_x,
+                    center_y=original_center_y,
                 )
             )
             legacy_results.append(
                 {
-                    "left_x": left_x,
-                    "bottom_y": bottom_y,
+                    "left_x": original_left_x,
+                    "bottom_y": original_bottom_y,
                     "pt_count": point_count,
                 }
             )

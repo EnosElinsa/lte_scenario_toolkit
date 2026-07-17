@@ -138,6 +138,9 @@ def test_gui_parser_resolves_all_shell_options_and_rejects_invalid_ports(tmp_pat
 def test_gui_check_uses_resolved_repo_paths_without_starting_app(
     tmp_path, monkeypatch, capsys
 ):
+    import socket
+    import urllib.request
+
     module = _gui_module("app")
     assert hasattr(module, "main")
     calls: dict[str, object] = {}
@@ -173,6 +176,13 @@ def test_gui_check_uses_resolved_repo_paths_without_starting_app(
             )
         ),
     )
+
+    def fail_network(*_args, **_kwargs):
+        pytest.fail("--check must not perform a network request")
+
+    monkeypatch.setattr(socket, "create_connection", fail_network)
+    monkeypatch.setattr(socket, "getaddrinfo", fail_network)
+    monkeypatch.setattr(urllib.request, "urlopen", fail_network)
 
     result = module.main(
         [
@@ -464,6 +474,88 @@ def test_gui_settings_reject_invalid_languages_and_file_output_roots(tmp_path):
 
     assert not (tmp_path / ".lte-data").exists()
 
+
+def test_gui_settings_reject_traversal_output_roots(tmp_path):
+    module = _gui_module("settings")
+    store = module.GuiSettingsStore(tmp_path)
+
+    with pytest.raises(module.GuiSettingsError, match="must not contain traversal"):
+        store.save(
+            language="en",
+            output_roots=[tmp_path / "results" / ".." / "outside"],
+        )
+
+
+def test_gui_settings_reject_redirected_output_roots(tmp_path):
+    module = _gui_module("settings")
+    store = module.GuiSettingsStore(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    redirected = tmp_path / "redirected"
+    try:
+        redirected.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable")
+    with pytest.raises(module.GuiSettingsError, match="symlink or junction"):
+        store.save(language="en", output_roots=[redirected])
+
+
+def test_gui_settings_reject_junction_output_root(tmp_path, monkeypatch):
+    module = _gui_module("settings")
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    original = module._is_link_or_junction
+
+    def mark_output_as_junction(path):
+        return path == output_root or original(path)
+
+    monkeypatch.setattr(module, "_is_link_or_junction", mark_output_as_junction)
+    with pytest.raises(module.GuiSettingsError, match="symlink or junction"):
+        module.GuiSettingsStore(tmp_path).save(
+            language="en",
+            output_roots=[output_root],
+        )
+
+
+def test_gui_settings_redirect_detector_supports_windows_reparse_points(monkeypatch):
+    import stat
+
+    module = _gui_module("settings")
+    flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    monkeypatch.setattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", flag, raising=False)
+
+    class ReparsePath:
+        @staticmethod
+        def is_symlink():
+            return False
+
+        @staticmethod
+        def lstat():
+            return SimpleNamespace(st_file_attributes=flag)
+
+    assert module._is_link_or_junction(ReparsePath()) is True
+
+
+def test_gui_settings_never_persist_environment_or_credentials(tmp_path, monkeypatch):
+    module = _gui_module("settings")
+    monkeypatch.setenv("EARTHENGINE_TOKEN", "do-not-persist")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "secret.json")
+
+    module.GuiSettingsStore(tmp_path).save(
+        language="en",
+        output_roots=[tmp_path / "results"],
+    )
+
+    document = (tmp_path / ".lte-data" / "gui-settings.json").read_text(
+        encoding="utf-8"
+    )
+    assert "do-not-persist" not in document
+    assert "secret.json" not in document
+    assert set(json.loads(document)) == {
+        "schema_version",
+        "language",
+        "output_roots",
+    }
 
 def test_gui_settings_atomic_failure_preserves_previous_file(tmp_path, monkeypatch):
     module = _gui_module("settings")
@@ -776,6 +868,34 @@ def _task13_profile(tmp_path: Path):
     )
 
 
+def _task17_legacy_profile_store(tmp_path: Path):
+    from lte_scenario_toolkit.profiles import ProfileStore
+
+    catalog = _Task13Catalog(tmp_path)
+    catalog.resolve = lambda value: (tmp_path / value).resolve()
+    legacy_entrypoints = {
+        "points": "points_shp/USA_Clear_LTE_Base_Station/USA_Clear_LTE_Base_Station.shp",
+        "boundary": "boundary_shp/Chicago/Chicago.shp",
+        "dem": "dem/Chicago/elevation.tif",
+    }
+    for dataset_id, entrypoint in legacy_entrypoints.items():
+        catalog.datasets_by_id[dataset_id]["entrypoint"] = entrypoint
+        path = tmp_path / entrypoint
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(dataset_id, encoding="utf-8")
+    source = tmp_path / "configs" / "ready.yaml"
+    source.parent.mkdir()
+    source.write_bytes(
+        (ROOT / "tests" / "fixtures" / "legacy" / "experiment-v1.yaml").read_bytes()
+    )
+    catalog_path = tmp_path / "data" / "datasets.yaml"
+    catalog_path.parent.mkdir()
+    catalog_path.write_text("test catalog is injected\n", encoding="utf-8")
+    store = ProfileStore(tmp_path, catalog_path)
+    store._load_catalog = lambda: catalog
+    return catalog, store, source
+
+
 def test_scenario_cards_are_immutable_and_enable_only_ready_statuses(tmp_path):
     from lte_scenario_toolkit.gui.pages.scenarios import scenario_cards
 
@@ -1041,6 +1161,32 @@ def test_configure_model_reports_legacy_yaml_without_parsing_or_writing(tmp_path
     assert model.migration_error is not None
     assert "schema version 2" in model.migration_error
     assert not (tmp_path / ".lte-data").exists()
+
+
+def test_configure_model_preserves_catalog_legacy_read_only_preview(tmp_path):
+    from lte_scenario_toolkit.gui.pages.configure import (
+        configure_model,
+        profile_with_form_values,
+    )
+
+    catalog, store, source = _task17_legacy_profile_store(tmp_path)
+
+    model = configure_model(catalog, store, "ready-city")
+
+    assert model.is_persisted is True
+    assert model.is_legacy_preview is True
+    assert model.profile.is_legacy_preview is True
+    assert model.profile.source_path == source.resolve()
+    assert model.profile.rect_size == 2400
+    assert model.profile.target_count == 24
+    assert model.profile.tolerance == 2
+    assert model.profile.scan_step == 30
+    assert model.profile.min_spacing == 1800
+    assert model.migration_error is not None
+    assert model.management_error is None
+    assert model.can_start is False
+    with pytest.raises(ValueError, match="read-only.*Save|Save.*read-only"):
+        profile_with_form_values(model.profile, {"rect_size": 2500})
 
 
 def test_unrelated_legacy_discovery_error_does_not_block_profileless_draft(tmp_path):
@@ -1453,6 +1599,49 @@ async def test_configure_route_shows_legacy_migration_placeholder(user, tmp_path
         "profile-save",
     ):
         assert all(not element.enabled for element in user.find(marker=marker).elements)
+
+
+async def test_real_legacy_profile_renders_read_only_migration_preview(user, tmp_path):
+    from lte_scenario_toolkit.gui.app import create_app
+
+    catalog, store, _ = _task17_legacy_profile_store(tmp_path)
+    create_app(catalog=catalog, profile_store=store, testing=True)
+
+    await user.open("/configure/ready-city")
+
+    await user.should_see("Read-only migration preview")
+    await user.should_see("schema version 2")
+    for marker in (
+        "profile-id",
+        "profile-display-name",
+        "profile-target-crs",
+        "profile-rect-size",
+        "profile-target-count",
+        "profile-scan-step",
+        "profile-max-rects",
+        "profile-tolerance",
+        "profile-strategy",
+        "profile-random-seed",
+        "profile-min-spacing",
+        "profile-scan-mode",
+        "profile-output-root",
+        "profile-browse",
+        "profile-copy",
+        "profile-rename",
+        "profile-set-default",
+        "profile-delete",
+        "profile-start-scan",
+    ):
+        elements = user.find(marker=marker).elements
+        assert elements, marker
+        assert all(not element.enabled for element in elements), marker
+    for marker in ("profile-select", "profile-discard", "profile-save"):
+        elements = user.find(marker=marker).elements
+        assert elements, marker
+        assert all(element.enabled for element in elements), marker
+
+    user.find(marker="profile-save").click()
+    await user.should_see("Convert legacy profile")
 
 
 async def test_configure_route_renders_complete_form_and_blocks_nonready_direct_url(
@@ -2386,7 +2575,9 @@ def _task14_map_bundle(tmp_path):
     from lte_scenario_toolkit.gui.pages.candidates import CandidateMapBundle
     from lte_scenario_toolkit.map_assets import MapAsset, MapStyle
 
-    overlay = tmp_path / "overview.png"
+    cache_root = tmp_path / ".lte-data" / "cache" / "maps"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    overlay = cache_root / "overview.png"
     overlay.write_bytes(b"png")
     return CandidateMapBundle(
         dem_asset=MapAsset(
@@ -2406,6 +2597,122 @@ def _task14_map_bundle(tmp_path):
         stations_geojson={"type": "FeatureCollection", "features": []},
         map_bounds=(-1.0, -1.0, 2.0, 2.0),
     )
+
+
+def test_gui_file_route_resolver_accepts_only_allowlisted_local_files(tmp_path):
+    module = _gui_module("app")
+    cache_root = tmp_path / ".lte-data" / "cache"
+    run_root = tmp_path / "runs"
+    cache_root.mkdir(parents=True)
+    run_root.mkdir()
+    cache_asset = cache_root / "map.png"
+    run_asset = run_root / "artifact.csv"
+    outside = tmp_path / "outside.png"
+    cache_asset.write_bytes(b"png")
+    run_asset.write_text("x,y\n1,2\n", encoding="utf-8")
+    outside.write_bytes(b"png")
+
+    assert module._resolve_allowlisted_file(
+        cache_asset,
+        roots=(cache_root, run_root),
+        suffixes=(".png",),
+        label="map asset",
+    ) == cache_asset.resolve()
+    assert module._resolve_allowlisted_file(
+        run_asset,
+        roots=(cache_root, run_root),
+        suffixes=(".csv",),
+        label="run artifact",
+    ) == run_asset.resolve()
+
+    with pytest.raises(ValueError, match="outside the allowlisted roots"):
+        module._resolve_allowlisted_file(
+            outside,
+            roots=(cache_root, run_root),
+            suffixes=(".png",),
+            label="map asset",
+        )
+    with pytest.raises(ValueError, match="must not contain traversal"):
+        module._resolve_allowlisted_file(
+            cache_root / "nested" / ".." / "map.png",
+            roots=(cache_root,),
+            suffixes=(".png",),
+            label="map asset",
+        )
+    with pytest.raises(ValueError, match="local filesystem path"):
+        module._resolve_allowlisted_file(
+            "https://example.invalid/map.png",
+            roots=(cache_root,),
+            suffixes=(".png",),
+            label="map asset",
+        )
+
+
+def test_gui_file_route_resolver_rejects_symlink_escape(tmp_path):
+    module = _gui_module("app")
+    cache_root = tmp_path / "cache"
+    outside_root = tmp_path / "outside"
+    cache_root.mkdir()
+    outside_root.mkdir()
+    (outside_root / "secret.png").write_bytes(b"png")
+    redirected = cache_root / "redirected"
+    try:
+        redirected.symlink_to(outside_root, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable")
+
+    with pytest.raises(ValueError, match="must not be redirected"):
+        module._resolve_allowlisted_file(
+            redirected / "secret.png",
+            roots=(cache_root,),
+            suffixes=(".png",),
+            label="map asset",
+        )
+
+
+def test_gui_file_route_resolver_rejects_redirected_allowlist_ancestor(
+    tmp_path,
+    monkeypatch,
+):
+    module = _gui_module("app")
+    redirected_parent = tmp_path / ".lte-data"
+    cache_root = redirected_parent / "cache" / "maps"
+    cache_root.mkdir(parents=True)
+    asset = cache_root / "map.png"
+    asset.write_bytes(b"png")
+    original = module._is_redirected_path
+    monkeypatch.setattr(
+        module,
+        "_is_redirected_path",
+        lambda path: Path(path) == redirected_parent or original(path),
+    )
+
+    with pytest.raises(ValueError, match="allowlisted root must not be redirected"):
+        module._resolve_allowlisted_file(
+            asset,
+            roots=(cache_root,),
+            suffixes=(".png",),
+            label="map asset",
+        )
+
+
+def test_gui_file_route_redirect_detector_supports_windows_reparse_points(monkeypatch):
+    import stat
+
+    module = _gui_module("app")
+    flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    monkeypatch.setattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", flag, raising=False)
+
+    class ReparsePath:
+        @staticmethod
+        def is_symlink():
+            return False
+
+        @staticmethod
+        def lstat():
+            return SimpleNamespace(st_file_attributes=flag)
+
+    assert module._is_redirected_path(ReparsePath()) is True
 
 
 def test_map_bundle_and_selected_overlay_use_frozen_registered_dem_inputs(tmp_path):
@@ -2633,9 +2940,11 @@ async def test_candidate_style_and_selected_preview_reuse_short_static_asset_url
     from lte_scenario_toolkit.map_assets import MapAsset
     from lte_scenario_toolkit.selection_service import DemStatistics
 
-    selected_png = tmp_path / "selected.png"
+    cache_root = tmp_path / ".lte-data" / "cache" / "maps"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    selected_png = cache_root / "selected.png"
     selected_png.write_bytes(b"png")
-    hillshade_png = tmp_path / "hillshade.png"
+    hillshade_png = cache_root / "hillshade.png"
     hillshade_png.write_bytes(b"png")
 
     class Service:
@@ -3168,6 +3477,218 @@ def test_history_model_includes_partial_and_parent_runs(tmp_path):
     )
 
 
+def test_legacy_history_action_opens_unique_csv_and_preserves_explicit_rectangle_choice(
+    tmp_path,
+):
+    from lte_scenario_toolkit.gui.pages.figures import load_figure_source
+    from lte_scenario_toolkit.gui.pages.history import (
+        HistoryAction,
+        history_rows,
+        resolve_history_action,
+    )
+    from lte_scenario_toolkit.run_service import RunService
+
+    fixture_root = ROOT / "tests" / "fixtures" / "legacy"
+    legacy_dir = tmp_path / "results" / "legacy-selection"
+    legacy_dir.mkdir(parents=True)
+    protected = {}
+    for name in ("run-select-sites.json", "scenario.csv"):
+        destination = legacy_dir / name
+        destination.write_bytes((fixture_root / name).read_bytes())
+        protected[destination] = destination.read_bytes()
+
+    rows = history_rows(RunService(tmp_path / "results"))
+
+    assert len(rows) == 1
+    row = rows[0]
+    csv_path = (legacy_dir / "scenario.csv").resolve()
+    assert row.can_open_figures is True
+    assert row.figure_source_path == csv_path
+    action = resolve_history_action(row, HistoryAction.OPEN_FIGURES)
+    assert action.path == csv_path
+    choice = load_figure_source(action.path)
+    assert choice.rectangle_ids == (1, 2)
+    assert choice.requires_rectangle is True
+    assert choice.source is None
+    assert load_figure_source(action.path, rect_id=2).source.rectangle["rect_id"] == 2
+    assert {path: path.read_bytes() for path in protected} == protected
+
+
+def test_identical_legacy_record_copies_have_distinct_stable_actionable_ids(tmp_path):
+    from lte_scenario_toolkit.gui.pages.history import (
+        HistoryAction,
+        history_rows,
+        resolve_history_action,
+    )
+    from lte_scenario_toolkit.run_service import RunService
+
+    fixture_root = ROOT / "tests" / "fixtures" / "legacy"
+    root = tmp_path / "results"
+    expected_paths = set()
+    for directory_name in ("archive-a", "archive-b"):
+        directory = root / directory_name
+        directory.mkdir(parents=True)
+        for name in ("run-select-sites.json", "scenario.csv"):
+            (directory / name).write_bytes((fixture_root / name).read_bytes())
+        expected_paths.add((directory / "scenario.csv").resolve())
+    service = RunService(root)
+
+    first = history_rows(service)
+    second = history_rows(service)
+
+    assert len(first) == 2
+    assert len({row.run_id for row in first}) == 2
+    assert [row.run_id for row in first] == [row.run_id for row in second]
+    assert {
+        resolve_history_action(row, HistoryAction.OPEN_FIGURES).path for row in first
+    } == expected_paths
+
+
+def test_legacy_figure_record_opens_csv_without_requiring_retry_style(tmp_path):
+    from lte_scenario_toolkit.gui.pages.history import (
+        HistoryAction,
+        history_rows,
+        resolve_history_action,
+    )
+    from lte_scenario_toolkit.run_service import RunService
+
+    fixture_root = ROOT / "tests" / "fixtures" / "legacy"
+    legacy_dir = tmp_path / "results" / "legacy-figure"
+    legacy_dir.mkdir(parents=True)
+    for name in ("run-generate-figures.json", "scenario.csv"):
+        (legacy_dir / name).write_bytes((fixture_root / name).read_bytes())
+    (legacy_dir / "terrain.png").write_bytes(b"legacy terrain fixture\n")
+    row = history_rows(RunService(tmp_path / "results"))[0]
+
+    action = resolve_history_action(row, HistoryAction.OPEN_FIGURES)
+
+    assert action.path == (legacy_dir / "scenario.csv").resolve()
+    assert action.figure_spec is None
+
+
+def test_exact_modern_figure_history_uses_authoritative_run_snapshot(tmp_path):
+    from lte_scenario_toolkit.figure_service import FigureService, FigureSpec
+    from lte_scenario_toolkit.gui.pages.history import (
+        HistoryAction,
+        HistoryActionError,
+        history_rows,
+        resolve_history_action,
+    )
+    from lte_scenario_toolkit.run_service import RunService
+
+    exact = tmp_path / "exact"
+    service = RunService(exact)
+    run = service.begin("city", "profile", created_at="2026-07-16T10:00:00Z")
+    (run.path / "source.csv").write_text(
+        "rect_id,pt_count,left_x,bottom_y,center_x,center_y,X,Y\n"
+        "1,1,0,0,1,1,0.5,0.5\n",
+        encoding="utf-8",
+    )
+    (run.path / "terrain.png").write_bytes(b"png")
+    figure_spec = FigureSpec.from_preset("publication")
+    final = service.publish(
+        run,
+        status="completed",
+        artifacts=["source.csv", "terrain.png"],
+        metadata={
+            "run_kind": "figure",
+            "source": {
+                "kind": "csv",
+                "artifact": "source.csv",
+                "path": "archived/source.csv",
+            },
+            "inputs": {"csv": {"path": "archived/source.csv"}},
+            "target_crs": "EPSG:32616",
+            "rectangle_size_m": 2,
+            "rect_id": 1,
+            "figure_spec": figure_spec.as_dict(),
+        },
+    )
+    service.relocate_to_exact_directory(
+        final,
+        exact,
+        compatibility_record="run-generate-figures.json",
+    )
+
+    row = history_rows(service)[0]
+    action = resolve_history_action(row, HistoryAction.OPEN_FIGURES)
+    loaded = FigureService.load_source(action.path)
+
+    assert row.figure_source_path == exact.resolve()
+    assert action.path == exact.resolve()
+    assert action.figure_spec == figure_spec
+    assert loaded.source_kind == "run"
+    assert loaded.target_crs == "EPSG:32616"
+    assert loaded.run_id == run.run_id
+    assert not any("EPSG:3857" in warning for warning in loaded.warnings)
+
+    manifest_path = exact / "run.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["run_id"] = "b" * 32
+    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+    with pytest.raises(HistoryActionError, match="no longer"):
+        resolve_history_action(row, HistoryAction.OPEN_FIGURES)
+
+
+def test_history_roots_reject_lexical_traversal(tmp_path):
+    from lte_scenario_toolkit.gui.pages.history import history_roots
+
+    traversal_parent = tmp_path / "configured"
+    traversal_parent.mkdir()
+    traversal = traversal_parent / ".." / "escaped"
+
+    with pytest.raises(ValueError, match="traversal|history|root"):
+        history_roots(tmp_path, (traversal,))
+
+
+def test_history_roots_reject_symlink_root(tmp_path):
+    from lte_scenario_toolkit.gui.pages.history import history_roots
+
+    target = tmp_path / "real-results"
+    target.mkdir()
+    redirected = tmp_path / "redirected-results"
+    try:
+        redirected.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+
+    with pytest.raises(ValueError, match="redirected|history|root"):
+        history_roots(tmp_path, (redirected,))
+
+
+def test_history_roots_reject_junction_or_reparse_root(tmp_path, monkeypatch):
+    import lte_scenario_toolkit.run_service as run_module
+    from lte_scenario_toolkit.gui.pages.history import history_roots
+
+    redirected = tmp_path / "redirected-results"
+    redirected.mkdir()
+    original = run_module._is_redirected_path
+    monkeypatch.setattr(
+        run_module,
+        "_is_redirected_path",
+        lambda path: Path(path) == redirected or original(Path(path)),
+    )
+
+    with pytest.raises(ValueError, match="redirected|history|root"):
+        history_roots(tmp_path, (redirected,))
+
+
+def test_history_rebuild_deduplicates_same_legacy_record_across_nested_roots(tmp_path):
+    from lte_scenario_toolkit.gui.pages.history import rebuild_history
+
+    fixture_root = ROOT / "tests" / "fixtures" / "legacy"
+    results_root = tmp_path / "results"
+    legacy_dir = results_root / "legacy-city"
+    legacy_dir.mkdir(parents=True)
+    for name in ("run-select-sites.json", "scenario.csv"):
+        (legacy_dir / name).write_bytes((fixture_root / name).read_bytes())
+
+    snapshot = rebuild_history(tmp_path, (results_root, legacy_dir))
+
+    assert len(snapshot.rows) == 1
+    assert snapshot.rows[0].path == legacy_dir.resolve()
+
+
 def test_history_rows_sort_fractional_seconds_newest_first(tmp_path):
     from lte_scenario_toolkit.gui.pages.history import history_rows
     from lte_scenario_toolkit.run_service import RunService
@@ -3418,6 +3939,50 @@ def test_figure_target_does_not_infer_cross_root_parent_and_revalidates_explicit
         (parent_path / "source.csv").unlink()
         with pytest.raises(ValueError, match="no longer|changed"):
             controller._target(source)
+    finally:
+        controller.close()
+        coordinator.shutdown()
+
+
+def test_legacy_shared_directory_parent_is_revalidated_by_run_id(tmp_path):
+    from lte_scenario_toolkit.figure_service import FigureService
+    from lte_scenario_toolkit.gui.pages.figures import FigureController
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.run_service import RunService
+
+    fixture_root = ROOT / "tests" / "fixtures" / "legacy"
+    output_root = tmp_path / "results"
+    legacy_dir = output_root / "legacy-shared"
+    legacy_dir.mkdir(parents=True)
+    for name in (
+        "run-select-sites.json",
+        "run-generate-figures.json",
+        "scenario.csv",
+    ):
+        (legacy_dir / name).write_bytes((fixture_root / name).read_bytes())
+    (legacy_dir / "terrain.png").write_bytes(b"legacy terrain fixture\n")
+    service = RunService(output_root)
+    entries = service.discover_entries().entries
+    selection = next(
+        entry for entry in entries if entry.record["metadata"]["run_kind"] == "selection"
+    )
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        service.entry_for_path(legacy_dir)
+    assert service.entry_for_path(legacy_dir, run_id=selection.run_id) == selection
+
+    source = FigureService.load_source(legacy_dir / "scenario.csv", rect_id=1)
+    coordinator = JobCoordinator()
+    controller = FigureController(
+        tmp_path,
+        coordinator,
+        source=source,
+        output_root=output_root,
+        parent_run_id=selection.run_id,
+        parent_run_path=legacy_dir,
+    )
+    try:
+        assert controller._target(source) == (output_root.resolve(), selection.run_id)
     finally:
         controller.close()
         coordinator.shutdown()

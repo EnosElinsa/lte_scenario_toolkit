@@ -19,8 +19,8 @@ from ...profiles import (
 from ...selection_service import SelectionError
 
 LEGACY_MIGRATION_MESSAGE = (
-    "This legacy profile needs the schema version 2 migration adapter before it can "
-    "be edited in the GUI. It remains available through the existing CLI."
+    "This is a read-only preview of the legacy profile's effective values. "
+    "Explicit Save converts it to schema version 2."
 )
 LEGACY_MANAGEMENT_MESSAGE = (
     "Profile discovery is temporarily unavailable because the repository contains "
@@ -77,6 +77,10 @@ class ConfigureModel:
             and self.migration_error is None
             and self.selection_error is None
         )
+
+    @property
+    def is_legacy_preview(self) -> bool:
+        return self.profile.is_legacy_preview
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,6 +324,8 @@ def configure_model(
                 selection_error = PROFILE_SELECTION_MESSAGE
     persisted = selected is not None
     profile = selected or _draft_profile(catalog, scenario_id, display_name)
+    if profile.is_legacy_preview:
+        migration_error = LEGACY_MIGRATION_MESSAGE
     output_root_default = (Path(catalog.root) / "results").resolve()
     return ConfigureModel(
         scenario_id=scenario_id,
@@ -390,6 +396,10 @@ def profile_with_form_values(
 ) -> ExperimentProfile:
     """Apply validated form values without mutating or truncating the source profile."""
 
+    if profile.is_legacy_preview and values:
+        raise ValueError(
+            "Legacy profile preview is read-only; use explicit Save to convert it"
+        )
     unknown = set(values) - _FORM_FIELDS
     if unknown:
         raise ValueError(f"Unknown profile form fields: {', '.join(sorted(unknown))}")
@@ -641,13 +651,20 @@ def render_configure_page(
                     "lte-section-title"
                 )
                 ui.label(translator.text("configure.migration_body"))
-                ui.code(
-                    "lte-select-sites --config "
-                    + _powershell_quote(
-                        str(catalog.scenario(scenario_id).get("config_path"))
-                    ),
-                    language="powershell",
-                ).classes("lte-cli-guidance")
+                if model.is_legacy_preview:
+                    ui.label(
+                        translator.text("configure.migration_revision", revision=(
+                            profile.legacy_source.source_revision
+                        ))
+                    ).classes("lte-technical-detail")
+                else:
+                    ui.code(
+                        "lte-select-sites --config "
+                        + _powershell_quote(
+                            str(catalog.scenario(scenario_id).get("config_path"))
+                        ),
+                        language="powershell",
+                    ).classes("lte-cli-guidance")
         elif model.selection_error is not None:
             with ui.card().classes("lte-callout lte-callout--warning"):
                 ui.label(translator.text("configure.selection_title")).classes(
@@ -673,9 +690,10 @@ def render_configure_page(
             options,
             value=selected_option,
             label=translator.text("label.profile"),
-        ).classes("lte-profile-select")
+        ).classes("lte-profile-select").mark("profile-select")
         profile_select.set_enabled(
-            model.migration_error is None and model.management_error is None
+            (model.migration_error is None or model.is_legacy_preview)
+            and model.management_error is None
         )
 
         def navigate_to_profile(selected_id: str) -> None:
@@ -751,17 +769,17 @@ def render_configure_page(
                 rect_size.on_value_change(lambda event: changed(event, "rect_size"))
                 target_count = ui.number(
                     translator.text("field.target_count"), value=profile.target_count
-                )
+                ).mark("profile-target-count")
                 target_count.on_value_change(
                     lambda event: changed(event, "target_count")
                 )
                 scan_step = ui.number(
                     translator.text("field.scan_step"), value=profile.scan_step
-                )
+                ).mark("profile-scan-step")
                 scan_step.on_value_change(lambda event: changed(event, "scan_step"))
                 max_rects = ui.number(
                     translator.text("field.max_rects"), value=profile.max_rects
-                )
+                ).mark("profile-max-rects")
                 max_rects.on_value_change(lambda event: changed(event, "max_rects"))
             with ui.expansion(translator.text("configure.advanced")).classes(
                 "lte-advanced full-width"
@@ -769,7 +787,7 @@ def render_configure_page(
                 with ui.grid(columns=2).classes("lte-form-grid"):
                     tolerance = ui.number(
                         translator.text("field.tolerance"), value=profile.tolerance
-                    )
+                    ).mark("profile-tolerance")
                     tolerance.on_value_change(
                         lambda event: changed(event, "tolerance")
                     )
@@ -780,17 +798,17 @@ def render_configure_page(
                         },
                         value=profile.strategy,
                         label=translator.text("field.strategy"),
-                    )
+                    ).mark("profile-strategy")
                     strategy.on_value_change(lambda event: changed(event, "strategy"))
                     random_seed = ui.number(
                         translator.text("field.random_seed"), value=profile.random_seed
-                    )
+                    ).mark("profile-random-seed")
                     random_seed.on_value_change(
                         lambda event: changed(event, "random_seed")
                     )
                     min_spacing = ui.number(
                         translator.text("field.min_spacing"), value=profile.min_spacing
-                    )
+                    ).mark("profile-min-spacing")
                     min_spacing.on_value_change(
                         lambda event: changed(event, "min_spacing")
                     )
@@ -801,7 +819,7 @@ def render_configure_page(
                         },
                         value=profile.scan_mode,
                         label=translator.text("field.scan_mode"),
-                    )
+                    ).mark("profile-scan-mode")
                     scan_mode.on_value_change(
                         lambda event: changed(event, "scan_mode")
                     )
@@ -833,9 +851,28 @@ def render_configure_page(
                         dirty_label.set_text(translator.text("configure.dirty"))
                         dirty_label.classes(add="lte-dirty-indicator--dirty")
 
-                ui.button(translator.text("action.browse"), on_click=browse).props(
-                    "outline"
-                )
+                browse_button = ui.button(
+                    translator.text("action.browse"), on_click=browse
+                ).props("outline").mark("profile-browse")
+
+        if model.is_legacy_preview:
+            for field in (
+                profile_id,
+                display_name,
+                target_crs,
+                rect_size,
+                target_count,
+                scan_step,
+                max_rects,
+                tolerance,
+                strategy,
+                random_seed,
+                min_spacing,
+                scan_mode,
+                output_root,
+                browse_button,
+            ):
+                field.set_enabled(False)
 
         error_area = ui.column().classes("lte-form-errors full-width")
 
@@ -931,9 +968,17 @@ def render_configure_page(
             title_key="confirmation.overwrite",
             on_confirm=lambda: perform_save(confirmed=True),
         )
+        migration_dialog = _confirmation_dialog(
+            ui,
+            translator,
+            title_key="confirmation.migrate",
+            on_confirm=lambda: perform_save(confirmed=True),
+        )
 
         def request_save() -> None:
-            if model.is_persisted:
+            if model.is_legacy_preview:
+                migration_dialog.open()
+            elif model.is_persisted:
                 save_dialog.open()
             else:
                 perform_save(confirmed=False)
@@ -1174,8 +1219,12 @@ def render_configure_page(
                 and model.selection_error is None
                 and model.status == "ready"
             )
-            save.set_enabled(writes_enabled)
-            discard.set_enabled(model.migration_error is None)
+            save.set_enabled(writes_enabled or (
+                model.is_legacy_preview and model.status == "ready"
+            ))
+            discard.set_enabled(
+                model.migration_error is None or model.is_legacy_preview
+            )
             start.set_enabled(model.can_start)
 
 

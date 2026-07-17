@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import uuid
 from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 from typing import Any
 
@@ -21,6 +23,9 @@ from .io import _json_safe, atomic_write_json
 
 _SLUG_PATTERN = re.compile(r"^[a-z][a-z0-9-]*$")
 _RUN_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+_LEGACY_RECORD_NAMES = frozenset(
+    {"run-select-sites.json", "run-generate-figures.json"}
+)
 _WINDOWS_RESERVED = frozenset(
     {"con", "prn", "aux", "nul"}
     | {f"com{index}" for index in range(1, 10)}
@@ -39,6 +44,45 @@ _RUN_RECORD_FIELDS = frozenset(
         "errors",
     }
 )
+
+
+def _is_redirected_path(path: Any) -> bool:
+    """Return whether a path leaf is a symlink, junction, or reparse point."""
+
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if callable(is_junction) and is_junction():
+        return True
+    try:
+        attributes = path.lstat().st_file_attributes
+    except FileNotFoundError:
+        return False
+    except AttributeError:
+        return False
+    reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(attributes & reparse_point)
+
+
+def _absolute_lexical_path(value: str | os.PathLike[str] | Path) -> Path:
+    candidate = Path(value).expanduser()
+    return candidate if candidate.is_absolute() else Path.cwd() / candidate
+
+
+def _assert_unredirected_chain(path: Path, *, description: str) -> Path:
+    """Validate lexical traversal and every component without following redirects."""
+
+    candidate = _absolute_lexical_path(path)
+    if ".." in candidate.parts:
+        raise ValueError(f"{description} path must not contain traversal: {candidate}")
+    current = Path(candidate.anchor)
+    for part in candidate.parts[1:]:
+        current /= part
+        if _is_redirected_path(current):
+            raise ValueError(
+                f"{description} path must not use redirected paths: {candidate}"
+            )
+    return candidate
 
 
 @dataclass(frozen=True)
@@ -85,12 +129,18 @@ class RunEntry:
     record: Mapping[str, Any]
 
     def __post_init__(self) -> None:
-        raw_root = Path(self.root)
-        raw_run_dir = Path(self.run_dir)
-        if not raw_root.is_absolute() or not raw_run_dir.is_absolute():
+        input_root = Path(self.root)
+        input_run_dir = Path(self.run_dir)
+        if not input_root.is_absolute() or not input_run_dir.is_absolute():
             raise ValueError("run entry paths must be absolute")
-        if raw_root.is_symlink() or raw_run_dir.is_symlink():
-            raise ValueError("run entry paths must not use symlinks")
+        raw_root = _assert_unredirected_chain(
+            input_root,
+            description="run entry root",
+        )
+        raw_run_dir = _assert_unredirected_chain(
+            input_run_dir,
+            description="run entry directory",
+        )
         root = raw_root.resolve(strict=True)
         run_dir = raw_run_dir.resolve(strict=True)
         if not root.is_dir() or not run_dir.is_dir():
@@ -103,8 +153,37 @@ class RunEntry:
         current = raw_root
         for part in lexical_relative.parts:
             current /= part
-            if current.is_symlink():
-                raise ValueError("run entry directory must not use symlinks")
+            if _is_redirected_path(current):
+                raise ValueError("run entry directory must not use redirected paths")
+        if not isinstance(self.record, Mapping):
+            raise ValueError("run entry record must be a mapping")
+        artifacts = self.record.get("artifacts", ())
+        if not isinstance(artifacts, (list, tuple)):
+            raise ValueError("run entry artifacts must be a path collection")
+        seen: set[Path] = set()
+        for item in artifacts:
+            if not isinstance(item, (str, os.PathLike)):
+                raise ValueError("run entry artifact paths must be path-like")
+            relative = Path(item)
+            if (
+                relative.is_absolute()
+                or not relative.parts
+                or relative == Path(".")
+                or ".." in relative.parts
+            ):
+                raise ValueError("run entry artifacts must be contained relative paths")
+            artifact = _assert_unredirected_chain(
+                raw_run_dir / relative,
+                description="run entry artifact",
+            )
+            try:
+                resolved_artifact = artifact.resolve(strict=True)
+                resolved_artifact.relative_to(run_dir)
+            except (FileNotFoundError, ValueError) as exc:
+                raise ValueError("run entry artifact must remain inside its run") from exc
+            if not resolved_artifact.is_file() or resolved_artifact in seen:
+                raise ValueError("run entry artifacts must be unique regular files")
+            seen.add(resolved_artifact)
         object.__setattr__(self, "root", root)
         object.__setattr__(self, "run_dir", run_dir)
         object.__setattr__(self, "record", _freeze_record(self.record))
@@ -130,6 +209,19 @@ def _safe_slug(value: Any, *, field: str) -> str:
             f"{field} must be a safe lowercase slug and not a Windows device name"
         )
     return value
+
+
+def _legacy_slug(value: Any, *, fallback: str) -> str:
+    raw = value if type(value) is str else ""
+    token = re.sub(r"[^a-z0-9]+", "-", raw.casefold()).strip("-")
+    if not token or not token[0].isalpha():
+        token = f"legacy-{token}".rstrip("-")
+    if token in _WINDOWS_RESERVED:
+        token = f"legacy-{token}"
+    try:
+        return _safe_slug(token, field="legacy slug")
+    except ValueError:
+        return _safe_slug(fallback, field="legacy slug fallback")
 
 
 def _safe_run_id(value: Any, *, field: str = "run_id") -> str:
@@ -168,7 +260,14 @@ class RunService:
     VALID_STATUSES = {"completed", "partial"}
 
     def __init__(self, output_root: str | Path) -> None:
-        self.output_root = Path(output_root).resolve()
+        lexical_root = _assert_unredirected_chain(
+            _absolute_lexical_path(output_root),
+            description="run output root",
+        )
+        resolved_root = lexical_root.resolve(strict=False)
+        if resolved_root != lexical_root:
+            raise ValueError("run output root must not use redirected paths or traversal")
+        self.output_root = resolved_root
         self._owned_runs: dict[str, StagingRun] = {}
 
     def _ensure_directory_component(self, path: Path, *, description: str) -> Path:
@@ -179,14 +278,14 @@ class RunService:
             except FileExistsError:
                 pass
         self._assert_contained(path, description=description)
-        if path.is_symlink() or not path.is_dir():
+        if _is_redirected_path(path) or not path.is_dir():
             raise ValueError(f"{description} path must be a real directory: {path}")
         return path
 
     def _prepare_run_parent(self, scenario_id: str, profile_id: str) -> Path:
         self.output_root.mkdir(parents=True, exist_ok=True)
         self._assert_contained(self.output_root, description="run output root")
-        if self.output_root.is_symlink() or not self.output_root.is_dir():
+        if _is_redirected_path(self.output_root) or not self.output_root.is_dir():
             raise ValueError(
                 f"run output root must be a real directory: {self.output_root}"
             )
@@ -219,6 +318,8 @@ class RunService:
         candidate = Path(path)
         if not candidate.is_absolute():
             raise ValueError(f"{description} path must be absolute: {candidate}")
+        _assert_unredirected_chain(self.output_root, description="run output root")
+        _assert_unredirected_chain(candidate, description=description)
         try:
             candidate.relative_to(self.output_root)
         except ValueError as exc:
@@ -230,8 +331,10 @@ class RunService:
         relative = candidate.relative_to(self.output_root)
         for part in relative.parts:
             current /= part
-            if current.is_symlink():
-                raise ValueError(f"{description} path must not use symlinks: {candidate}")
+            if _is_redirected_path(current):
+                raise ValueError(
+                    f"{description} path must not use redirected paths: {candidate}"
+                )
         resolved = candidate.resolve(strict=False)
         try:
             resolved.relative_to(self.output_root)
@@ -278,7 +381,7 @@ class RunService:
             description="run final",
         )
         if os.path.lexists(staging):
-            if staging.is_symlink() or not staging.is_dir():
+            if _is_redirected_path(staging) or not staging.is_dir():
                 raise ValueError(f"run staging path must be a real directory: {staging}")
         elif require_staging:
             raise FileNotFoundError(staging)
@@ -372,7 +475,7 @@ class RunService:
                 raise ValueError(f"artifact must be a contained relative path: {item}")
             candidate = staging / relative
             self._assert_contained(candidate, description="artifact")
-            if candidate.is_symlink() or not candidate.is_file():
+            if _is_redirected_path(candidate) or not candidate.is_file():
                 raise ValueError(f"artifact must be an existing regular file: {item}")
             resolved = candidate.resolve(strict=True)
             try:
@@ -498,9 +601,283 @@ class RunService:
         if not os.path.lexists(staging):
             return
         self._assert_contained(staging, description="run staging")
-        if staging.is_symlink() or not staging.is_dir():
+        if _is_redirected_path(staging) or not staging.is_dir():
             raise ValueError(f"run staging path must be a real directory: {staging}")
         shutil.rmtree(staging)
+
+    def _record_candidates(
+        self,
+    ) -> tuple[tuple[Path, ...], tuple[dict[str, Any], ...]]:
+        """Walk only unredirected directories and collect supported record files."""
+
+        records: list[Path] = []
+        diagnostics: list[dict[str, Any]] = []
+        pending = [self.output_root]
+        while pending:
+            directory = pending.pop()
+            try:
+                self._assert_contained(directory, description="run discovery directory")
+                children = sorted(directory.iterdir(), key=lambda path: path.name)
+            except Exception as exc:
+                diagnostics.append(
+                    {
+                        "path": str(directory),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                continue
+            for child in children:
+                name = child.name.casefold()
+                if name in _LEGACY_RECORD_NAMES:
+                    records.append(child)
+                    continue
+                try:
+                    redirected = _is_redirected_path(child)
+                except OSError as exc:
+                    diagnostics.append(
+                        {
+                            "path": str(child),
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+                    continue
+                if redirected:
+                    diagnostics.append(
+                        {
+                            "path": str(child),
+                            "error": "ValueError: run discovery path is redirected",
+                        }
+                    )
+                    continue
+                if child.is_dir() and not child.name.startswith(".staging-"):
+                    pending.append(child)
+                    continue
+                if name == "run.json":
+                    try:
+                        relative = child.relative_to(self.output_root)
+                    except ValueError:
+                        continue
+                    if len(relative.parts) == 4:
+                        records.append(child)
+        records.sort(key=lambda path: path.as_posix())
+        diagnostics.sort(key=lambda item: item["path"])
+        return tuple(records), tuple(diagnostics)
+
+    @staticmethod
+    def _legacy_relative_reference(value: Any, *, description: str) -> Path:
+        if type(value) is not str or not value.strip():
+            raise ValueError(f"{description} artifact path must be non-empty text")
+        text = value.strip()
+        posix = PurePosixPath(text)
+        windows = PureWindowsPath(text)
+        if ".." in posix.parts or ".." in windows.parts:
+            raise ValueError(f"{description} artifact path contains traversal")
+        if windows.drive and not windows.is_absolute():
+            raise ValueError(f"{description} artifact path is drive-relative")
+        absolute = Path(text).is_absolute() or posix.is_absolute() or windows.is_absolute()
+        if absolute:
+            name = windows.name if windows.is_absolute() or "\\" in text else posix.name
+            relative = Path(name)
+        else:
+            relative = Path(*PurePosixPath(text.replace("\\", "/")).parts)
+        if (
+            relative.is_absolute()
+            or relative.drive
+            or not relative.parts
+            or relative == Path(".")
+            or ".." in relative.parts
+        ):
+            raise ValueError(f"{description} artifact path is unsafe")
+        return relative
+
+    def _validate_legacy_record(
+        self,
+        record_path: Path,
+        document: Any,
+    ) -> tuple[dict[str, Any], datetime]:
+        if not isinstance(document, dict):
+            raise ValueError("legacy operation record must be a JSON object")
+        required = {"timestamp", "command", "config", "inputs", "software", "outputs"}
+        missing = sorted(required - document.keys())
+        if missing:
+            raise ValueError(
+                "legacy operation record is missing required fields: " + ", ".join(missing)
+            )
+        self._assert_contained(record_path, description="legacy operation record")
+        if _is_redirected_path(record_path) or not record_path.is_file():
+            raise ValueError("legacy operation record must be a regular file")
+
+        created_at, parsed_created_at = _normalise_created_at(document["timestamp"])
+        command = document["command"]
+        if not isinstance(command, list) or not all(type(item) is str for item in command):
+            raise ValueError("legacy operation command must be an array of strings")
+        config = document["config"]
+        if not isinstance(config, Mapping):
+            raise ValueError("legacy operation config must be a JSON object")
+        inputs = document["inputs"]
+        if not isinstance(inputs, list) or not all(
+            isinstance(item, Mapping) for item in inputs
+        ):
+            raise ValueError("legacy operation inputs must be an array of objects")
+        software = document["software"]
+        if not isinstance(software, Mapping):
+            raise ValueError("legacy operation software must be a JSON object")
+        outputs = document["outputs"]
+        if not isinstance(outputs, list):
+            raise ValueError("legacy operation outputs must be a JSON array")
+        source_record = document.get("source_record")
+        if source_record == "run.json":
+            authoritative_record = record_path.parent / "run.json"
+            self._assert_contained(
+                authoritative_record,
+                description="authoritative run record",
+            )
+            if (
+                _is_redirected_path(authoritative_record)
+                or not authoritative_record.is_file()
+            ):
+                raise ValueError(
+                    "compatibility operation record is missing authoritative run.json"
+                )
+            authoritative_document = json.loads(
+                authoritative_record.read_text(encoding="utf-8")
+            )
+            if not isinstance(authoritative_document, dict):
+                raise ValueError("authoritative run.json must be a JSON object")
+            compatibility_run_id = _safe_run_id(document.get("run_id"))
+            authoritative_run_id = _safe_run_id(authoritative_document.get("run_id"))
+            if compatibility_run_id != authoritative_run_id:
+                raise ValueError(
+                    "compatibility operation run_id does not match authoritative run.json"
+                )
+
+        references: list[Path] = []
+        if record_path.name.casefold() == "run-generate-figures.json":
+            local_source: Any = None
+            if document.get("source_record") == "run.json":
+                configured_source = config.get("source")
+                if isinstance(configured_source, Mapping):
+                    local_source = configured_source.get("artifact")
+            if (
+                type(local_source) is str
+                and PureWindowsPath(local_source).suffix.casefold() == ".csv"
+            ):
+                references.append(
+                    self._legacy_relative_reference(
+                        local_source,
+                        description="compatibility source CSV",
+                    )
+                )
+            else:
+                for item in inputs:
+                    input_path = item.get("path")
+                    if type(input_path) is str and (
+                        PureWindowsPath(input_path).suffix.casefold() == ".csv"
+                        or PurePosixPath(input_path).suffix.casefold() == ".csv"
+                    ):
+                        references.append(
+                            self._legacy_relative_reference(
+                                input_path,
+                                description="legacy input CSV",
+                            )
+                        )
+        references.extend(
+            self._legacy_relative_reference(value, description="legacy output")
+            for value in outputs
+        )
+        unique_references: list[Path] = []
+        seen_references: set[str] = set()
+        for reference in references:
+            identity = reference.as_posix().casefold()
+            if identity in seen_references:
+                continue
+            seen_references.add(identity)
+            unique_references.append(reference)
+        artifacts = self._artifact_paths(record_path.parent, unique_references)
+
+        explicit_run_id = document.get("run_id")
+        if explicit_run_id is None:
+            canonical = json.dumps(
+                document,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            record_identity = os.path.normcase(
+                os.path.normpath(str(record_path.resolve(strict=True)))
+            )
+            run_id = hashlib.sha256(
+                f"{record_identity}\0{canonical}".encode()
+            ).hexdigest()[:32]
+        else:
+            run_id = _safe_run_id(explicit_run_id)
+        status = document.get("status", "completed")
+        if status not in self.VALID_STATUSES:
+            raise ValueError(f"invalid legacy run status: {status!r}")
+        errors = document.get("errors", [])
+        if not isinstance(errors, list):
+            raise ValueError("legacy operation errors must be a JSON array")
+        parent_run_id = document.get("parent_run_id")
+        if parent_run_id is not None:
+            parent_run_id = _safe_run_id(parent_run_id, field="parent_run_id")
+
+        scenario_id = _legacy_slug(
+            config.get("scenario_id", config.get("city_name")),
+            fallback="legacy",
+        )
+        profile_id = _legacy_slug(
+            config.get("profile_id", config.get("experiment_name")),
+            fallback="legacy-profile",
+        )
+        run_kind = (
+            "figure"
+            if record_path.name.casefold() == "run-generate-figures.json"
+            else "selection"
+        )
+        metadata: dict[str, Any] = {
+            "run_kind": run_kind,
+            "entrypoint": list(command),
+            "git_commit": document.get("git_commit"),
+            "software_versions": dict(software),
+            "inputs": [dict(item) for item in inputs],
+            "parameters": dict(config),
+            "legacy_record": {
+                "filename": record_path.name,
+                "path": record_path.relative_to(self.output_root).as_posix(),
+                "source_record": document.get("source_record"),
+            },
+        }
+        csv_artifacts = [
+            artifact for artifact in artifacts if Path(artifact).suffix.casefold() == ".csv"
+        ]
+        if len(csv_artifacts) == 1:
+            csv_artifact = csv_artifacts[0]
+            metadata["source"] = {
+                "kind": "legacy-csv",
+                "artifact": csv_artifact,
+                "path": str((record_path.parent / csv_artifact).resolve(strict=True)),
+            }
+        for source_field, target_field in (
+            ("target_crs", "target_crs"),
+            ("rect_size", "rectangle_size_m"),
+            ("rectangle_size_m", "rectangle_size_m"),
+            ("figure_spec", "figure_spec"),
+        ):
+            if source_field in config:
+                metadata[target_field] = config[source_field]
+
+        record = {
+            "run_id": run_id,
+            "scenario_id": scenario_id,
+            "profile_id": profile_id,
+            "created_at": created_at,
+            "parent_run_id": parent_run_id,
+            "status": status,
+            "artifacts": artifacts,
+            "metadata": metadata,
+            "errors": list(errors),
+        }
+        return record, parsed_created_at
 
     def _validate_discovered_record(
         self,
@@ -530,7 +907,7 @@ class RunService:
 
         final_path = record_path.parent
         self._assert_contained(record_path, description="run record")
-        if record_path.is_symlink() or not record_path.is_file():
+        if _is_redirected_path(record_path) or not record_path.is_file():
             raise ValueError("run record must be a regular file")
         expected_staging, expected_final = self._expected_paths(
             scenario_id=scenario_id,
@@ -556,20 +933,22 @@ class RunService:
             return RunEntryDiscovery(entries=(), diagnostics=())
 
         entries: list[tuple[datetime, RunEntry]] = []
-        diagnostics: list[dict[str, Any]] = []
-        candidates = sorted(
-            self.output_root.glob("*/*/*/run.json"),
-            key=lambda path: path.as_posix(),
-        )
+        candidates, traversal_diagnostics = self._record_candidates()
+        diagnostics: list[dict[str, Any]] = list(traversal_diagnostics)
         for record_path in candidates:
             if record_path.parent.name.startswith(".staging-"):
                 continue
             try:
+                self._assert_contained(record_path, description="run record")
+                if _is_redirected_path(record_path) or not record_path.is_file():
+                    raise ValueError("run record must be a regular file")
                 document = json.loads(record_path.read_text(encoding="utf-8"))
-                record, parsed_created_at = self._validate_discovered_record(
-                    record_path,
-                    document,
+                validator = (
+                    self._validate_legacy_record
+                    if record_path.name.casefold() in _LEGACY_RECORD_NAMES
+                    else self._validate_discovered_record
                 )
+                record, parsed_created_at = validator(record_path, document)
             except Exception as exc:
                 diagnostics.append(
                     {
@@ -605,16 +984,23 @@ class RunService:
             diagnostics=discovered.diagnostics,
         )
 
-    def entry_for_path(self, path: str | os.PathLike[str]) -> RunEntry:
-        """Re-discover and resolve exactly one live run directory by path."""
+    def entry_for_path(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        run_id: str | None = None,
+    ) -> RunEntry:
+        """Re-discover one live run by path, optionally disambiguated by ID."""
 
         if not isinstance(path, (str, os.PathLike)):
             raise ValueError("run path must be path-like")
         candidate = Path(path).expanduser()
         if not candidate.is_absolute():
             raise ValueError("run path must be absolute")
-        if candidate.is_symlink():
-            raise ValueError("run path must not be a symlink")
+        self._assert_contained(candidate, description="run path")
+        if _is_redirected_path(candidate):
+            raise ValueError("run path must not be redirected")
+        expected_run_id = None if run_id is None else _safe_run_id(run_id)
         resolved = candidate.resolve(strict=False)
         try:
             resolved.relative_to(self.output_root)
@@ -624,9 +1010,12 @@ class RunService:
             entry
             for entry in self.discover_entries().entries
             if entry.run_dir == resolved
+            and (expected_run_id is None or entry.run_id == expected_run_id)
         ]
-        if len(matches) != 1:
+        if not matches:
             raise ValueError("run path is not one currently available valid run")
+        if len(matches) != 1:
+            raise ValueError("run path is ambiguous; provide one unique run_id")
         return matches[0]
 
     @staticmethod
@@ -702,7 +1091,7 @@ class RunService:
     def _exact_source_files(run_directory: Path) -> tuple[Path, ...]:
         files: list[Path] = []
         for source in sorted(run_directory.iterdir(), key=lambda path: path.name):
-            if source.is_symlink() or not source.is_file():
+            if _is_redirected_path(source) or not source.is_file():
                 raise ValueError(
                     "exact-directory publication supports regular run files only: "
                     f"{source}"
@@ -816,8 +1205,9 @@ class RunService:
         raw_target = Path(exact_directory).expanduser()
         if not raw_target.is_absolute():
             raise ValueError("exact output directory must be absolute")
-        if raw_target.is_symlink():
-            raise ValueError("exact output directory must not be a symlink")
+        _assert_unredirected_chain(raw_target, description="exact output directory")
+        if _is_redirected_path(raw_target):
+            raise ValueError("exact output directory must not be redirected")
         target = raw_target.resolve(strict=False)
         if target != self.output_root:
             raise ValueError(
@@ -847,7 +1237,11 @@ class RunService:
 
         original_sources = self._exact_source_files(source_directory)
         original_names = tuple(path.name for path in original_sources)
-        if compatibility_name is not None and compatibility_name in original_names:
+        original_identities = {name.casefold() for name in original_names}
+        if (
+            compatibility_name is not None
+            and compatibility_name.casefold() in original_identities
+        ):
             raise FileExistsError(
                 f"compatibility record already exists in published run: "
                 f"{compatibility_name}"
@@ -856,17 +1250,26 @@ class RunService:
             *original_names,
             *((compatibility_name,) if compatibility_name else ()),
         )
+        if len({name.casefold() for name in planned_names}) != len(planned_names):
+            raise FileExistsError(
+                "exact publication has case-insensitive filename conflicts"
+            )
 
         def conflicts() -> tuple[Path, ...]:
             values = []
+            existing = {
+                child.name.casefold(): child
+                for child in target.iterdir()
+            }
             for name in planned_names:
                 destination = target / name
                 self._assert_contained(
                     destination,
                     description="exact publication destination",
                 )
-                if os.path.lexists(destination):
-                    values.append(destination)
+                conflict = existing.get(name.casefold())
+                if conflict is not None or os.path.lexists(destination):
+                    values.append(conflict or destination)
             return tuple(values)
 
         initial_conflicts = conflicts()

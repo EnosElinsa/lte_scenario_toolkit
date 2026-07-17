@@ -1,0 +1,30 @@
+experiment:
+  name: legacy_chicago_2400m_target24
+  random_seed: 17
+
+inputs:
+  points_root: points_shp
+  points_layer: USA_Clear_LTE_Base_Station
+  boundary_root: boundary_shp
+  city: Chicago
+  dem_path: dem/Chicago/elevation.tif
+
+spatial:
+  target_crs: EPSG:3857
+  rectangle_size_m: 2400
+  target_base_station_count: 24
+  count_tolerance: 2
+
+scan:
+  strategy: sequential
+  step_m: 30
+  max_rectangles: 12
+  minimum_center_spacing_m: 1800
+
+outputs:
+  root: results/legacy_chicago
+  save_csv: true
+  save_preview_png: false
+  save_terrain_png: true
+  save_terrain_eps: false
+  save_terrain_html: true

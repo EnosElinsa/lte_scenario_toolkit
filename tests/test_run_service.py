@@ -1,15 +1,20 @@
 import errno
 import json
 import os
+import re
+import stat
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import lte_scenario_toolkit.run_service as run_module
 from lte_scenario_toolkit.run_service import RunEntry, RunService, StagingRun
 
 CREATED_AT = "2026-07-16T10:00:00Z"
+LEGACY_FIXTURES = Path(__file__).parent / "fixtures" / "legacy"
 
 
 def _write_artifact(run: StagingRun, name: str = "scenario.csv") -> Path:
@@ -80,6 +85,18 @@ def _symlink_or_skip(link: Path, target: Path, *, directory: bool = False) -> No
         link.symlink_to(target, target_is_directory=directory)
     except OSError as exc:
         pytest.skip(f"symlink creation is unavailable: {exc}")
+
+
+def _legacy_directory(root: Path, name: str, record_name: str) -> Path:
+    directory = root / name
+    directory.mkdir(parents=True)
+    for fixture_name in (record_name, "scenario.csv"):
+        (directory / fixture_name).write_bytes(
+            (LEGACY_FIXTURES / fixture_name).read_bytes()
+        )
+    if record_name == "run-generate-figures.json":
+        (directory / "terrain.png").write_bytes(b"legacy terrain fixture\n")
+    return directory
 
 
 def test_begin_publish_writes_completed_run_record_and_atomically_moves_directory(
@@ -294,7 +311,12 @@ def test_figure_exact_compatibility_record_keeps_cli_provenance_and_figure_outpu
     _write_artifact(run, "source.csv")
     _write_artifact(run, "terrain.png")
     figure_spec = {"preset": "publication", "dpi": 300}
-    source = {"kind": "run", "path": "selection-run", "run_id": "a" * 32}
+    source = {
+        "kind": "run",
+        "artifact": "source.csv",
+        "path": "selection-run",
+        "run_id": "a" * 32,
+    }
     final = service.publish(
         run,
         status="completed",
@@ -333,6 +355,12 @@ def test_figure_exact_compatibility_record_keeps_cli_provenance_and_figure_outpu
     assert compatibility["config"]["source"] == source
     assert compatibility["config"]["target_crs"] == "EPSG:3857"
     assert compatibility["config"]["rectangle_size_m"] == 1000
+    discovery = service.discover_entries()
+    assert discovery.diagnostics == ()
+    assert len(discovery.entries) == 1
+    relocated_entry = discovery.entries[0]
+    assert relocated_entry.run_id == run.run_id
+    assert relocated_entry.record["artifacts"] == ("source.csv", "terrain.png")
 
 
 def test_relocate_to_exact_directory_rejects_all_conflicts_before_writing(tmp_path):
@@ -360,6 +388,34 @@ def test_relocate_to_exact_directory_rejects_all_conflicts_before_writing(tmp_pa
     assert not (exact / "run-select-sites.json").exists()
     assert service.entry_for_path(final).run_id == run.run_id
     assert not (final / "run-select-sites.json").exists()
+
+
+def test_exact_relocation_rejects_casefolded_compatibility_artifact_collision(
+    tmp_path,
+):
+    exact = tmp_path / "exact"
+    service = RunService(exact)
+    run = _begin_with_artifact(service)
+    conflicting = run.path / "RUN-SELECT-SITES.JSON"
+    conflicting.write_text("user-owned compatibility artifact\n", encoding="utf-8")
+    final = service.publish(
+        run,
+        status="completed",
+        artifacts=["scenario.csv", "RUN-SELECT-SITES.JSON"],
+    )
+
+    with pytest.raises(FileExistsError, match="compatibility|conflict"):
+        service.relocate_to_exact_directory(
+            final,
+            exact,
+            compatibility_record="run-select-sites.json",
+        )
+
+    assert (final / "RUN-SELECT-SITES.JSON").read_text(encoding="utf-8") == (
+        "user-owned compatibility artifact\n"
+    )
+    assert not (exact / "run-select-sites.json").exists()
+    assert not (exact / "RUN-SELECT-SITES.JSON").exists()
 
 
 def test_relocate_to_exact_directory_rolls_back_when_manifest_move_fails(
@@ -873,6 +929,204 @@ def test_discover_reports_bad_records_and_keeps_valid_history_unchanged(tmp_path
     )
     assert all(item["error"] for item in discovered.diagnostics)
     assert {path: path.read_bytes() for path in all_records} == before
+
+
+def test_legacy_operation_fixtures_normalize_to_stable_immutable_run_entries(
+    tmp_path,
+):
+    root = tmp_path / "results"
+    selection_dir = _legacy_directory(
+        root,
+        "legacy-selection",
+        "run-select-sites.json",
+    )
+    figure_dir = _legacy_directory(
+        root,
+        "legacy-figure",
+        "run-generate-figures.json",
+    )
+    protected = {
+        path: path.read_bytes()
+        for directory in (selection_dir, figure_dir)
+        for path in directory.iterdir()
+    }
+    service = RunService(root)
+
+    first = service.discover_entries()
+    second = service.discover_entries()
+
+    assert first.diagnostics == second.diagnostics == ()
+    assert len(first.entries) == 2
+    assert [entry.record for entry in first.entries] == [
+        entry.record for entry in second.entries
+    ]
+    by_kind = {
+        entry.record["metadata"]["run_kind"]: entry for entry in first.entries
+    }
+    selection = by_kind["selection"]
+    figure = by_kind["figure"]
+    assert re.fullmatch(r"[0-9a-f]{32}", selection.run_id)
+    assert re.fullmatch(r"[0-9a-f]{32}", figure.run_id)
+    assert selection.record["created_at"] == "2025-06-01T02:00:00Z"
+    assert figure.record["created_at"] == "2025-06-01T02:05:00Z"
+    assert selection.record["status"] == figure.record["status"] == "completed"
+    assert selection.record["artifacts"] == ("scenario.csv",)
+    assert figure.record["artifacts"] == ("scenario.csv", "terrain.png")
+    assert selection.record["metadata"]["source"] == {
+        "kind": "legacy-csv",
+        "artifact": "scenario.csv",
+        "path": str((selection_dir / "scenario.csv").resolve()),
+    }
+    assert figure.record["metadata"]["source"] == {
+        "kind": "legacy-csv",
+        "artifact": "scenario.csv",
+        "path": str((figure_dir / "scenario.csv").resolve()),
+    }
+    assert selection.record["metadata"]["legacy_record"]["filename"] == (
+        "run-select-sites.json"
+    )
+    assert service.entry_for_path(selection_dir) == selection
+    assert service.entry_for_path(figure_dir) == figure
+    with pytest.raises(TypeError):
+        selection.record["status"] = "partial"
+    with pytest.raises(TypeError):
+        selection.record["metadata"]["source"]["kind"] = "changed"
+    assert {path: path.read_bytes() for path in protected} == protected
+
+
+@pytest.mark.parametrize(
+    "output",
+    ["../outside.csv", "ABSOLUTE_OUTSIDE"],
+)
+def test_legacy_operation_record_rejects_artifact_traversal_without_reading_outside(
+    tmp_path,
+    output,
+):
+    root = tmp_path / "results"
+    directory = root / "legacy"
+    directory.mkdir(parents=True)
+    outside = tmp_path / "outside.csv"
+    outside.write_text("outside owner\n", encoding="utf-8")
+    document = json.loads(
+        (LEGACY_FIXTURES / "run-select-sites.json").read_text(encoding="utf-8")
+    )
+    document["outputs"] = [str(outside) if output == "ABSOLUTE_OUTSIDE" else output]
+    record_path = directory / "run-select-sites.json"
+    record_path.write_text(json.dumps(document) + "\n", encoding="utf-8")
+    before = record_path.read_bytes()
+
+    discovery = RunService(root).discover_entries()
+
+    assert discovery.entries == ()
+    assert len(discovery.diagnostics) == 1
+    assert discovery.diagnostics[0]["path"] == str(record_path)
+    assert "artifact" in discovery.diagnostics[0]["error"].lower()
+    assert record_path.read_bytes() == before
+    assert outside.read_text(encoding="utf-8") == "outside owner\n"
+
+
+@pytest.mark.parametrize("kind", ["junction", "reparse"])
+def test_redirected_path_detector_covers_junctions_and_reparse_points(
+    monkeypatch,
+    kind,
+):
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    monkeypatch.setattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", reparse_flag, raising=False)
+
+    class FakePath:
+        def is_symlink(self):
+            return False
+
+        def is_junction(self):
+            return kind == "junction"
+
+        def lstat(self):
+            attributes = reparse_flag if kind == "reparse" else 0
+            return SimpleNamespace(st_file_attributes=attributes)
+
+    assert run_module._is_redirected_path(FakePath()) is True
+
+
+def test_entry_and_run_entry_reject_lexical_traversal_alias(tmp_path):
+    service = RunService(tmp_path / "results")
+    run = _begin_with_artifact(service)
+    final = service.publish(run, status="completed", artifacts=["scenario.csv"])
+    alias_parent = final.parent / "alias-parent"
+    alias_parent.mkdir()
+    alias = alias_parent / ".." / final.name
+    record = json.loads((final / "run.json").read_text(encoding="utf-8"))
+
+    with pytest.raises(ValueError, match="traversal|redirected|path"):
+        service.entry_for_path(alias)
+    with pytest.raises(ValueError, match="traversal|redirected|path"):
+        RunEntry(root=service.output_root, run_dir=alias, record=record)
+
+
+def test_artifact_rejects_redirected_ancestor_chain(tmp_path, monkeypatch):
+    service = RunService(tmp_path / "results")
+    run = service.begin("chicago", "default", created_at=CREATED_AT)
+    artifact = _write_artifact(run, "nested/scenario.csv")
+    redirected = artifact.parent
+    original = run_module._is_redirected_path
+    monkeypatch.setattr(
+        run_module,
+        "_is_redirected_path",
+        lambda path: Path(path) == redirected or original(Path(path)),
+    )
+
+    with pytest.raises(ValueError, match="redirected|artifact|path"):
+        service.publish(
+            run,
+            status="completed",
+            artifacts=["nested/scenario.csv"],
+        )
+
+    assert artifact.is_file()
+
+
+def test_entry_for_path_rejects_redirected_ancestor_chain(tmp_path, monkeypatch):
+    service = RunService(tmp_path / "results")
+    run = _begin_with_artifact(service)
+    final = service.publish(run, status="completed", artifacts=["scenario.csv"])
+    redirected = final.parent.parent
+    original = run_module._is_redirected_path
+    monkeypatch.setattr(
+        run_module,
+        "_is_redirected_path",
+        lambda path: Path(path) == redirected or original(Path(path)),
+    )
+
+    with pytest.raises(ValueError, match="redirected|run path|path"):
+        service.entry_for_path(final)
+
+
+@pytest.mark.parametrize("redirected_part", ["target", "source"])
+def test_exact_relocation_rejects_junction_or_reparse_path_chain(
+    tmp_path,
+    monkeypatch,
+    redirected_part,
+):
+    exact = tmp_path / "exact"
+    service = RunService(exact)
+    run = _begin_with_artifact(service)
+    final = service.publish(run, status="completed", artifacts=["scenario.csv"])
+    redirected = exact.resolve() if redirected_part == "target" else final.parent.parent
+    original = run_module._is_redirected_path
+    monkeypatch.setattr(
+        run_module,
+        "_is_redirected_path",
+        lambda path: Path(path) == redirected or original(Path(path)),
+    )
+
+    with pytest.raises(ValueError, match="redirected|exact|run path|path"):
+        service.relocate_to_exact_directory(
+            final,
+            exact,
+            compatibility_record="run-select-sites.json",
+        )
+
+    assert final.is_dir()
+    assert not (exact / "scenario.csv").exists()
 
 
 def test_begin_normalizes_aware_times_to_utc_and_defaults_to_utc_z(tmp_path):

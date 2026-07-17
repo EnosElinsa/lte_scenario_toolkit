@@ -480,7 +480,10 @@ class FigureController:
         if source.source_kind == "run" and source.path is not None and source.run_id:
             try:
                 inferred = source.path.parents[2]
-                entry = RunService(inferred).entry_for_path(source.path)
+                entry = RunService(inferred).entry_for_path(
+                    source.path,
+                    run_id=source.run_id,
+                )
             except (IndexError, OSError, ValueError):
                 entry = None
             if entry is not None and entry.run_id == source.run_id:
@@ -497,7 +500,8 @@ class FigureController:
         if parent_run_id is not None and self.parent_run_path is not None:
             try:
                 parent_entry = RunService(output_root).entry_for_path(
-                    self.parent_run_path
+                    self.parent_run_path,
+                    run_id=parent_run_id,
                 )
             except (OSError, ValueError) as exc:
                 raise ValueError(

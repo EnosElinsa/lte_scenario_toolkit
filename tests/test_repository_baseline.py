@@ -1,6 +1,7 @@
 import json
 import py_compile
 import re
+import subprocess
 from pathlib import Path
 
 import geopandas as gpd
@@ -197,6 +198,30 @@ def test_large_and_generated_paths_are_protected():
     assert "dem/**" in ignore_rules
     assert "results/**" in ignore_rules
     assert "runs/**" in ignore_rules
+    assert "docs/superpowers/" in ignore_rules
+    assert ".superpowers/" in ignore_rules
+
+    tracked = subprocess.run(
+        ["git", "ls-files", "--", ".superpowers", "docs/superpowers"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert tracked.stdout == ""
+
+    for ignored_path in (
+        ".superpowers/session.json",
+        "docs/superpowers/plan.md",
+    ):
+        ignored = subprocess.run(
+            ["git", "check-ignore", "--quiet", ignored_path],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert ignored.returncode == 0
 
     attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
     assert "points_shp/**/*.dbf filter=lfs" in attributes

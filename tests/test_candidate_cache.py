@@ -13,8 +13,11 @@ from lte_scenario_toolkit.candidate_cache import (
     CACHE_SCHEMA_VERSION,
     CandidateCache,
     cache_key,
+    legacy_cache_filename,
 )
 from lte_scenario_toolkit.candidate_scanner import Candidate, ScanRequest, ScanResult
+
+LEGACY_FIXTURES = Path(__file__).parent / "fixtures" / "legacy"
 
 
 def make_request(**overrides):
@@ -764,7 +767,7 @@ def test_import_legacy_validates_and_atomically_overwrites_same_key(tmp_path):
         algorithm_version=request.algorithm_version,
     )
     cache.store(key, request, existing)
-    legacy_path = tmp_path / "legacy.json"
+    legacy_path = tmp_path / legacy_cache_filename("FixtureCity", request)
     legacy_path.write_text(json.dumps(legacy, indent=2) + "\n", encoding="utf-8")
     original_legacy = legacy_path.read_bytes()
 
@@ -774,6 +777,7 @@ def test_import_legacy_validates_and_atomically_overwrites_same_key(tmp_path):
         request,
         boundary,
         coordinates,
+        scenario_tag="FixtureCity",
     )
 
     assert imported.candidates == (
@@ -843,7 +847,7 @@ def test_import_legacy_rejects_invalid_content_without_publishing(tmp_path, case
     elif case == "not_list":
         document = {"results": document}
     key = key_for(request)
-    legacy_path = tmp_path / f"legacy-{case}.json"
+    legacy_path = tmp_path / legacy_cache_filename("FixtureCity", request)
     legacy_path.write_text(json.dumps(document), encoding="utf-8")
 
     with pytest.raises(ValueError):
@@ -853,6 +857,134 @@ def test_import_legacy_rejects_invalid_content_without_publishing(tmp_path, case
             request,
             boundary,
             coordinates,
+            scenario_tag="FixtureCity",
+        )
+
+    assert not cache.path_for(key).exists()
+
+
+def test_fixture_legacy_cache_is_revalidated_and_imported_without_rewriting_source(
+    tmp_path,
+):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    cache = CandidateCache(repository)
+    request, boundary, coordinates, _ = _valid_legacy_setup()
+    fixture = LEGACY_FIXTURES / "candidate-cache.json"
+    source = tmp_path / legacy_cache_filename("FixtureCity", request)
+    source.write_bytes(fixture.read_bytes())
+    before = {fixture: fixture.read_bytes(), source: source.read_bytes()}
+
+    imported = cache.import_legacy(
+        source,
+        key_for(request),
+        request,
+        boundary,
+        coordinates,
+        scenario_tag="FixtureCity",
+    )
+
+    assert imported.candidates == (
+        Candidate(5, 2, 1.0, 1.0, 2.0, 2.0),
+        Candidate(7, 2, 5.0, 1.0, 6.0, 2.0),
+    )
+    assert {path: path.read_bytes() for path in before} == before
+    assert cache.load(key_for(request), request) == imported
+
+
+def test_import_legacy_rejects_filename_that_does_not_match_effective_request(
+    tmp_path,
+):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    cache = CandidateCache(repository)
+    request, boundary, coordinates, _ = _valid_legacy_setup()
+    source = tmp_path / f"wrong-{legacy_cache_filename('FixtureCity', request)}"
+    source.write_bytes((LEGACY_FIXTURES / "candidate-cache.json").read_bytes())
+    key = key_for(request)
+
+    with pytest.raises(ValueError, match="filename|effective configuration"):
+        cache.import_legacy(
+            source,
+            key,
+            request,
+            boundary,
+            coordinates,
+            scenario_tag="FixtureCity",
+        )
+
+    assert not cache.path_for(key).exists()
+
+
+def test_import_legacy_reconstructs_grid_origins_from_two_decimal_serialization(
+    tmp_path,
+):
+    request = make_request(
+        rectangle_size=2,
+        target_count=2,
+        tolerance=0,
+        step=2,
+        max_candidates=2,
+        minimum_spacing=3,
+    )
+    boundary = box(0.003, 0.003, 10.003, 10.003)
+    coordinates = np.asarray(
+        [[2.5, 2.5], [3.5, 3.5], [6.5, 2.5], [7.5, 3.5]],
+        dtype=float,
+    )
+    legacy = [
+        {
+            "left_x": 2.0,
+            "bottom_y": 2.0,
+            "center_x": 3.0,
+            "center_y": 3.0,
+            "pt_count": 2,
+        },
+        {
+            "left_x": 6.0,
+            "bottom_y": 2.0,
+            "center_x": 7.0,
+            "center_y": 3.0,
+            "pt_count": 2,
+        },
+    ]
+    source = tmp_path / legacy_cache_filename("FractionalCity", request)
+    source.write_text(json.dumps(legacy), encoding="utf-8")
+    key = key_for(request)
+    cache = CandidateCache(tmp_path)
+
+    imported = cache.import_legacy(
+        source,
+        key,
+        request,
+        boundary,
+        coordinates,
+        scenario_tag="FractionalCity",
+    )
+
+    assert imported.candidates == (
+        Candidate(5, 2, 2.003, 2.003, 3.003, 3.003),
+        Candidate(7, 2, 6.003, 2.003, 7.003, 3.003),
+    )
+    assert cache.load(key, request) == imported
+
+
+def test_import_legacy_rejects_complete_mode_without_coverage_metadata(tmp_path):
+    request, boundary, coordinates, legacy = _valid_legacy_setup()
+    request = replace(request, mode="complete")
+    source = tmp_path / legacy_cache_filename("FixtureCity", request)
+    source.write_text(json.dumps(legacy), encoding="utf-8")
+    key = key_for(request)
+    cache = CandidateCache(tmp_path)
+
+    with pytest.raises(ValueError, match="complete|coverage|legacy"):
+        cache.import_legacy(
+            source,
+            key,
+            request,
+            boundary,
+            coordinates,
+            scenario_tag="FixtureCity",
         )
 
     assert not cache.path_for(key).exists()

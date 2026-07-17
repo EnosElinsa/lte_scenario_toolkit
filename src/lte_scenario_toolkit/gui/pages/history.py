@@ -176,6 +176,52 @@ def _mapping_field(metadata: Mapping[str, Any], name: str) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
+def _figure_source_path(path: Path, record: Mapping[str, Any]) -> Path:
+    """Resolve legacy normalized records to their one local CSV artifact."""
+
+    metadata_value = record.get("metadata", {})
+    metadata = metadata_value if isinstance(metadata_value, Mapping) else {}
+    legacy_value = metadata.get("legacy_record")
+    legacy = legacy_value if isinstance(legacy_value, Mapping) else None
+    if legacy is None:
+        return path
+    if legacy.get("source_record") == "run.json":
+        manifest = path / "run.json"
+        if manifest.is_symlink() or not manifest.is_file():
+            raise ValueError("exact modern history run is missing its authoritative run.json")
+        if manifest.resolve(strict=True) != manifest:
+            raise ValueError("exact modern history run.json must not be redirected")
+        document = json.loads(manifest.read_text(encoding="utf-8"))
+        if not isinstance(document, Mapping) or document.get("run_id") != record.get(
+            "run_id"
+        ):
+            raise ValueError("exact modern history run.json identity changed")
+        return path
+    artifacts_value = record.get("artifacts", ())
+    artifacts = (
+        tuple(item for item in artifacts_value if type(item) is str)
+        if isinstance(artifacts_value, (list, tuple))
+        else ()
+    )
+    csv_artifacts = tuple(
+        artifact for artifact in artifacts if Path(artifact).suffix.casefold() == ".csv"
+    )
+    if len(csv_artifacts) != 1:
+        raise ValueError("legacy history run must expose exactly one CSV artifact")
+    relative = Path(csv_artifacts[0])
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("legacy history CSV artifact path is unsafe")
+    candidate = path / relative
+    if candidate.is_symlink() or not candidate.is_file():
+        raise ValueError("legacy history CSV artifact is not a regular file")
+    resolved = candidate.resolve(strict=True)
+    try:
+        resolved.relative_to(path)
+    except ValueError as exc:
+        raise ValueError("legacy history CSV artifact escapes its run") from exc
+    return resolved
+
+
 def _requested_and_missing(
     metadata: Mapping[str, Any],
     artifacts: Iterable[str],
@@ -221,7 +267,7 @@ def _retry_figure_spec(
     if run_kind not in {"figure", "selection"}:
         return None
     value = metadata.get("figure_spec")
-    if value is None and run_kind == "selection" and not required:
+    if value is None and not required:
         return None
     if not isinstance(value, Mapping):
         raise HistoryActionError("Figure run is missing a retryable style specification")
@@ -258,6 +304,7 @@ def _row_from_entry(entry: RunEntry) -> HistoryRow:
     )
     _, missing = _requested_and_missing(metadata, artifacts)
     has_csv = any(Path(artifact).suffix.casefold() == ".csv" for artifact in artifacts)
+    source_path = _figure_source_path(path, record) if has_csv else None
     retry_formats = _retry_formats(metadata, missing)
     if retry_formats:
         try:
@@ -281,7 +328,7 @@ def _row_from_entry(entry: RunEntry) -> HistoryRow:
         record=_freeze(record),
         reference=reference,
         figure_source_reference=reference if has_csv else None,
-        figure_source_path=path if has_csv else None,
+        figure_source_path=source_path,
         missing_artifacts=missing,
         retry_formats=retry_formats,
     )
@@ -352,11 +399,24 @@ def _link_figure_sources(rows: Iterable[HistoryRow]) -> tuple[HistoryRow, ...]:
     linked = []
     for row in values:
         source = source_for(row, frozenset())
+        source_row = (
+            None
+            if source is None
+            else by_identity.get((_path_identity(source.root), source.run_id))
+        )
         linked.append(
             replace(
                 row,
                 figure_source_reference=source,
-                figure_source_path=None if source is None else source.expected_path,
+                figure_source_path=(
+                    None
+                    if source is None
+                    else (
+                        source_row.figure_source_path
+                        if source_row is not None
+                        else source.expected_path
+                    )
+                ),
             )
         )
     return tuple(linked)
@@ -413,14 +473,14 @@ def history_roots(
 ) -> tuple[Path, ...]:
     """Return the repository results root plus canonical, de-duplicated GUI roots."""
 
-    repository = _canonical_root(repo_root)
+    repository = RunService(repo_root).output_root
     if isinstance(output_roots, (str, bytes, os.PathLike)):
         raise ValueError("history output roots must be a path collection")
     candidates = [repository / "results", *list(output_roots)]
     unique: list[Path] = []
     seen: set[str] = set()
     for value in candidates:
-        root = _canonical_root(value)
+        root = RunService(value).output_root
         identity = _path_identity(root)
         if identity in seen:
             continue
@@ -525,7 +585,7 @@ def rebuild_history(
             continue
         diagnostics.extend(discovered_diagnostics)
         for row in discovered_rows:
-            identity = (_path_identity(row.root), row.run_id)
+            identity = (_path_identity(row.path), row.run_id)
             if identity in seen:
                 continue
             seen.add(identity)
@@ -653,6 +713,12 @@ def resolve_history_action(
             path, record = clicked_path, clicked_record
         else:
             path, record = resolve_history_reference(reference)
+        try:
+            path = _figure_source_path(path, record)
+        except ValueError as exc:
+            raise HistoryActionError(
+                "This run no longer has one safe compatible figure source"
+            ) from exc
     else:
         reference = row.reference
         path, record = clicked_path, clicked_record

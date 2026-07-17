@@ -19,6 +19,9 @@ Thumbs.db
 # Local development process documents
 docs/superpowers/
 
+# Local visual design sessions
+.superpowers/
+
 # Secrets and local environment
 .env
 .env.*

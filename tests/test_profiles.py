@@ -2,6 +2,7 @@ import os
 import re
 from copy import deepcopy
 from dataclasses import replace
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,8 @@ from lte_scenario_toolkit.profiles import (
     dump_profile,
     load_profile,
 )
+
+LEGACY_FIXTURES = Path(__file__).parent / "fixtures" / "legacy"
 
 
 def write_profile(path: Path, *, profile_id: str = "chicago-default") -> None:
@@ -107,6 +110,296 @@ def test_load_profile_maps_schema_version_2_to_runtime_values(tmp_path):
         "save_terrain_html": True,
         "config_path": profile_path.resolve(),
     }
+
+
+def test_legacy_profile_conversion_preserves_effective_values_and_source(tmp_path):
+    source = LEGACY_FIXTURES / "experiment-v1.yaml"
+    original = source.read_bytes()
+
+    legacy = profiles_module.load_legacy_profile(source, repo_root=tmp_path)
+
+    with pytest.raises(TypeError):
+        legacy["rect_size"] = 1
+    assert legacy.source_path == source.resolve()
+    assert legacy.source_sha256 == sha256(original).hexdigest()
+    assert legacy.source_revision == f"sha256:{sha256(original).hexdigest()}"
+    converted = profiles_module.convert_legacy_profile(
+        legacy,
+        profile_id="legacy",
+        scenario_id="chicago",
+        points_dataset_id="points",
+    )
+
+    assert converted is profiles_module.validate_profile(converted)
+    assert converted.display_name == "legacy_chicago_2400m_target24"
+    assert converted.random_seed == legacy["random_seed"] == 17
+    assert converted.target_crs == legacy["target_crs"] == "EPSG:3857"
+    assert converted.rect_size == legacy["rect_size"] == 2400
+    assert converted.target_count == legacy["target_count"] == 24
+    assert converted.tolerance == legacy["tolerance"] == 2
+    assert converted.scan_mode == DEFAULT_PROFILE_VALUES["scan_mode"]
+    assert converted.strategy == legacy["strategy"] == "sequential"
+    assert converted.scan_step == legacy["scan_step"] == 30
+    assert converted.max_rects == legacy["max_rects"] == 12
+    assert converted.min_spacing == legacy["min_spacing"] == 1800
+    assert converted.output_root == legacy["output_root"]
+    assert converted.outputs == OutputSettings(
+        save_csv=True,
+        save_preview_png=False,
+        save_terrain_png=True,
+        save_terrain_eps=False,
+        save_terrain_html=True,
+    )
+    assert converted.source_path == source.resolve()
+    assert converted.is_legacy_preview is False
+    assert converted.legacy_source is None
+    assert source.read_bytes() == original
+
+
+def test_explicit_legacy_save_writes_v2_without_rewriting_source(
+    profile_repository,
+):
+    repo_root, catalog_path = profile_repository
+    source = LEGACY_FIXTURES / "experiment-v1.yaml"
+    original = source.read_bytes()
+    legacy = profiles_module.load_legacy_profile(source, repo_root=repo_root)
+    converted = profiles_module.convert_legacy_profile(
+        legacy,
+        profile_id="legacy",
+        scenario_id="chicago",
+        points_dataset_id="points",
+    )
+
+    destination = ProfileStore(repo_root, catalog_path).save(
+        converted,
+        set_default=True,
+    )
+
+    assert source.read_bytes() == original
+    assert destination == repo_root / "configs" / "chicago" / "legacy.yaml"
+    document = yaml.safe_load(destination.read_text(encoding="utf-8"))
+    assert document["schema_version"] == 2
+    reloaded = load_profile(destination, repo_root=repo_root)
+    assert reloaded.rect_size == legacy["rect_size"]
+    assert reloaded.target_count == legacy["target_count"]
+    assert reloaded.tolerance == legacy["tolerance"]
+    assert reloaded.scan_step == legacy["scan_step"]
+    assert reloaded.min_spacing == legacy["min_spacing"]
+    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    assert catalog["scenarios"][0]["config_path"] == (
+        "configs/chicago/legacy.yaml"
+    )
+
+
+def test_profile_store_save_closes_catalog_legacy_migration(
+    profile_repository,
+    monkeypatch,
+):
+    repo_root, catalog_path = profile_repository
+    source = repo_root / "configs" / "example.yaml"
+    source.parent.mkdir()
+    source.write_bytes((LEGACY_FIXTURES / "experiment-v1.yaml").read_bytes())
+    original = source.read_bytes()
+    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    catalog["scenarios"][0]["config_path"] = "configs/example.yaml"
+    catalog_path.write_text(
+        yaml.safe_dump(catalog, sort_keys=False),
+        encoding="utf-8",
+    )
+    store = ProfileStore(repo_root, catalog_path)
+    real_convert = profiles_module.convert_legacy_profile
+    conversions = []
+
+    def record_conversion(legacy, **kwargs):
+        conversions.append((legacy, kwargs))
+        return real_convert(legacy, **kwargs)
+
+    monkeypatch.setattr(profiles_module, "convert_legacy_profile", record_conversion)
+    legacy_view = store.discover("chicago")[0]
+
+    assert conversions == []
+    assert legacy_view.is_legacy_preview is True
+    assert legacy_view.legacy_source is not None
+    assert legacy_view.legacy_source.source_path == source.resolve()
+    assert legacy_view.legacy_source.source_sha256 == sha256(original).hexdigest()
+    assert legacy_view.source_path == source.resolve()
+    assert source.read_bytes() == original
+    destination = store.save(legacy_view, overwrite=True)
+
+    assert len(conversions) == 1
+    assert conversions[0][0].source_sha256 == sha256(original).hexdigest()
+    assert destination == repo_root / "configs" / "chicago" / "example.yaml"
+    assert source.read_bytes() == original
+    assert load_profile(destination, repo_root=repo_root).profile_id == "example"
+    migrated_catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    assert migrated_catalog["scenarios"][0]["config_path"] == (
+        "configs/chicago/example.yaml"
+    )
+    discovered = store.discover("chicago")
+    assert [profile.profile_id for profile in discovered] == ["example"]
+    assert discovered[0].source_path == destination.resolve()
+    assert discovered[0].is_legacy_preview is False
+
+
+def test_catalog_legacy_migration_rejects_external_change_since_discovery(
+    profile_repository,
+):
+    repo_root, catalog_path = profile_repository
+    source = repo_root / "configs" / "legacy-default.yaml"
+    source.parent.mkdir()
+    source.write_bytes((LEGACY_FIXTURES / "experiment-v1.yaml").read_bytes())
+    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    catalog["scenarios"][0]["config_path"] = "configs/legacy-default.yaml"
+    catalog_path.write_text(yaml.safe_dump(catalog, sort_keys=False), encoding="utf-8")
+    original_catalog = catalog_path.read_bytes()
+    store = ProfileStore(repo_root, catalog_path)
+    legacy_view = store.discover("chicago")[0]
+    destination = repo_root / "configs" / "chicago" / "legacy-default.yaml"
+
+    source.write_text(
+        source.read_text(encoding="utf-8") + "\n# edited after opening GUI\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConcurrentProfileUpdateError, match="changed since discovery"):
+        store.save(legacy_view, overwrite=True)
+
+    assert not destination.exists()
+    assert source.read_text(encoding="utf-8").endswith("# edited after opening GUI\n")
+    assert catalog_path.read_bytes() == original_catalog
+
+
+def test_catalog_legacy_migration_in_place_preserves_revision_and_effective_values(
+    profile_repository,
+):
+    repo_root, catalog_path = profile_repository
+    source = repo_root / "configs" / "chicago" / "legacy-default.yaml"
+    source.parent.mkdir(parents=True)
+    source.write_bytes((LEGACY_FIXTURES / "experiment-v1.yaml").read_bytes())
+    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    catalog["scenarios"][0]["config_path"] = (
+        "configs/chicago/legacy-default.yaml"
+    )
+    catalog_path.write_text(yaml.safe_dump(catalog, sort_keys=False), encoding="utf-8")
+    original_catalog = catalog_path.read_bytes()
+    store = ProfileStore(repo_root, catalog_path)
+    legacy_view = store.discover("chicago")[0]
+    revision = legacy_view.legacy_source.source_revision
+
+    destination = store.save(legacy_view, overwrite=True)
+
+    assert destination == source.resolve()
+    migrated = load_profile(source, repo_root=repo_root)
+    assert migrated.rect_size == 2400
+    assert migrated.target_count == 24
+    assert migrated.tolerance == 2
+    assert migrated.scan_step == 30
+    assert migrated.min_spacing == 1800
+    assert migrated.is_legacy_preview is False
+    assert revision.startswith("sha256:")
+    assert catalog_path.read_bytes() == original_catalog
+
+
+def test_catalog_legacy_migration_in_place_rejects_change_since_discovery(
+    profile_repository,
+):
+    repo_root, catalog_path = profile_repository
+    source = repo_root / "configs" / "chicago" / "legacy-default.yaml"
+    source.parent.mkdir(parents=True)
+    source.write_bytes((LEGACY_FIXTURES / "experiment-v1.yaml").read_bytes())
+    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    catalog["scenarios"][0]["config_path"] = (
+        "configs/chicago/legacy-default.yaml"
+    )
+    catalog_path.write_text(yaml.safe_dump(catalog, sort_keys=False), encoding="utf-8")
+    original_catalog = catalog_path.read_bytes()
+    store = ProfileStore(repo_root, catalog_path)
+    legacy_view = store.discover("chicago")[0]
+
+    source.write_text(
+        source.read_text(encoding="utf-8") + "\n# edited after opening GUI\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConcurrentProfileUpdateError, match="changed since discovery"):
+        store.save(legacy_view, overwrite=True)
+
+    assert source.read_text(encoding="utf-8").endswith("# edited after opening GUI\n")
+    assert catalog_path.read_bytes() == original_catalog
+
+
+def test_catalog_legacy_migration_in_place_detects_change_during_save(
+    profile_repository,
+    monkeypatch,
+):
+    repo_root, catalog_path = profile_repository
+    source = repo_root / "configs" / "chicago" / "legacy-default.yaml"
+    source.parent.mkdir(parents=True)
+    source.write_bytes((LEGACY_FIXTURES / "experiment-v1.yaml").read_bytes())
+    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    catalog["scenarios"][0]["config_path"] = (
+        "configs/chicago/legacy-default.yaml"
+    )
+    catalog_path.write_text(yaml.safe_dump(catalog, sort_keys=False), encoding="utf-8")
+    original_catalog = catalog_path.read_bytes()
+    store = ProfileStore(repo_root, catalog_path)
+    legacy_view = store.discover("chicago")[0]
+    real_dump = profiles_module.dump_profile
+
+    def dump_then_change_source(profile, path):
+        result = real_dump(profile, path)
+        source.write_text(
+            source.read_text(encoding="utf-8") + "\n# concurrent writer\n",
+            encoding="utf-8",
+        )
+        return result
+
+    monkeypatch.setattr(profiles_module, "dump_profile", dump_then_change_source)
+
+    with pytest.raises(ConcurrentProfileUpdateError, match="during migration"):
+        store.save(legacy_view, overwrite=True)
+
+    assert source.read_text(encoding="utf-8").endswith("# concurrent writer\n")
+    assert catalog_path.read_bytes() == original_catalog
+
+
+def test_profile_store_legacy_migration_rolls_back_if_source_changes(
+    profile_repository,
+    monkeypatch,
+):
+    repo_root, catalog_path = profile_repository
+    source = repo_root / "configs" / "example.yaml"
+    source.parent.mkdir()
+    source.write_bytes((LEGACY_FIXTURES / "experiment-v1.yaml").read_bytes())
+    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    catalog["scenarios"][0]["config_path"] = "configs/example.yaml"
+    catalog_path.write_text(
+        yaml.safe_dump(catalog, sort_keys=False),
+        encoding="utf-8",
+    )
+    store = ProfileStore(repo_root, catalog_path)
+    legacy_view = store.discover("chicago")[0]
+    destination = repo_root / "configs" / "chicago" / "example.yaml"
+    real_dump = profiles_module.dump_profile
+
+    def dump_then_change_source(profile, path):
+        real_dump(profile, path)
+        source.write_text(
+            source.read_text(encoding="utf-8") + "\n# external change\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(profiles_module, "dump_profile", dump_then_change_source)
+
+    with pytest.raises(ConcurrentProfileUpdateError, match="during migration"):
+        store.save(legacy_view, overwrite=True)
+
+    assert not destination.exists()
+    assert source.read_text(encoding="utf-8").endswith("# external change\n")
+    unchanged_catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    assert unchanged_catalog["scenarios"][0]["config_path"] == (
+        "configs/example.yaml"
+    )
 
 
 def test_default_profile_values_are_explicit_and_stable():
@@ -353,9 +646,14 @@ def _catalog_dataset(
 @pytest.fixture
 def profile_repository(tmp_path):
     entrypoints = {
-        "points": tmp_path / "inputs" / "points" / "stations.csv",
-        "boundary": tmp_path / "inputs" / "boundary" / "boundary.geojson",
-        "dem": tmp_path / "inputs" / "dem" / "elevation.tif",
+        "points": (
+            tmp_path
+            / "points_shp"
+            / "USA_Clear_LTE_Base_Station"
+            / "USA_Clear_LTE_Base_Station.shp"
+        ),
+        "boundary": tmp_path / "boundary_shp" / "Chicago" / "Chicago.shp",
+        "dem": tmp_path / "dem" / "Chicago" / "elevation.tif",
     }
     for dataset_id, path in entrypoints.items():
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -367,20 +665,20 @@ def profile_repository(tmp_path):
             _catalog_dataset(
                 "points",
                 "points",
-                "inputs/points",
-                "inputs/points/stations.csv",
+                "points_shp",
+                "points_shp/USA_Clear_LTE_Base_Station/USA_Clear_LTE_Base_Station.shp",
             ),
             _catalog_dataset(
                 "boundary",
                 "boundary",
-                "inputs/boundary",
-                "inputs/boundary/boundary.geojson",
+                "boundary_shp",
+                "boundary_shp/Chicago/Chicago.shp",
             ),
             _catalog_dataset(
                 "dem",
                 "dem",
-                "inputs/dem",
-                "inputs/dem/elevation.tif",
+                "dem",
+                "dem/Chicago/elevation.tif",
             ),
         ],
         "scenarios": [
@@ -1016,6 +1314,324 @@ def test_profile_store_discover_is_recursive_sorted_and_filterable(
         "alpha",
         "zeta",
     ]
+
+
+def test_profile_store_discovers_catalog_legacy_among_mixed_yaml(
+    profile_repository,
+):
+    repo_root, catalog_path = profile_repository
+    configs = repo_root / "configs"
+    configs.mkdir()
+    legacy_path = configs / "chicago-default.yaml"
+    legacy_path.write_bytes(
+        (LEGACY_FIXTURES / "experiment-v1.yaml").read_bytes()
+    )
+    unrelated = configs / "unrelated.yaml"
+    unrelated.write_text("this: legacy file is unrelated\n", encoding="utf-8")
+    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    catalog["scenarios"][0]["config_path"] = "configs/chicago-default.yaml"
+    catalog_path.write_text(
+        yaml.safe_dump(catalog, sort_keys=False),
+        encoding="utf-8",
+    )
+    store = ProfileStore(repo_root, catalog_path)
+    store.save(
+        make_profile(
+            repo_root,
+            profile_id="metro",
+            display_name="Metro",
+            scenario_id="new-york-city",
+        )
+    )
+    original = legacy_path.read_bytes()
+
+    discovered = store.discover()
+
+    assert [profile.profile_id for profile in discovered] == [
+        "chicago-default",
+        "metro",
+    ]
+    legacy = discovered[0]
+    assert legacy.scenario_id == "chicago"
+    assert legacy.points_dataset_id == "points"
+    assert legacy.rect_size == 2400
+    assert legacy.source_path == legacy_path.resolve()
+    assert legacy.legacy_source.catalog_owner_scenario_id == "chicago"
+    assert [profile.profile_id for profile in store.discover("chicago")] == [
+        "chicago-default"
+    ]
+    assert [profile.profile_id for profile in store.discover()] == [
+        "chicago-default",
+        "metro",
+    ]
+    assert legacy_path.read_bytes() == original
+    assert unrelated.read_text(encoding="utf-8") == (
+        "this: legacy file is unrelated\n"
+    )
+
+
+def test_profile_store_catalog_owned_legacy_validates_registered_paths(
+    profile_repository,
+):
+    repo_root, catalog_path = profile_repository
+    source = repo_root / "configs" / "legacy-default.yaml"
+    source.parent.mkdir()
+    source.write_bytes((LEGACY_FIXTURES / "experiment-v1.yaml").read_bytes())
+    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    catalog["scenarios"][0]["config_path"] = "configs/legacy-default.yaml"
+    dem = next(item for item in catalog["datasets"] if item["role"] == "dem")
+    dem["entrypoint"] = "dem/Chicago/other.tif"
+    other_dem = repo_root / dem["entrypoint"]
+    other_dem.parent.mkdir(parents=True, exist_ok=True)
+    other_dem.write_text("dem", encoding="utf-8")
+    catalog_path.write_text(yaml.safe_dump(catalog, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="catalog-owned legacy.*registered paths"):
+        ProfileStore(repo_root, catalog_path).discover()
+
+
+def _nondefault_legacy_fixture(profile_repository):
+    repo_root, catalog_path = profile_repository
+    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    catalog["scenarios"] = [catalog["scenarios"][0]]
+    catalog["scenarios"][0]["config_path"] = None
+    catalog_path.write_text(yaml.safe_dump(catalog, sort_keys=False), encoding="utf-8")
+    source = repo_root / "configs" / "chicago" / "legacy-secondary.yaml"
+    source.parent.mkdir(parents=True)
+    source.write_bytes((LEGACY_FIXTURES / "experiment-v1.yaml").read_bytes())
+    return repo_root, catalog_path, source
+
+
+def test_profile_store_discovers_and_migrates_matching_nondefault_legacy(
+    profile_repository,
+):
+    repo_root, catalog_path, source = _nondefault_legacy_fixture(profile_repository)
+    store = ProfileStore(repo_root, catalog_path)
+
+    discovered = store.discover()
+
+    assert [profile.profile_id for profile in discovered] == ["legacy-secondary"]
+    preview = discovered[0]
+    assert preview.scenario_id == "chicago"
+    assert preview.points_dataset_id == "points"
+    assert preview.is_legacy_preview is True
+    assert preview.legacy_source.source_path == source.resolve()
+    assert preview.legacy_source.catalog_owner_scenario_id is None
+    assert store.discover("chicago") == [preview]
+    assert store.discover("new-york-city") == []
+
+    original = source.read_bytes()
+    original_catalog = catalog_path.read_bytes()
+    source.write_bytes(original + b"\n# external change\n")
+    with pytest.raises(ConcurrentProfileUpdateError, match="changed since discovery"):
+        store.save(preview, overwrite=True)
+    assert source.read_bytes().endswith(b"# external change\n")
+    assert catalog_path.read_bytes() == original_catalog
+
+    source.write_bytes(original)
+    refreshed = store.discover("chicago")[0]
+    destination = store.save(refreshed, overwrite=True)
+
+    assert destination == source.resolve()
+    migrated = load_profile(source, repo_root=repo_root)
+    assert migrated.is_legacy_preview is False
+    assert migrated.rect_size == 2400
+    assert migrated.target_count == 24
+    assert yaml.safe_load(catalog_path.read_text(encoding="utf-8"))["scenarios"][0][
+        "config_path"
+    ] is None
+
+
+def test_profile_store_rejects_valid_unowned_legacy_without_catalog_path_match(
+    profile_repository,
+):
+    repo_root, catalog_path, _ = _nondefault_legacy_fixture(profile_repository)
+    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    points = next(item for item in catalog["datasets"] if item["role"] == "points")
+    points["path"] = "other-points"
+    points["entrypoint"] = "other-points/Other/Other.shp"
+    unmatched = repo_root / points["entrypoint"]
+    unmatched.parent.mkdir(parents=True)
+    unmatched.write_text("points", encoding="utf-8")
+    catalog_path.write_text(yaml.safe_dump(catalog, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="legacy.*points.*does not match|no.*points"):
+        ProfileStore(repo_root, catalog_path).discover()
+
+
+def test_profile_store_rejects_valid_unowned_legacy_with_ambiguous_scenario_match(
+    profile_repository,
+):
+    repo_root, catalog_path, _ = _nondefault_legacy_fixture(profile_repository)
+    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    duplicate = dict(catalog["scenarios"][0])
+    duplicate.update(
+        scenario_id="chicago-copy",
+        display_name="Chicago Copy",
+        config_path=None,
+    )
+    catalog["scenarios"].append(duplicate)
+    catalog_path.write_text(yaml.safe_dump(catalog, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="legacy.*multiple scenarios|ambiguous"):
+        ProfileStore(repo_root, catalog_path).discover()
+
+
+def _assert_duplicate_profile_identity(error: Exception, *paths: Path) -> None:
+    message = str(error)
+    assert "duplicate profile identity" in message
+    for path in paths:
+        assert str(path.resolve()) in message
+
+
+def test_profile_store_rejects_v2_and_unowned_legacy_with_same_identity(
+    profile_repository,
+):
+    repo_root, catalog_path, legacy = _nondefault_legacy_fixture(profile_repository)
+    legacy_target = legacy.with_name("foo.yaml")
+    legacy.replace(legacy_target)
+    modern = repo_root / "configs" / "modern" / "foo.yaml"
+    modern.parent.mkdir()
+    dump_profile(
+        make_profile(repo_root, profile_id="foo", scenario_id="chicago"),
+        modern,
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        ProfileStore(repo_root, catalog_path).discover()
+
+    _assert_duplicate_profile_identity(exc_info.value, legacy_target, modern)
+
+
+def test_profile_store_rejects_two_unowned_legacy_profiles_with_same_identity(
+    profile_repository,
+):
+    repo_root, catalog_path, legacy = _nondefault_legacy_fixture(profile_repository)
+    first = repo_root / "configs" / "legacy-a" / "foo.yaml"
+    second = repo_root / "configs" / "legacy-b" / "foo.yaml"
+    first.parent.mkdir()
+    second.parent.mkdir()
+    legacy.replace(first)
+    second.write_bytes(first.read_bytes())
+
+    with pytest.raises(ValueError) as exc_info:
+        ProfileStore(repo_root, catalog_path).discover()
+
+    _assert_duplicate_profile_identity(exc_info.value, first, second)
+
+
+def test_profile_store_rejects_two_v2_profiles_with_same_identity(
+    profile_repository,
+):
+    repo_root, catalog_path = profile_repository
+    first = repo_root / "configs" / "modern-a" / "foo.yaml"
+    second = repo_root / "configs" / "modern-b" / "foo.yaml"
+    profile = make_profile(repo_root, profile_id="foo", scenario_id="chicago")
+    dump_profile(profile, first)
+    dump_profile(profile, second)
+
+    with pytest.raises(ValueError) as exc_info:
+        ProfileStore(repo_root, catalog_path).discover()
+
+    _assert_duplicate_profile_identity(exc_info.value, first, second)
+
+
+@pytest.mark.parametrize(
+    "content",
+    (
+        "just-a-scalar\n",
+        "- one\n- two\n",
+    ),
+)
+def test_profile_store_discover_skips_unowned_schema_less_non_mapping_yaml(
+    profile_repository,
+    content,
+):
+    repo_root, catalog_path = profile_repository
+    unowned = repo_root / "configs" / "notes.yaml"
+    unowned.parent.mkdir()
+    unowned.write_text(content, encoding="utf-8")
+
+    assert ProfileStore(repo_root, catalog_path).discover() == []
+
+
+def test_profile_store_discover_keeps_unowned_explicit_v2_strict(
+    profile_repository,
+):
+    repo_root, catalog_path = profile_repository
+    explicit = repo_root / "configs" / "broken-v2.yaml"
+    explicit.parent.mkdir()
+    explicit.write_text("schema_version: 2\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Missing required configuration value"):
+        ProfileStore(repo_root, catalog_path).discover()
+
+
+@pytest.mark.parametrize(
+    "content",
+    (
+        "just-a-scalar\n",
+        "- one\n- two\n",
+    ),
+)
+def test_profile_store_discover_keeps_catalog_owned_legacy_strict(
+    profile_repository,
+    content,
+):
+    repo_root, catalog_path = profile_repository
+    owned = repo_root / "configs" / "owned.yaml"
+    owned.parent.mkdir()
+    owned.write_text(content, encoding="utf-8")
+    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    catalog["scenarios"][0]["config_path"] = "configs/owned.yaml"
+    catalog_path.write_text(yaml.safe_dump(catalog, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="legacy.*mapping|mapping.*legacy"):
+        ProfileStore(repo_root, catalog_path).discover()
+
+
+def test_profile_store_discover_rejects_catalog_profile_outside_configs(
+    profile_repository,
+):
+    repo_root, catalog_path = profile_repository
+    outside = repo_root / "legacy-outside.yaml"
+    outside.write_bytes((LEGACY_FIXTURES / "experiment-v1.yaml").read_bytes())
+    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    catalog["scenarios"][0]["config_path"] = "legacy-outside.yaml"
+    catalog_path.write_text(
+        yaml.safe_dump(catalog, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="configs|inside"):
+        ProfileStore(repo_root, catalog_path).discover()
+
+
+@pytest.mark.parametrize(
+    ("profile_id", "scenario_id"),
+    [
+        ("../escape", "chicago"),
+        ("con", "chicago"),
+        ("legacy", "../escape"),
+    ],
+)
+def test_convert_legacy_profile_rejects_unsafe_identity(
+    tmp_path,
+    profile_id,
+    scenario_id,
+):
+    legacy = profiles_module.load_legacy_profile(
+        LEGACY_FIXTURES / "experiment-v1.yaml",
+        repo_root=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match=r"profile\.(id|scenario_id)"):
+        profiles_module.convert_legacy_profile(
+            legacy,
+            profile_id=profile_id,
+            scenario_id=scenario_id,
+            points_dataset_id="points",
+        )
 
 
 def test_profile_store_discover_rejects_symlink_escape(profile_repository):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -27,7 +28,31 @@ def _is_link_or_junction(path: Path) -> bool:
     if path.is_symlink():
         return True
     is_junction = getattr(path, "is_junction", None)
-    return bool(is_junction is not None and is_junction())
+    if callable(is_junction) and is_junction():
+        return True
+    try:
+        attributes = path.lstat().st_file_attributes
+    except (AttributeError, FileNotFoundError):
+        return False
+    reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(attributes & reparse_point)
+
+
+def _redirected_component(root: Path, candidate: Path) -> Path | None:
+    """Return the first redirected component between an absolute root and path."""
+
+    if _is_link_or_junction(root):
+        return root
+    try:
+        parts = candidate.relative_to(root).parts
+    except ValueError:
+        return None
+    current = root
+    for part in parts:
+        current = current / part
+        if os.path.lexists(current) and _is_link_or_junction(current):
+            return current
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,10 +181,24 @@ class GuiSettingsStore:
             if not isinstance(value, (str, os.PathLike)):
                 raise GuiSettingsError(f"Invalid GUI output root: {value!r}")
             try:
-                path = Path(value).expanduser()
-                if not path.is_absolute():
-                    path = self.repo_root / path
-                path = path.resolve(strict=False)
+                requested = Path(value).expanduser()
+                if ".." in requested.parts:
+                    raise GuiSettingsError(
+                        f"GUI output root must not contain traversal: {value!r}"
+                    )
+                if not requested.is_absolute():
+                    requested = self.repo_root / requested
+                lexical = requested.absolute()
+                anchor = Path(lexical.anchor)
+                redirected = _redirected_component(anchor, lexical)
+                if redirected is not None:
+                    raise GuiSettingsError(
+                        "GUI output root must not use a symlink or junction: "
+                        f"{redirected}"
+                    )
+                path = lexical.resolve(strict=False)
+            except GuiSettingsError:
+                raise
             except (OSError, RuntimeError, ValueError) as exc:
                 raise GuiSettingsError(f"Invalid GUI output root: {value!r}") from exc
             if path.exists() and not path.is_dir():

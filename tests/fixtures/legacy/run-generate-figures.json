@@ -1,0 +1,33 @@
+{
+  "timestamp": "2025-06-01T10:05:00+08:00",
+  "command": [
+    "lte-generate-figures",
+    "--config",
+    "configs/legacy-fixture.yaml"
+  ],
+  "git_commit": "legacy-figure-commit",
+  "config": {
+    "experiment_name": "Legacy Fixture Profile",
+    "city_name": "Fixture City",
+    "target_crs": "EPSG:3857",
+    "rect_size": 2
+  },
+  "inputs": [
+    {
+      "name": "scenario_csv",
+      "path": "Z:\\archived\\legacy-figures\\scenario.csv",
+      "sha256": "legacy-scenario-sha256"
+    },
+    {
+      "name": "dem",
+      "path": "Z:\\archived\\legacy-figures\\dem.tif",
+      "sha256": "legacy-dem-sha256"
+    }
+  ],
+  "software": {
+    "python": "3.11.9"
+  },
+  "outputs": [
+    "Z:\\archived\\legacy-figures\\terrain.png"
+  ]
+}

@@ -5,9 +5,10 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import os
+import stat
 import sys
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
@@ -181,6 +182,91 @@ def _css_text() -> str:
     )
 
 
+def _is_redirected_path(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if callable(is_junction) and is_junction():
+        return True
+    try:
+        attributes = path.lstat().st_file_attributes
+    except (AttributeError, FileNotFoundError):
+        return False
+    reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(attributes & reparse_point)
+
+
+def _redirected_component(root: Path, candidate: Path) -> Path | None:
+    if _is_redirected_path(root):
+        return root
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError:
+        return None
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if os.path.lexists(current) and _is_redirected_path(current):
+            return current
+    return None
+
+
+def _resolve_allowlisted_file(
+    path: str | os.PathLike[str],
+    *,
+    roots: Iterable[str | os.PathLike[str]],
+    suffixes: Iterable[str],
+    label: str,
+) -> Path:
+    """Resolve one local regular file without crossing an allowlisted root."""
+
+    if not isinstance(path, (str, os.PathLike)) or isinstance(path, bytes):
+        raise ValueError(f"{label} must be a local filesystem path")
+    raw_text = os.fspath(path)
+    if not isinstance(raw_text, str) or "://" in raw_text or "\x00" in raw_text:
+        raise ValueError(f"{label} must be a local filesystem path")
+    raw = Path(raw_text).expanduser()
+    if not raw.is_absolute():
+        raise ValueError(f"{label} must be an absolute local filesystem path")
+    if ".." in raw.parts:
+        raise ValueError(f"{label} must not contain traversal components")
+
+    allowed_suffixes = {str(value).casefold() for value in suffixes}
+    if not allowed_suffixes or any(not value.startswith(".") for value in allowed_suffixes):
+        raise ValueError("allowlisted file suffixes must be non-empty extensions")
+
+    lexical = raw.absolute()
+    for value in roots:
+        root = Path(value).expanduser()
+        if not root.is_absolute():
+            raise ValueError("allowlisted file roots must be absolute")
+        root = root.absolute()
+        redirected_root = _redirected_component(Path(root.anchor), root)
+        if redirected_root is not None:
+            raise ValueError(
+                f"allowlisted root must not be redirected: {redirected_root}"
+            )
+        try:
+            lexical.relative_to(root)
+        except ValueError:
+            continue
+        redirected = _redirected_component(root, lexical)
+        if redirected is not None:
+            raise ValueError(f"{label} must not be redirected: {redirected}")
+        try:
+            resolved_root = root.resolve(strict=True)
+            resolved = lexical.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(f"{label} does not exist or cannot be resolved") from exc
+        if not resolved.is_relative_to(resolved_root):
+            raise ValueError(f"{label} is outside the allowlisted roots")
+        if not resolved.is_file() or resolved.suffix.casefold() not in allowed_suffixes:
+            extensions = ", ".join(sorted(allowed_suffixes))
+            raise ValueError(f"{label} must be a regular {extensions} file")
+        return resolved
+    raise ValueError(f"{label} is outside the allowlisted roots")
+
+
 def create_app(
     catalog: DataCatalog | None = None,
     testing: bool = False,
@@ -269,16 +355,12 @@ def create_app(
             body(translator)
 
     def candidate_asset_url(path: Path) -> str:
-        raw = Path(path)
-        if raw.is_symlink():
-            raise ValueError("candidate map asset must not be redirected")
-        resolved = raw.resolve(strict=True)
-        if resolved.suffix.lower() != ".png" or not resolved.is_file():
-            raise ValueError("candidate map asset must be a regular PNG file")
-        if not testing:
-            cache_root = map_assets.cache_root.resolve(strict=True)
-            if not resolved.is_relative_to(cache_root):
-                raise ValueError("candidate map asset must stay inside the map cache")
+        resolved = _resolve_allowlisted_file(
+            path,
+            roots=(map_assets.cache_root,),
+            suffixes=(".png",),
+            label="candidate map asset",
+        )
         existing = static_asset_urls.get(resolved)
         if existing is not None:
             return existing
@@ -292,17 +374,15 @@ def create_app(
         return url
 
     def preview_asset_url(path: Path) -> str:
-        raw = Path(path)
-        if raw.is_symlink():
-            raise ValueError("figure preview asset must not be redirected")
-        resolved = raw.resolve(strict=True)
-        if resolved.suffix.casefold() != ".png" or not resolved.is_file():
-            raise ValueError("figure preview asset must be a regular PNG file")
         preview_root = (
             repo_root / ".lte-data" / "cache" / "previews"
-        ).resolve(strict=True)
-        if not resolved.is_relative_to(preview_root):
-            raise ValueError("figure preview asset must stay inside the preview cache")
+        )
+        resolved = _resolve_allowlisted_file(
+            path,
+            roots=(preview_root,),
+            suffixes=(".png",),
+            label="figure preview asset",
+        )
         existing = static_asset_urls.get(resolved)
         if existing is not None:
             return existing
