@@ -210,9 +210,49 @@ def test_web_selector_import_failure_only_recommends_select_index(
             preflight=object(),
             selection_service=object(),
             repo_root=tmp_path,
+            scan_progress=_progress(_candidate(), cache_status="miss"),
         )
 
     assert "legacy" not in str(error.value).lower()
+
+
+def test_web_selector_receives_real_scan_provenance(tmp_path, monkeypatch):
+    candidate = _candidate()
+    progress = replace(
+        _progress(candidate, cache_status="forced"),
+        elapsed_seconds=8.2,
+        cache_key="real-cache-key",
+    )
+    captured = {}
+
+    class Payload:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    fake_module = SimpleNamespace(
+        WebSelectorError=RuntimeError,
+        WebSelectorPayload=Payload,
+        select_candidate=lambda candidates, *, map_payload: candidates[0],
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "lte_scenario_toolkit.web_selector",
+        fake_module,
+    )
+
+    selected = select_sites._web_selected_candidate(
+        _scan_result(candidate),
+        preflight=SimpleNamespace(profile=object()),
+        selection_service=object(),
+        repo_root=tmp_path,
+        scan_progress=progress,
+    )
+
+    assert selected is candidate
+    provenance = captured["scan_provenance"]
+    assert provenance.elapsed_seconds == pytest.approx(8.2)
+    assert provenance.cache_status == "forced"
+    assert provenance.cache_key == "real-cache-key"
 
 
 def test_export_artifacts_uses_current_profile_flags():

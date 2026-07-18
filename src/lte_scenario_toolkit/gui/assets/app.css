@@ -716,13 +716,20 @@ h3,
 .lte-candidate-id-input { width: 126px; }
 
 .lte-candidate-workspace {
-  grid-template-columns: minmax(0, 3fr) minmax(280px, 1fr) !important;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) clamp(320px, 24vw, 360px);
   align-items: stretch;
   gap: var(--lte-space-4);
+  min-width: 0;
 }
 
-.lte-candidate-map-card,
-.lte-candidate-inspector { height: min(68vh, 760px); }
+.lte-candidate-map-card {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  height: min(72vh, 780px);
+  overflow: hidden;
+}
 
 .lte-candidate-map-wrap,
 .lte-candidate-map {
@@ -730,13 +737,59 @@ h3,
   height: 100%;
 }
 
-.lte-layer-controls { gap: var(--lte-space-2); }
+.lte-candidate-map-wrap {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.lte-layer-controls {
+  flex: 0 0 auto;
+  gap: var(--lte-space-2);
+}
 .lte-dem-opacity { width: 120px; }
 .lte-dem-style { width: 144px; }
 
 .lte-candidate-inspector {
+  min-width: 0;
+  max-height: min(72vh, 780px);
   overflow-y: auto;
+  overscroll-behavior: contain;
   gap: var(--lte-space-3);
+}
+
+.lte-candidate-toolbar {
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--lte-space-3);
+}
+
+.lte-candidate-toolbar-group {
+  align-items: center;
+  gap: var(--lte-space-2);
+  min-width: 0;
+}
+
+.lte-candidate-toolbar-group--confirmation { margin-left: auto; }
+
+.lte-segmented-control {
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  background: var(--lte-accent-soft);
+  border: 1px solid var(--lte-border);
+  border-radius: var(--lte-radius-md);
+}
+
+.lte-candidate-progress-count,
+.lte-candidate-progress-meta { gap: var(--lte-space-3); }
+
+.lte-candidate-percent {
+  color: var(--lte-accent);
+  font-size: 18px;
+  font-weight: 750;
+  font-variant-numeric: tabular-nums;
 }
 
 .lte-selected-dem-preview {
@@ -755,10 +808,25 @@ h3,
   font-variant-numeric: tabular-nums;
 }
 
+.lte-technical-copy {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--lte-ink-muted);
+  font-family: ui-monospace, "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.65;
+}
+
 .lte-filmstrip-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  grid-auto-flow: column;
+  grid-auto-columns: clamp(220px, 22vw, 280px);
+  grid-template-rows: minmax(0, 1fr);
   gap: var(--lte-space-3);
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+  padding-bottom: var(--lte-space-2);
 }
 
 .lte-filmstrip-card {
@@ -791,6 +859,19 @@ h3,
   color: var(--lte-ink);
   font-size: 14px;
   font-weight: 650;
+}
+
+.lte-web-selector-frame {
+  width: 100%;
+  min-width: 0;
+  padding: var(--lte-space-3);
+  background: var(--lte-canvas);
+}
+
+.lte-web-selector-actions {
+  width: min(1540px, 100%);
+  margin: 0 auto;
+  justify-content: flex-end;
 }
 
 .lte-generate-page,
@@ -950,10 +1031,10 @@ button:disabled,
   .lte-shell-menu { display: inline-flex; }
   .lte-main { padding: 22px 18px 32px; }
   .lte-form-grid { grid-template-columns: 1fr !important; }
-  .lte-candidate-workspace { grid-template-columns: 1fr !important; }
+  .lte-candidate-workspace { grid-template-columns: 1fr; }
   .lte-figure-workspace { grid-template-columns: 1fr; }
-  .lte-candidate-map-card,
-  .lte-candidate-inspector { height: auto; }
+  .lte-candidate-map-card { height: min(70vh, 700px); }
+  .lte-candidate-inspector { max-height: none; }
 }
 
 @media (max-width: 760px) {
@@ -1015,8 +1096,7 @@ button:disabled,
     padding: 18px 12px 28px;
   }
 
-  .lte-card-grid,
-  .lte-filmstrip-grid { grid-template-columns: minmax(0, 1fr); }
+  .lte-card-grid { grid-template-columns: minmax(0, 1fr); }
 
   .lte-page-header { align-items: flex-start; flex-direction: column; }
 
@@ -1050,7 +1130,21 @@ button:disabled,
   .lte-output-row .q-btn { flex: 1 1 100%; }
 
   .lte-candidate-map-wrap,
-  .lte-candidate-map { min-height: 360px; }
+  .lte-candidate-map { min-height: 420px; }
+
+  .lte-candidate-map-card {
+    min-height: 520px;
+    height: auto;
+  }
+
+  .lte-candidate-toolbar-group {
+    flex: 1 1 100%;
+    flex-wrap: wrap;
+  }
+
+  .lte-candidate-toolbar-group--confirmation { margin-left: 0; }
+
+  .lte-candidate-toolbar-group .q-btn { flex: 1 1 auto; }
 }
 
 @media (prefers-reduced-motion: reduce) {

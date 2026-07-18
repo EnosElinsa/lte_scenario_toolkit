@@ -25,6 +25,11 @@ from ...selection_service import (
     SelectionError,
     SelectionProgress,
 )
+from ..presentation import (
+    cache_presentation,
+    render_technical_details,
+    scan_mode_presentation,
+)
 
 DEFAULT_LAYERS = frozenset({"dem", "boundary", "stations", "candidates"})
 ALLOWED_LAYERS = DEFAULT_LAYERS | {"online"}
@@ -1616,8 +1621,18 @@ def render_candidate_page(
     last_dem_asset_path = str(bundle.dem_asset.path)
     current_overview_url = image_url
 
+    def station_count_text(count: int) -> str:
+        key = (
+            "candidates.station_count_one"
+            if count == 1
+            else "candidates.station_count"
+        )
+        return translator.text(key, count=count)
+
     with ui.column().classes("lte-page lte-candidate-page"):
-        with ui.row().classes("lte-candidate-heading items-end justify-between full-width"):
+        with ui.row().classes(
+            "lte-candidate-heading items-end justify-between full-width"
+        ):
             with ui.column().classes("gap-1"):
                 ui.label(translator.text("candidates.title")).classes("lte-page-title")
                 ui.label(
@@ -1626,7 +1641,9 @@ def render_candidate_page(
                         name=profile.display_name,
                     )
                 ).classes("lte-page-subtitle")
-            with ui.button_group().props("outline"):
+            with ui.element("div").classes("lte-segmented-control").props(
+                f'role=group aria-label="{translator.text("candidates.view_label")}"'
+            ).mark("candidate-view-control"):
                 map_view_button = ui.button(
                     translator.text("candidates.view_map")
                 ).mark("candidate-view-map")
@@ -1639,9 +1656,21 @@ def render_candidate_page(
                 progress_phase = ui.label(
                     translator.text("candidates.phase_idle")
                 ).classes("lte-section-title")
-                progress_numbers = ui.label("0 / 0").classes("lte-candidate-metric")
-            progress_bar = ui.linear_progress(value=0.0).props("rounded color=teal")
-            with ui.row().classes("items-center justify-between full-width"):
+                with ui.row().classes("lte-candidate-progress-count items-center"):
+                    progress_percent = ui.label("0%").classes(
+                        "lte-candidate-percent"
+                    ).mark("candidate-progress-percent")
+                    progress_numbers = ui.label("0 / 0").classes(
+                        "lte-candidate-metric"
+                    )
+            progress_bar = ui.linear_progress(
+                value=0.0,
+                size="8px",
+                show_value=False,
+            ).props("rounded color=teal")
+            with ui.row().classes(
+                "lte-candidate-progress-meta items-center justify-between full-width"
+            ):
                 found_label = ui.label(
                     translator.text("candidates.found", count=0)
                 ).classes("lte-page-subtitle")
@@ -1649,48 +1678,57 @@ def render_candidate_page(
                     translator.text("candidates.elapsed", seconds="0.0")
                 ).classes("lte-page-subtitle")
                 cache_label = ui.label(
-                    translator.text("candidates.cache", status="none")
+                    translator.text(cache_presentation("none").label_key)
                 ).classes("lte-page-subtitle")
             progress_error = ui.label("").classes(
                 "lte-validation-result lte-validation-result--error"
             )
             progress_error.set_visibility(False)
 
-        with ui.row().classes("lte-candidate-toolbar items-center full-width"):
-            start_button = ui.button(
-                translator.text("action.start_scan")
-            ).mark("candidate-start")
-            cancel_button = ui.button(
-                translator.text("action.cancel")
-            ).props("outline").mark("candidate-cancel")
-            force_button = ui.button(
-                translator.text("candidates.force_rescan")
-            ).props("outline").mark("candidate-force")
-            if not allow_rescan:
-                for button in (start_button, cancel_button, force_button):
-                    button.disable()
-                    button.set_visibility(False)
-            ui.separator().props("vertical")
-            previous_button = ui.button(
-                translator.text("candidates.previous")
-            ).props("flat").mark("candidate-previous")
-            next_button = ui.button(
-                translator.text("candidates.next")
-            ).props("flat").mark("candidate-next")
-            candidate_id_input = ui.number(
-                translator.text("candidates.grid_id"),
-                value=None,
-                precision=0,
-            ).classes("lte-candidate-id-input").mark("candidate-id")
-            choose_id_button = ui.button(
-                translator.text("candidates.select_id")
-            ).props("outline").mark("candidate-select-id")
-            ui.space()
-            confirm_button = ui.button(
-                translator.text("candidates.confirm_selection")
-            ).mark("candidate-confirm")
+        with ui.row().classes("lte-candidate-toolbar full-width"):
+            with ui.row().classes(
+                "lte-candidate-toolbar-group lte-candidate-toolbar-group--scan"
+            ):
+                start_button = ui.button(
+                    translator.text("action.start_scan")
+                ).mark("candidate-start")
+                cancel_button = ui.button(
+                    translator.text("action.cancel")
+                ).props("outline").mark("candidate-cancel")
+                force_button = ui.button(
+                    translator.text("candidates.force_rescan")
+                ).props("outline").mark("candidate-force")
+                if not allow_rescan:
+                    for button in (start_button, cancel_button, force_button):
+                        button.disable()
+                        button.set_visibility(False)
+            with ui.row().classes(
+                "lte-candidate-toolbar-group lte-candidate-toolbar-group--navigation"
+            ):
+                previous_button = ui.button(
+                    translator.text("candidates.previous")
+                ).props("flat").mark("candidate-previous")
+                next_button = ui.button(
+                    translator.text("candidates.next")
+                ).props("flat").mark("candidate-next")
+                candidate_id_input = ui.number(
+                    translator.text("candidates.candidate_number"),
+                    value=None,
+                    precision=0,
+                ).classes("lte-candidate-id-input").mark("candidate-id")
+                choose_id_button = ui.button(
+                    translator.text("candidates.select_number")
+                ).props("outline").mark("candidate-select-id")
+            with ui.row().classes(
+                "lte-candidate-toolbar-group lte-candidate-toolbar-group--confirmation"
+            ):
+                confirm_button = ui.button(
+                    translator.text("candidates.confirm_selection")
+                ).mark("candidate-confirm")
 
-        with ui.grid(columns=2).classes("lte-candidate-workspace full-width"):
+        with ui.element("section").classes(
+            "lte-candidate-workspace full-width"
+        ):
             with ui.card().classes("lte-candidate-map-card"):
                 with ui.row().classes("items-center full-width lte-layer-controls"):
                     dem_switch = ui.switch(
@@ -1783,7 +1821,7 @@ def render_candidate_page(
                 ).classes("lte-candidate-selected-title")
                 selected_details = ui.label(
                     translator.text("candidates.select_hint")
-                ).classes("lte-page-subtitle")
+                ).classes("lte-page-subtitle").mark("candidate-primary-summary")
                 selected_preview = ui.image().classes("lte-selected-dem-preview").mark(
                     "candidate-selected-preview"
                 )
@@ -1796,6 +1834,23 @@ def render_candidate_page(
                 ).classes("lte-candidate-statistics")
                 stats_title.set_visibility(False)
                 stats_details.set_visibility(False)
+
+                technical_refs: dict[str, Any] = {}
+
+                def render_candidate_technical_copy() -> None:
+                    technical_refs["copy"] = ui.label(
+                        translator.text("candidates.technical_waiting")
+                    ).classes("lte-technical-copy").mark(
+                        "candidate-technical-copy"
+                    )
+
+                render_technical_details(
+                    ui,
+                    translator.text("candidates.technical_details"),
+                    render_candidate_technical_copy,
+                    marker="candidate-technical-details",
+                )
+                technical_copy = technical_refs["copy"]
 
         filmstrip_container = ui.column().classes(
             "lte-candidate-filmstrip full-width"
@@ -1881,17 +1936,17 @@ def render_candidate_page(
                 )
                 candidate_layers[item.flat_grid_id] = layer
                 if map_element.is_initialized:
-                    candidate = next(
-                        value
-                        for value in state.candidates
+                    candidate_index, candidate = next(
+                        (index, value)
+                        for index, value in enumerate(state.candidates)
                         if value.flat_grid_id == item.flat_grid_id
                     )
                     layer.run_method(
                         "bindTooltip",
                         translator.text(
                             "candidates.tooltip",
-                            grid_id=candidate.flat_grid_id,
-                            count=candidate.point_count,
+                            index=candidate_index + 1,
+                            stations=station_count_text(candidate.point_count),
                         ),
                         {"sticky": True},
                     )
@@ -2009,10 +2064,79 @@ def render_candidate_page(
                         ui.label(
                             translator.text(
                                 "candidates.card_details",
-                                grid_id=candidate.flat_grid_id,
-                                count=candidate.point_count,
+                                stations=station_count_text(candidate.point_count),
                             )
                         ).classes("lte-page-subtitle")
+
+    def refresh_technical_details(state: CandidatePageState) -> None:
+        selected = state.selected_candidate
+        none = translator.text("value.none")
+        mode = translator.text(
+            scan_mode_presentation(profile.scan_mode).label_key
+        )
+        lines = [
+            translator.text("candidates.technical.scan_mode", value=mode),
+            translator.text(
+                "candidates.technical.cache_key",
+                value=state.cache_key or none,
+            ),
+            translator.text(
+                "candidates.technical.algorithm",
+                value=state.algorithm_version or none,
+            ),
+        ]
+        if selected is not None:
+            lines.extend(
+                (
+                    translator.text(
+                        "candidates.technical.grid_id",
+                        value=selected.flat_grid_id,
+                    ),
+                    translator.text(
+                        "candidates.technical.coordinates",
+                        x=f"{selected.center_x:.1f}",
+                        y=f"{selected.center_y:.1f}",
+                    ),
+                    translator.text(
+                        "candidates.technical.bounds",
+                        left=f"{selected.left_x:.1f}",
+                        bottom=f"{selected.bottom_y:.1f}",
+                        right=f"{selected.left_x + rectangle_size:.1f}",
+                        top=f"{selected.bottom_y + rectangle_size:.1f}",
+                    ),
+                    translator.text(
+                        "candidates.technical.profile",
+                        rect_size=profile.rect_size,
+                        target=profile.target_count,
+                        tolerance=profile.tolerance,
+                    ),
+                )
+            )
+        if state.statistics is not None:
+            lines.append(
+                translator.text(
+                    "candidates.technical.pixels",
+                    count=state.statistics.valid_pixel_count,
+                )
+            )
+        if state.error_code:
+            lines.append(
+                translator.text(
+                    "candidates.technical.error_code",
+                    value=state.error_code,
+                )
+            )
+        for label, value in state.error_details:
+            lines.append(f"{label}: {value}")
+        for label, value in (
+            ("scan", state.error),
+            ("terrain-style", state.dem_style_error),
+            ("statistics", state.statistics_error),
+            ("preview", state.candidate_preview_error),
+        ):
+            if value:
+                lines.append(f"{label}: {value}")
+        technical_copy.set_text("\n".join(lines))
 
     def refresh(state: CandidatePageState) -> None:
         nonlocal last_rendered_state, last_coordinator_active
@@ -2026,6 +2150,7 @@ def render_candidate_page(
         progress_numbers.set_text(
             f"{state.checked_positions:,} / {state.total_positions:,}"
         )
+        progress_percent.set_text(f"{state.progress_fraction:.0%}")
         progress_bar.set_value(state.progress_fraction)
         found_label.set_text(
             translator.text("candidates.found", count=state.found_count)
@@ -2037,7 +2162,7 @@ def render_candidate_page(
             )
         )
         cache_label.set_text(
-            translator.text("candidates.cache", status=state.cache_status)
+            translator.text(cache_presentation(state.cache_status).label_key)
         )
         if state.dem_style_asset is not None:
             asset_path = str(state.dem_style_asset.path)
@@ -2050,10 +2175,10 @@ def render_candidate_page(
             dem_style_select.value = state.dem_style
         visible_error = state.error or state.dem_style_error
         if visible_error:
-            error = (
-                f"{state.error_code}: {state.error}"
-                if state.error_code and state.error
-                else visible_error
+            error = translator.text(
+                "candidates.error.scan"
+                if state.error
+                else "candidates.error.terrain_style"
             )
             progress_error.set_text(error)
             progress_error.set_visibility(True)
@@ -2076,21 +2201,7 @@ def render_candidate_page(
                 )
             )
             selected_details.set_text(
-                translator.text(
-                    "candidates.selected_details",
-                    grid_id=selected.flat_grid_id,
-                    count=selected.point_count,
-                    x=f"{selected.center_x:.1f}",
-                    y=f"{selected.center_y:.1f}",
-                    left=f"{selected.left_x:.1f}",
-                    bottom=f"{selected.bottom_y:.1f}",
-                    right=f"{selected.left_x + rectangle_size:.1f}",
-                    top=f"{selected.bottom_y + rectangle_size:.1f}",
-                    rect_size=profile.rect_size,
-                    target=profile.target_count,
-                    tolerance=profile.tolerance,
-                    mode=profile.scan_mode,
-                )
+                station_count_text(selected.point_count)
             )
             if state.candidate_preview_asset is not None:
                 selected_preview.set_source(
@@ -2110,24 +2221,23 @@ def render_candidate_page(
                         maximum=f"{stats.maximum:.1f}",
                         mean=f"{stats.mean:.1f}",
                         elevation_range=f"{stats.elevation_range:.1f}",
-                        pixels=stats.valid_pixel_count,
                     )
                     + (
                         " "
-                        + translator.text(
-                            "candidates.preview_unavailable",
-                            error=state.candidate_preview_error,
-                        )
+                        + translator.text("candidates.preview_unavailable")
                         if state.candidate_preview_error
                         else ""
                     )
                 )
             elif state.statistics_error:
-                stats_details.set_text(state.statistics_error)
+                stats_details.set_text(
+                    translator.text("candidates.statistics_failed")
+                )
             elif state.statistics_job_id:
                 stats_details.set_text(translator.text("candidates.statistics_loading"))
             else:
                 stats_details.set_text(translator.text("candidates.statistics_waiting"))
+        refresh_technical_details(state)
         rebuild_filmstrip(state)
 
     def try_request_statistics() -> None:
@@ -2160,13 +2270,16 @@ def render_candidate_page(
     def choose_direct() -> None:
         value = candidate_id_input.value
         try:
-            candidate_id = int(value)
+            candidate_number = int(value)
         except (TypeError, ValueError, OverflowError):
-            candidate_id = None
-        before = controller.state.selected_flat_grid_id
-        controller.select_flat_grid_id(candidate_id)
-        if controller.state.selected_flat_grid_id is None and before != candidate_id:
-            ui.notify(translator.text("candidates.unknown_id"), type="warning")
+            candidate_number = 0
+        if not 1 <= candidate_number <= len(controller.state.candidates):
+            ui.notify(
+                translator.text("candidates.unknown_number"),
+                type="warning",
+            )
+            return
+        controller.select_index(candidate_number - 1)
         refresh(controller.state)
         try_request_statistics()
 
@@ -2196,9 +2309,17 @@ def render_candidate_page(
         state = controller.set_view(view)
         map_container.set_visibility(True)
         filmstrip_container.set_visibility(view == "filmstrip")
-        map_view_button.props("unelevated" if view == "map" else "outline")
+        map_view_button.props(
+            "unelevated aria-pressed=true"
+            if view == "map"
+            else "outline aria-pressed=false",
+            remove="outline unelevated aria-pressed",
+        )
         filmstrip_view_button.props(
-            "unelevated" if view == "filmstrip" else "outline"
+            "unelevated aria-pressed=true"
+            if view == "filmstrip"
+            else "outline aria-pressed=false",
+            remove="outline unelevated aria-pressed",
         )
         if view == "map":
             map_element.run_map_method("invalidateSize")
@@ -2212,8 +2333,11 @@ def render_candidate_page(
         except JobBusyError:
             notify_busy()
             return
-        except Exception as exc:
-            ui.notify(str(exc), type="negative")
+        except Exception:
+            ui.notify(
+                translator.text("candidates.error.scan_start"),
+                type="negative",
+            )
             return
         timer.activate()
         refresh(controller.state)
@@ -2227,13 +2351,26 @@ def render_candidate_page(
     def confirm_selection() -> None:
         try:
             confirmed = controller.confirm()
-        except ValueError as exc:
-            ui.notify(str(exc), type="warning")
+        except ValueError:
+            ui.notify(
+                translator.text("candidates.selection_required"),
+                type="warning",
+            )
             return
+        selected = confirmed.locked_candidate
+        selected_index = next(
+            index
+            for index, candidate in enumerate(
+                confirmed.scan_result.candidates,
+                start=1,
+            )
+            if candidate == selected
+        )
         ui.notify(
             translator.text(
                 "candidates.confirmed",
-                grid_id=confirmed.confirmed_flat_grid_id,
+                index=selected_index,
+                stations=station_count_text(selected.point_count),
             ),
             type="positive",
         )
@@ -2374,18 +2511,20 @@ def render_candidate_page(
 
     def bind_candidate_tooltips() -> None:
         candidates_by_id = {
-            candidate.flat_grid_id: candidate for candidate in controller.state.candidates
+            candidate.flat_grid_id: (index, candidate)
+            for index, candidate in enumerate(controller.state.candidates, start=1)
         }
         for flat_grid_id, layer in candidate_layers.items():
-            candidate = candidates_by_id.get(flat_grid_id)
-            if candidate is None:
+            indexed = candidates_by_id.get(flat_grid_id)
+            if indexed is None:
                 continue
+            index, candidate = indexed
             layer.run_method(
                 "bindTooltip",
                 translator.text(
                     "candidates.tooltip",
-                    grid_id=flat_grid_id,
-                    count=candidate.point_count,
+                    index=index,
+                    stations=station_count_text(candidate.point_count),
                 ),
                 {"sticky": True},
             )

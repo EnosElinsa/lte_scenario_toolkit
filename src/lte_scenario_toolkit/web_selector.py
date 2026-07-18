@@ -12,9 +12,10 @@ from typing import Any
 from uuid import uuid4
 
 from .candidate_scanner import Candidate, ScanResult
+from .gui.assets import install_gui_assets
 from .gui.i18n import Translator
-from .gui.leaflet_assets import register_station_dots_resource
 from .gui.pages.candidates import (
+    CandidateScanProvenance,
     CandidateSession,
     build_candidate_map_bundle,
     build_candidate_overlay,
@@ -36,6 +37,7 @@ class WebSelectorPayload:
     preflight: Any
     selection_service: Any
     scan_result: ScanResult
+    scan_provenance: CandidateScanProvenance
     repo_root: Path
 
     def __post_init__(self) -> None:
@@ -45,6 +47,10 @@ class WebSelectorPayload:
             raise ValueError("web selector preflight requires a frozen profile")
         if self.selection_service is None:
             raise ValueError("web selector requires a selection service")
+        if not isinstance(self.scan_provenance, CandidateScanProvenance):
+            raise ValueError(
+                "web selector requires completed-scan provenance"
+            )
         object.__setattr__(
             self,
             "repo_root",
@@ -156,6 +162,7 @@ def _build_candidate_session(
         selection_service=payload.selection_service,
         repo_root=payload.repo_root,
         scan_result=payload.scan_result,
+        scan_provenance=payload.scan_provenance,
     )
     bundle = build_candidate_map_bundle(candidate_session, assets)
     candidate_session = CandidateSession(
@@ -166,6 +173,7 @@ def _build_candidate_session(
         repo_root=candidate_session.repo_root,
         map_bundle=bundle,
         scan_result=candidate_session.scan_result,
+        scan_provenance=candidate_session.scan_provenance,
     )
     return candidate_session, assets
 
@@ -211,28 +219,30 @@ def _render_selector_page(
     def cancel() -> None:
         stop_if_settled(selector.cancel())
 
-    ui.button(translator.text("action.cancel"), on_click=cancel).props(
-        "outline"
-    ).mark("web-selector-cancel")
-    render_candidate_page(
-        ui,
-        translator,
-        candidate_session,
-        coordinator,
-        station_layer_resource=station_layer_resource,
-        candidate_overlay_builder=lambda active, candidate, style: (
-            build_candidate_overlay(active, assets, candidate, style=style)
-        ),
-        dem_style_builder=lambda active, style: build_candidate_style_overlay(
-            active,
-            assets,
-            active.map_bundle.map_bounds,
-            style,
-        ),
-        on_confirm=confirm,
-        auto_start=False,
-        allow_rescan=False,
-    )
+    with ui.column().classes("lte-web-selector-frame"):
+        with ui.row().classes("lte-web-selector-actions"):
+            ui.button(translator.text("action.cancel"), on_click=cancel).props(
+                "outline"
+            ).mark("web-selector-cancel")
+        render_candidate_page(
+            ui,
+            translator,
+            candidate_session,
+            coordinator,
+            station_layer_resource=station_layer_resource,
+            candidate_overlay_builder=lambda active, candidate, style: (
+                build_candidate_overlay(active, assets, candidate, style=style)
+            ),
+            dem_style_builder=lambda active, style: build_candidate_style_overlay(
+                active,
+                assets,
+                active.map_bundle.map_bounds,
+                style,
+            ),
+            on_confirm=confirm,
+            auto_start=False,
+            allow_rescan=False,
+        )
     ui.context.client.on_delete(cancel)
 
 
@@ -252,7 +262,7 @@ def _run_server(session: _SelectorSession) -> None:
 
     candidate_session, assets = _build_candidate_session(payload)
     coordinator = JobCoordinator()
-    station_layer_resource = register_station_dots_resource(app)
+    station_layer_resource = install_gui_assets(app, ui)
     host = "127.0.0.1"
     port = _available_port()
     stop_browser = Event()

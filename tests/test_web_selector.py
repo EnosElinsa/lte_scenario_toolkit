@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from lte_scenario_toolkit.candidate_scanner import Candidate
+from lte_scenario_toolkit.gui.pages.candidates import CandidateScanProvenance
 
 
 def _candidates() -> list[Candidate]:
@@ -15,6 +16,10 @@ def _candidates() -> list[Candidate]:
         Candidate(0, 1, 0.0, 0.0, 1.0, 1.0),
         Candidate(4, 2, 4.0, 0.0, 5.0, 1.0),
     ]
+
+
+def _provenance() -> CandidateScanProvenance:
+    return CandidateScanProvenance(8.2, "miss", "cache-key")
 
 
 def test_web_selector_freezes_candidates_and_confirms_zero_based_index(monkeypatch):
@@ -121,11 +126,21 @@ def test_web_selector_payload_requires_a_completed_frozen_scan(tmp_path):
         preflight=preflight,
         selection_service=object(),
         scan_result=result,
+        scan_provenance=_provenance(),
         repo_root=tmp_path,
     )
 
     assert payload.scan_result is result
+    assert payload.scan_provenance == _provenance()
     assert payload.repo_root == tmp_path.resolve()
+    with pytest.raises(ValueError, match="provenance"):
+        web_selector.WebSelectorPayload(
+            preflight=preflight,
+            selection_service=object(),
+            scan_result=result,
+            scan_provenance=object(),
+            repo_root=tmp_path,
+        )
     with pytest.raises(ValueError, match="completed"):
         web_selector.WebSelectorPayload(
             preflight=preflight,
@@ -137,6 +152,7 @@ def test_web_selector_payload_requires_a_completed_frozen_scan(tmp_path):
                 completed=False,
                 algorithm_version="row-sweep-v1",
             ),
+            scan_provenance=_provenance(),
             repo_root=tmp_path,
         )
 
@@ -159,6 +175,7 @@ def test_web_selector_rejects_candidates_that_differ_from_payload_scan(
             completed=True,
             algorithm_version="row-sweep-v1",
         ),
+        scan_provenance=_provenance(),
         repo_root=tmp_path,
     )
     monkeypatch.setattr(
@@ -169,6 +186,59 @@ def test_web_selector_rejects_candidates_that_differ_from_payload_scan(
 
     with pytest.raises(ValueError, match="ScanResult"):
         web_selector.select_candidate(reversed(candidates), map_payload=payload)
+
+
+def test_candidate_session_builder_preserves_scan_provenance_twice(
+    tmp_path, monkeypatch
+):
+    from lte_scenario_toolkit import web_selector
+    from lte_scenario_toolkit.candidate_scanner import ScanResult
+
+    provenance = _provenance()
+    result = ScanResult(
+        candidates=tuple(_candidates()),
+        checked_positions=10,
+        total_positions=10,
+        completed=True,
+        algorithm_version="row-sweep-v1",
+    )
+    payload = web_selector.WebSelectorPayload(
+        preflight=SimpleNamespace(profile=object()),
+        selection_service=object(),
+        scan_result=result,
+        scan_provenance=provenance,
+        repo_root=tmp_path,
+    )
+    created = []
+
+    class Session:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+            self.__dict__.update(kwargs)
+
+    assets = object()
+    bundle = object()
+    monkeypatch.setattr(web_selector, "CandidateSession", Session)
+    monkeypatch.setattr(web_selector, "MapAssetService", lambda _root: assets)
+    monkeypatch.setattr(
+        web_selector,
+        "build_candidate_map_bundle",
+        lambda session, exact_assets: (
+            bundle
+            if session.scan_provenance is provenance and exact_assets is assets
+            else pytest.fail("builder lost scan provenance")
+        ),
+    )
+
+    session, returned_assets = web_selector._build_candidate_session(payload)
+
+    assert returned_assets is assets
+    assert session.scan_provenance is provenance
+    assert session.map_bundle is bundle
+    assert [item["scan_provenance"] for item in created] == [
+        provenance,
+        provenance,
+    ]
 
 
 def test_run_server_opens_loopback_browser_and_releases_owned_runtime(
@@ -191,12 +261,17 @@ def test_run_server_opens_loopback_browser_and_releases_owned_runtime(
             completed=True,
             algorithm_version="row-sweep-v1",
         ),
+        scan_provenance=_provenance(),
         repo_root=tmp_path,
     )
     session = web_selector._SelectorSession(candidates, payload)
     browser_opened = Event()
     stopped = Event()
-    calls = {"shutdown": 0, "coordinator_shutdown": 0}
+    calls = {
+        "shutdown": 0,
+        "coordinator_shutdown": 0,
+        "asset_install_count": 0,
+    }
 
     class FakeApp:
         def shutdown(self):
@@ -224,9 +299,13 @@ def test_run_server_opens_loopback_browser_and_releases_owned_runtime(
     monkeypatch.setattr(web_selector, "JobCoordinator", FakeCoordinator)
     monkeypatch.setattr(
         web_selector,
-        "register_station_dots_resource",
-        lambda app: (
-            calls.__setitem__("station_resource_app", app)
+        "install_gui_assets",
+        lambda app, ui: (
+            calls.__setitem__(
+                "asset_install_count",
+                calls["asset_install_count"] + 1,
+            )
+            or calls.__setitem__("asset_install", (app, ui))
             or "/_lte_gui/assets/station-dots.js"
         ),
     )
@@ -282,7 +361,8 @@ def test_run_server_opens_loopback_browser_and_releases_owned_runtime(
     assert calls["url"] == "http://127.0.0.1:43123/"
     assert calls["shutdown"] >= 1
     assert calls["coordinator_shutdown"] == 1
-    assert calls["station_resource_app"] is fake_app
+    assert calls["asset_install_count"] == 1
+    assert calls["asset_install"] == (fake_app, fake_ui)
 
 
 def test_run_server_browser_failure_is_actionable_and_still_cleans_up(
@@ -305,6 +385,7 @@ def test_run_server_browser_failure_is_actionable_and_still_cleans_up(
             completed=True,
             algorithm_version="row-sweep-v1",
         ),
+        scan_provenance=_provenance(),
         repo_root=tmp_path,
     )
     session = web_selector._SelectorSession(candidates, payload)
@@ -333,8 +414,8 @@ def test_run_server_browser_failure_is_actionable_and_still_cleans_up(
     monkeypatch.setattr(web_selector, "JobCoordinator", FakeCoordinator)
     monkeypatch.setattr(
         web_selector,
-        "register_station_dots_resource",
-        lambda _app: "/_lte_gui/assets/station-dots.js",
+        "install_gui_assets",
+        lambda _app, _ui: "/_lte_gui/assets/station-dots.js",
     )
     monkeypatch.setattr(
         web_selector,
@@ -390,6 +471,7 @@ def test_run_server_wraps_unexpected_nicegui_failure_after_cleanup(
             completed=True,
             algorithm_version="row-sweep-v1",
         ),
+        scan_provenance=_provenance(),
         repo_root=tmp_path,
     )
     session = web_selector._SelectorSession(candidates, payload)
@@ -417,8 +499,8 @@ def test_run_server_wraps_unexpected_nicegui_failure_after_cleanup(
     monkeypatch.setattr(web_selector, "JobCoordinator", FakeCoordinator)
     monkeypatch.setattr(
         web_selector,
-        "register_station_dots_resource",
-        lambda _app: "/_lte_gui/assets/station-dots.js",
+        "install_gui_assets",
+        lambda _app, _ui: "/_lte_gui/assets/station-dots.js",
     )
     monkeypatch.setattr(
         web_selector,
@@ -461,6 +543,7 @@ def test_run_server_missing_gui_extra_is_actionable(tmp_path, monkeypatch):
             completed=True,
             algorithm_version="row-sweep-v1",
         ),
+        scan_provenance=_provenance(),
         repo_root=tmp_path,
     )
     session = web_selector._SelectorSession(candidates, payload)
@@ -479,8 +562,22 @@ def test_selector_renderer_reuses_precomputed_candidate_page_without_rescan(
     selector = web_selector._SelectorSession(candidates, map_payload={})
     captured = {}
     delete_handlers = []
+    styled_containers = []
 
     class Element:
+        def __init__(self, kind="element"):
+            self.kind = kind
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def classes(self, value):
+            styled_containers.append((self.kind, value))
+            return self
+
         def props(self, _value):
             return self
 
@@ -495,6 +592,14 @@ def test_selector_renderer_reuses_precomputed_candidate_page_without_rescan(
         @staticmethod
         def button(*_args, **_kwargs):
             return Element()
+
+        @staticmethod
+        def column():
+            return Element("column")
+
+        @staticmethod
+        def row():
+            return Element("row")
 
         @staticmethod
         def notify(*_args, **_kwargs):
@@ -536,6 +641,8 @@ def test_selector_renderer_reuses_precomputed_candidate_page_without_rescan(
     assert captured["kwargs"]["station_layer_resource"] == (
         "/_lte_gui/assets/station-dots.js"
     )
+    assert ("column", "lte-web-selector-frame") in styled_containers
+    assert ("row", "lte-web-selector-actions") in styled_containers
     assert selector.wait(0) is candidates[1]
     assert app.shutdown_calls == 1
     assert len(delete_handlers) == 1

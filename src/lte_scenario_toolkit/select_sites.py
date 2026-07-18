@@ -99,11 +99,13 @@ def _web_selected_candidate(
     preflight: SelectionPreflight,
     selection_service: SelectionService,
     repo_root: str | Path,
+    scan_progress: SelectionProgress,
 ) -> Candidate | None:
     """Run the optional local web selector without importing it for other modes."""
 
     guidance = "Use --select-index in headless environments."
     try:
+        from .gui.pages.candidates import CandidateScanProvenance
         from .web_selector import (
             WebSelectorError,
             WebSelectorPayload,
@@ -113,10 +115,22 @@ def _web_selected_candidate(
         raise SelectorError(f"Web selector is unavailable: {exc}. {guidance}") from exc
 
     try:
+        if not isinstance(scan_progress, SelectionProgress):
+            raise ValueError("Web selection requires completed scan progress")
+        if scan_progress.cache_status not in {"hit", "miss", "forced"}:
+            raise ValueError("Selection scan did not report a cache status")
+        if type(scan_progress.cache_key) is not str or not scan_progress.cache_key:
+            raise ValueError("Selection scan did not report a cache key")
+        provenance = CandidateScanProvenance(
+            elapsed_seconds=scan_progress.elapsed_seconds,
+            cache_status=scan_progress.cache_status,
+            cache_key=scan_progress.cache_key,
+        )
         payload = WebSelectorPayload(
             preflight=preflight,
             selection_service=selection_service,
             scan_result=scan_result,
+            scan_provenance=provenance,
             repo_root=Path(repo_root).expanduser().resolve(strict=False),
         )
         return select_candidate(scan_result.candidates, map_payload=payload)
@@ -131,6 +145,7 @@ def _select_candidate(
     config: dict[str, Any],
     preflight: SelectionPreflight,
     selection_service: SelectionService,
+    scan_progress: SelectionProgress | None = None,
 ) -> Candidate | None:
     """Select one candidate by explicit index or the local web UI."""
 
@@ -147,6 +162,7 @@ def _select_candidate(
         preflight=preflight,
         selection_service=selection_service,
         repo_root=config["repo_root"],
+        scan_progress=scan_progress,
     )
     return None if selected is None else _scanned_candidate(selected, scan_result)
 
@@ -295,6 +311,7 @@ def main(argv=None) -> int:
             config=config,
             preflight=preflight,
             selection_service=selection_service,
+            scan_progress=cache_progress,
         )
         if selected_candidate is None:
             print("No rectangle selected", file=sys.stderr)

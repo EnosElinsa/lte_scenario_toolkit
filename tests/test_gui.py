@@ -176,6 +176,9 @@ def test_station_dot_resource_is_local_and_registered_once():
     assert calls[0] == ("remove", url)
     assert calls[1][1]["local_file"].name == "station_dots.js"
     assert calls[1][1]["strict"] is True
+    source = calls[1][1]["local_file"].read_text(encoding="utf-8")
+    assert "L.circleMarker(latlng, dotStyle)" in source
+    assert "L.marker(" not in source
 
 
 def test_translation_dictionaries_have_identical_keys_and_format_values():
@@ -3801,6 +3804,7 @@ async def test_candidate_route_uses_one_offline_leaflet_and_preserves_it_on_view
     maps = user.find(kind=ui.leaflet).elements
     assert len(maps) == 1
     map_element = next(iter(maps))
+    assert map_element._props["options"]["preferCanvas"] is True
     assert not any(isinstance(layer, TileLayer) for layer in map_element.layers)
     assert not any("tile.osm" in str(layer) for layer in map_element.layers)
     station_layers = [
@@ -3834,6 +3838,8 @@ async def test_candidate_route_uses_one_offline_leaflet_and_preserves_it_on_view
             break
         await asyncio.sleep(0.05)
     assert len(rectangles) == 2
+    station_index = map_element.layers.index(station_layers[0])
+    assert all(station_index < map_element.layers.index(layer) for layer in rectangles)
     assert {layer.args[1]["color"] for layer in rectangles} == {"#dc3f4f"}
     assert all(layer.args[1]["pane"] == "overlayPane" for layer in rectangles)
 
@@ -3870,6 +3876,111 @@ async def test_candidate_route_uses_one_offline_leaflet_and_preserves_it_on_view
 
     user.find(marker="candidate-confirm").click()
     assert registry.get("session-1").locked_candidate.flat_grid_id == 4
+
+
+async def test_candidate_workbench_presents_progress_and_technical_details(
+    user, tmp_path
+):
+    from dataclasses import replace
+
+    from nicegui import ui
+
+    from lte_scenario_toolkit.gui.app import create_app
+    from lte_scenario_toolkit.gui.pages.candidates import (
+        CandidateScanProvenance,
+        CandidateSessionRegistry,
+    )
+    from lte_scenario_toolkit.selection_service import DemStatistics
+
+    class Service:
+        @staticmethod
+        def candidate_statistics(*_args, **_kwargs):
+            return DemStatistics(1.0, 5.0, 3.0, 4.0, 10)
+
+    registry = CandidateSessionRegistry()
+    registry.add(
+        replace(
+            _task14_session(
+                tmp_path,
+                Service(),
+                map_bundle=_task14_map_bundle(tmp_path),
+            ),
+            scan_result=_task14_scan_result(),
+            scan_provenance=CandidateScanProvenance(8.2, "miss", "cache-key"),
+        )
+    )
+    create_app(
+        catalog=_Task13Catalog(tmp_path),
+        profile_store=object(),
+        candidate_registry=registry,
+        testing=True,
+    )
+
+    await user.open("/candidates/session-1")
+
+    await user.should_see("100%")
+    await user.should_see("10 / 10")
+    await user.should_see("Fresh scan")
+    await user.should_see("8.2 s elapsed")
+    await user.should_not_see("Cache: miss")
+    await user.should_see(marker="candidate-view-control")
+    progress = next(iter(user.find(kind=ui.linear_progress).elements))
+    assert tuple(progress.default_slot.children) == ()
+
+    map_button = next(iter(user.find(marker="candidate-view-map").elements))
+    filmstrip_button = next(
+        iter(user.find(marker="candidate-view-filmstrip").elements)
+    )
+    assert map_button.props["aria-pressed"] == "true"
+    assert filmstrip_button.props["aria-pressed"] == "false"
+    assert "outline" not in map_button.props
+    assert "unelevated" not in filmstrip_button.props
+
+    user.find(marker="candidate-next").click()
+    await user.should_see("Candidate 1")
+    await user.should_see("1 station")
+    await user.should_see("Min 1.0 m", retries=15)
+    primary = next(iter(user.find(marker="candidate-primary-summary").elements))
+    assert primary.text == "1 station"
+    assert "Grid ID" not in primary.text
+    await user.should_see(marker="candidate-technical-details")
+    technical = next(iter(user.find(marker="candidate-technical-copy").elements))
+    assert "Grid ID 0" in technical.text
+    assert "Fast scan" in technical.text
+    assert "10 pixels" in technical.text
+    assert "cache-key" in technical.text
+    assert "row-sweep-v1" in technical.text
+
+    map_element = next(iter(user.find(kind=ui.leaflet).elements))
+    map_identity = id(map_element)
+    layer_identities = tuple(id(layer) for layer in map_element.layers)
+    user.find(marker="candidate-view-filmstrip").click()
+    assert map_button.props["aria-pressed"] == "false"
+    assert filmstrip_button.props["aria-pressed"] == "true"
+    assert "unelevated" not in map_button.props
+    assert "outline" not in filmstrip_button.props
+    user.find(marker="candidate-view-map").click()
+    assert id(next(iter(user.find(kind=ui.leaflet).elements))) == map_identity
+    assert tuple(id(layer) for layer in map_element.layers) == layer_identities
+
+
+def test_candidate_workbench_css_is_bounded_and_mobile_safe():
+    css = (
+        ROOT / "src/lte_scenario_toolkit/gui/assets/app.css"
+    ).read_text(encoding="utf-8")
+
+    assert "grid-template-columns: minmax(0, 1fr) clamp(320px, 24vw, 360px);" in css
+    assert "grid-auto-flow: column;" in css
+    assert "grid-auto-columns: clamp(220px, 22vw, 280px);" in css
+    assert "overflow-x: auto;" in css
+    desktop = css.index(".lte-candidate-workspace")
+    tablet = css.index("@media (max-width: 980px)")
+    mobile = css.index("@media (max-width: 760px)")
+    assert desktop < tablet < mobile
+    assert "grid-template-columns: 1fr" in css[tablet:mobile]
+    mobile_block = css[mobile:]
+    assert "min-height: 420px" in mobile_block
+    assert ".lte-filmstrip-grid { grid-template-columns" not in mobile_block
 
 
 async def test_candidate_page_can_disable_all_rescan_entrypoints(user, tmp_path):
