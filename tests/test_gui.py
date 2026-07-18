@@ -4,6 +4,7 @@ import asyncio
 import importlib
 import json
 import os
+import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -93,6 +94,225 @@ def test_translation_dictionaries_have_identical_keys_and_format_values():
     assert set(module.TRANSLATIONS["en"]) == set(module.TRANSLATIONS["zh-CN"])
     assert module.Translator("zh-CN").text("nav.scenarios") == "\u573a\u666f"
     assert module.Translator("en").text("job.running", name="Scan 1") == "Running Scan 1"
+
+
+def test_presentation_spec_is_an_immutable_compact_value():
+    module = _gui_module("presentation")
+
+    spec = module.PresentationSpec("status.example")
+
+    assert spec.label_key == "status.example"
+    assert spec.tone == "neutral"
+    assert spec.description_key is None
+    assert not hasattr(spec, "__dict__")
+    with pytest.raises(FrozenInstanceError):
+        spec.tone = "info"
+
+
+def test_presentation_mappings_cover_current_gui_machine_values():
+    module = _gui_module("presentation")
+    spec = module.PresentationSpec
+
+    assert {
+        value: module.readiness_presentation(value)
+        for value in ("ready", "boundary-ready", "dem-pending", "invalid")
+    } == {
+        "ready": spec(
+            "status.ready", "success", "readiness.ready.description"
+        ),
+        "boundary-ready": spec(
+            "status.boundary_ready",
+            "warning",
+            "readiness.boundary_ready.description",
+        ),
+        "dem-pending": spec(
+            "status.dem_pending",
+            "warning",
+            "readiness.dem_pending.description",
+        ),
+        "invalid": spec(
+            "status.invalid", "danger", "readiness.invalid.description"
+        ),
+    }
+    assert {
+        value: module.cache_presentation(value) for value in ("none", "hit", "miss")
+    } == {
+        "none": spec("cache.none"),
+        "hit": spec("cache.hit", "success"),
+        "miss": spec("cache.miss", "info"),
+    }
+    assert {
+        value: module.scan_mode_presentation(value)
+        for value in ("fast", "complete")
+    } == {
+        "fast": spec("scan.fast"),
+        "complete": spec("scan.complete"),
+    }
+    assert {
+        value: module.artifact_label_presentation(value)
+        for value in (
+            "csv",
+            "preview_png",
+            "terrain_png",
+            "terrain_eps",
+            "terrain_html",
+        )
+    } == {
+        "csv": spec(
+            "generate.artifact.csv",
+            description_key="generate.artifact.csv.description",
+        ),
+        "preview_png": spec(
+            "generate.artifact.preview_png",
+            description_key="generate.artifact.preview_png.description",
+        ),
+        "terrain_png": spec(
+            "generate.artifact.terrain_png",
+            description_key="generate.artifact.terrain_png.description",
+        ),
+        "terrain_eps": spec(
+            "generate.artifact.terrain_eps",
+            description_key="generate.artifact.terrain_eps.description",
+        ),
+        "terrain_html": spec(
+            "generate.artifact.terrain_html",
+            description_key="generate.artifact.terrain_html.description",
+        ),
+    }
+    assert {
+        value: module.artifact_state_presentation(value)
+        for value in ("not-requested", "pending", "published", "failed")
+    } == {
+        "not-requested": spec("status.not_requested"),
+        "pending": spec("status.pending", "active"),
+        "published": spec("status.published", "success"),
+        "failed": spec("status.failed", "danger"),
+    }
+    assert {
+        value: module.run_state_presentation(value)
+        for value in ("completed", "partial")
+    } == {
+        "completed": spec("status.completed", "success"),
+        "partial": spec("status.partial", "warning"),
+    }
+    assert {
+        value: module.job_kind_presentation(value)
+        for value in (
+            "validation.full_checksum",
+            "generate",
+            "selection.scan",
+            "candidate.dem_style",
+            "candidate.statistics",
+            "figure-source",
+            "figure-preview",
+            "figure-export",
+        )
+    } == {
+        "validation.full_checksum": spec("job.kind.full_checksum", "active"),
+        "generate": spec("job.kind.generate", "active"),
+        "selection.scan": spec("job.kind.selection_scan", "active"),
+        "candidate.dem_style": spec("job.kind.dem_style", "active"),
+        "candidate.statistics": spec("job.kind.statistics", "active"),
+        "figure-source": spec("job.kind.figure_source", "active"),
+        "figure-preview": spec("job.kind.figure_preview", "active"),
+        "figure-export": spec("job.kind.figure_export", "active"),
+    }
+
+
+def test_presentation_mappings_fail_safe_for_unknown_values():
+    module = _gui_module("presentation")
+    unknown = module.PresentationSpec("status.unknown")
+
+    for mapping in (
+        module.readiness_presentation,
+        module.cache_presentation,
+        module.scan_mode_presentation,
+        module.artifact_label_presentation,
+        module.artifact_state_presentation,
+        module.run_state_presentation,
+        module.job_kind_presentation,
+    ):
+        assert mapping("future-machine-value") == unknown
+        assert mapping(None) == unknown
+
+
+def test_presentation_translation_keys_are_complete_and_localized():
+    i18n = _gui_module("i18n")
+    presentation = _gui_module("presentation")
+    machine_values = {
+        presentation.readiness_presentation: (
+            "ready",
+            "boundary-ready",
+            "dem-pending",
+            "invalid",
+        ),
+        presentation.cache_presentation: ("none", "hit", "miss"),
+        presentation.scan_mode_presentation: ("fast", "complete"),
+        presentation.artifact_label_presentation: (
+            "csv",
+            "preview_png",
+            "terrain_png",
+            "terrain_eps",
+            "terrain_html",
+        ),
+        presentation.artifact_state_presentation: (
+            "not-requested",
+            "pending",
+            "published",
+            "failed",
+        ),
+        presentation.run_state_presentation: ("completed", "partial"),
+        presentation.job_kind_presentation: (
+            "validation.full_checksum",
+            "generate",
+            "selection.scan",
+            "candidate.dem_style",
+            "candidate.statistics",
+            "figure-source",
+            "figure-preview",
+            "figure-export",
+        ),
+    }
+    keys = {"status.unknown"}
+    for mapping, values in machine_values.items():
+        for value in values:
+            item = mapping(value)
+            keys.add(item.label_key)
+            if item.description_key is not None:
+                keys.add(item.description_key)
+
+    for language in i18n.SUPPORTED_LANGUAGES:
+        assert keys <= set(i18n.TRANSLATIONS[language])
+    assert i18n.Translator("en").text("status.boundary_ready") == "Boundary available"
+    assert i18n.Translator("zh-CN").text("status.boundary_ready") == "\u8fb9\u754c\u6570\u636e\u53ef\u7528"
+    assert i18n.Translator("en").text("cache.hit") == "Cached scan"
+    assert i18n.Translator("zh-CN").text("cache.hit") == "\u5df2\u590d\u7528\u7f13\u5b58\u626b\u63cf"
+    assert i18n.Translator("en").text("scan.complete") == "Complete scan"
+    assert i18n.Translator("zh-CN").text("scan.complete") == "\u5b8c\u6574\u626b\u63cf"
+    assert i18n.Translator("en").text("job.kind.figure_export") == "Figure export"
+    assert i18n.Translator("zh-CN").text("job.kind.figure_export") == "\u56fe\u8868\u5bfc\u51fa"
+
+
+def test_development_option_prefixes_are_absent_from_all_translations():
+    module = _gui_module("i18n")
+    prefixed = [
+        (language, key, text)
+        for language, translations in module.TRANSLATIONS.items()
+        for key, text in translations.items()
+        if re.match(r"^[ABC][:\uff1a]", text)
+    ]
+
+    assert prefixed == []
+    assert module.Translator("en").text("candidates.view_map") == "Map"
+    assert (
+        module.Translator("en").text("candidates.view_filmstrip")
+        == "Map and candidates"
+    )
+    assert module.Translator("zh-CN").text("candidates.view_map") == "\u5730\u56fe"
+    assert (
+        module.Translator("zh-CN").text("candidates.view_filmstrip")
+        == "\u5730\u56fe\u4e0e\u5019\u9009\u533a\u57df"
+    )
 
 
 def test_gui_settings_are_local_and_atomic(tmp_path):
