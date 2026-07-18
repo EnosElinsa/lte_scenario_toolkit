@@ -1216,6 +1216,11 @@ button:disabled,
 
   .lte-language-select .q-field__control { min-height: 44px; }
 
+  .lte-generation-artifact-row .q-checkbox {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
   .lte-main {
     min-height: calc(100vh - 64px);
     padding: 18px 12px 28px;

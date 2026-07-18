@@ -412,6 +412,8 @@ def render_generate_page(
     checkboxes: dict[str, Any] = {}
     artifact_status_holders: dict[str, Any] = {}
     navigated = False
+    selection_locked = False
+    locked_selection = ARTIFACT_ORDER
 
     with ui.column().classes("lte-page lte-generate-page"):
         ui.label(translator.text("generate.title")).classes("lte-page-title")
@@ -469,6 +471,12 @@ def render_generate_page(
                                 artifact_state_presentation("pending"),
                                 marker=f"generation-artifact-status-{token}",
                             )
+        selection_guidance = ui.label(
+            translator.text("generate.selection_required")
+        ).classes("lte-callout lte-callout--warning").mark(
+            "generation-selection-guidance"
+        )
+        selection_guidance.set_visibility(False)
         warning_box = ui.column().classes("lte-generate-warnings")
         error_box = ui.column().classes("lte-generate-errors")
         with ui.row().classes("lte-card-actions lte-generation-actions"):
@@ -507,6 +515,35 @@ def render_generate_page(
                 artifact_state_presentation(raw_status),
                 marker=f"generation-artifact-status-{token}",
             )
+
+    def selected_artifacts() -> tuple[str, ...]:
+        return tuple(
+            token for token in ARTIFACT_ORDER if bool(checkboxes[token].value)
+        )
+
+    def sync_ready_selection() -> tuple[str, ...]:
+        selected = selected_artifacts()
+        if selection_locked or controller.state.phase != "ready":
+            return selected
+        selected_set = set(selected)
+        for token in ARTIFACT_ORDER:
+            render_artifact_status(
+                token,
+                "pending" if token in selected_set else "not-requested",
+            )
+        submit.set_enabled(bool(selected))
+        selection_guidance.set_visibility(not selected)
+        return selected
+
+    def selection_changed(token: str, value: object) -> None:
+        if selection_locked or controller.state.phase != "ready":
+            checkbox = checkboxes[token]
+            expected = token in locked_selection
+            checkbox.disable()
+            if bool(value) != expected:
+                checkbox.set_value(expected)
+            return
+        sync_ready_selection()
 
     def render_outcome_details(state: GenerationState) -> None:
         warning_box.clear()
@@ -549,7 +586,13 @@ def render_generate_page(
                     marker="generation-technical-details",
                 )
 
+    for artifact_token, checkbox in checkboxes.items():
+        checkbox.on_value_change(
+            lambda event, token=artifact_token: selection_changed(token, event.value)
+        )
+
     render_phase("ready")
+    sync_ready_selection()
 
     def tick() -> None:
         nonlocal navigated
@@ -569,17 +612,25 @@ def render_generate_page(
             return
 
     def start() -> None:
-        selected = tuple(
-            token for token in ARTIFACT_ORDER if bool(checkboxes[token].value)
-        )
+        nonlocal locked_selection, selection_locked
+        selected = selected_artifacts()
+        if not selected:
+            sync_ready_selection()
+            return
         try:
             controller.start(selected)
         except JobBusyError:
             ui.notify(translator.text("error.job_busy"), type="warning")
             return
-        except (RuntimeError, ValueError) as exc:
-            ui.notify(str(exc), type="warning")
+        except ValueError:
+            selection_guidance.set_visibility(True)
+            submit.disable()
             return
+        except RuntimeError:
+            ui.notify(translator.text("operation.failed"), type="warning")
+            return
+        locked_selection = selected
+        selection_locked = True
         submit.disable()
         for checkbox in checkboxes.values():
             checkbox.disable()

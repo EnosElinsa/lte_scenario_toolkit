@@ -135,6 +135,9 @@ def test_gui_css_defines_field_atlas_shell_and_mobile_touch_contract():
     assert "min-height: 44px;" in declarations(
         ".lte-language-select .q-field__control"
     )
+    artifact_checkbox = declarations(".lte-generation-artifact-row .q-checkbox")
+    assert "min-width: 44px;" in artifact_checkbox
+    assert "min-height: 44px;" in artifact_checkbox
 
     action_rule = re.search(
         r"\.lte-command-bar \.q-btn,(?P<selectors>[^\{]+)"
@@ -4532,6 +4535,17 @@ async def test_generation_page_uses_semantic_artifact_rows_and_live_partial_stat
             for token in expected
         )
         assert not next(iter(user.find(marker="generation-submit").elements)).enabled
+        csv_checkbox = next(
+            iter(user.find(marker="generation-artifact-select-csv").elements)
+        )
+        csv_checkbox.set_value(False)
+        await asyncio.sleep(0.1)
+        assert csv_checkbox.value is True
+        assert csv_checkbox.enabled is False
+        await user.should_see(
+            marker="generation-artifact-status-csv",
+            content="Pending",
+        )
 
         release.set()
         await user.should_see(marker="generation-phase", content="Some artifacts failed", retries=30)
@@ -4557,6 +4571,58 @@ async def test_generation_page_uses_semantic_artifact_rows_and_live_partial_stat
         assert "terrain_png" not in primary.text
     finally:
         release.set()
+        coordinator.shutdown()
+
+
+async def test_generation_selection_state_gates_submit_and_updates_status(
+    user,
+    tmp_path,
+):
+    from lte_scenario_toolkit.gui.app import create_app
+    from lte_scenario_toolkit.gui.pages.candidates import CandidateSessionRegistry
+    from lte_scenario_toolkit.gui.pages.generate import ARTIFACT_ORDER
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    coordinator = JobCoordinator()
+    registry = CandidateSessionRegistry()
+    registry.add(_task15_locked_session(tmp_path, object(), session_id="selection-state"))
+    create_app(
+        catalog=_Task13Catalog(tmp_path),
+        profile_store=object(),
+        candidate_registry=registry,
+        coordinator=coordinator,
+        testing=True,
+    )
+
+    try:
+        await user.open("/generate/selection-state")
+        for token in ARTIFACT_ORDER:
+            user.find(marker=f"generation-artifact-select-{token}").click()
+
+        await user.should_see(
+            marker="generation-selection-guidance",
+            content="Select at least one artifact",
+            retries=12,
+        )
+        assert not next(iter(user.find(marker="generation-submit").elements)).enabled
+        for token in ARTIFACT_ORDER:
+            await user.should_see(
+                marker=f"generation-artifact-status-{token}",
+                content="Not requested",
+            )
+
+        user.find(marker="generation-artifact-select-csv").click()
+        await user.should_not_see(marker="generation-selection-guidance", retries=12)
+        assert next(iter(user.find(marker="generation-submit").elements)).enabled
+        await user.should_see(
+            marker="generation-artifact-status-csv",
+            content="Pending",
+        )
+        await user.should_see(
+            marker="generation-artifact-status-terrain_png",
+            content="Not requested",
+        )
+    finally:
         coordinator.shutdown()
 
 
@@ -5743,6 +5809,134 @@ def test_history_cross_root_source_uses_path_and_run_id_without_collision(tmp_pa
     assert action.path == parent_path.resolve()
     assert action.destination_root == child_root.resolve()
     assert action.derived_parent_run_id == child.run_id
+
+
+def test_history_action_relinks_current_intermediate_source_chain(tmp_path):
+    from lte_scenario_toolkit.gui.pages.history import (
+        HistoryAction,
+        history_rows,
+        resolve_history_action,
+    )
+    from lte_scenario_toolkit.run_service import RunService
+
+    service = RunService(tmp_path / "runs")
+
+    def completed_csv(name, created_at):
+        run = service.begin("city", "default", created_at=created_at)
+        (run.path / f"{name}.csv").write_text("X,Y\n1,2\n", encoding="utf-8")
+        path = service.publish(
+            run,
+            status="completed",
+            artifacts=[f"{name}.csv"],
+            metadata={"run_kind": "selection"},
+        )
+        return run, path
+
+    source_a, path_a = completed_csv("source-a", "2026-07-16T10:00:00Z")
+    source_d, path_d = completed_csv("source-d", "2026-07-16T10:00:01Z")
+    intermediate = service.begin(
+        "city",
+        "default",
+        created_at="2026-07-16T10:00:02Z",
+    )
+    (intermediate.path / "intermediate.png").write_bytes(b"png")
+    intermediate_path = service.publish(
+        intermediate,
+        status="completed",
+        artifacts=["intermediate.png"],
+        metadata={
+            "run_kind": "figure",
+            "source": {"path": str(path_a), "run_id": source_a.run_id},
+        },
+    )
+    child = service.begin(
+        "city",
+        "default",
+        created_at="2026-07-16T10:00:03Z",
+        parent_run_id=intermediate.run_id,
+    )
+    (child.path / "child.png").write_bytes(b"png")
+    service.publish(
+        child,
+        status="completed",
+        artifacts=["child.png"],
+        metadata={
+            "run_kind": "figure",
+            "source": {
+                "path": str(intermediate_path),
+                "run_id": intermediate.run_id,
+            },
+        },
+    )
+    child_row = next(
+        row for row in history_rows(service) if row.run_id == child.run_id
+    )
+    assert child_row.figure_source_path == path_a.resolve()
+
+    manifest_path = intermediate_path / "run.json"
+    rewired = json.loads(manifest_path.read_text(encoding="utf-8"))
+    rewired["metadata"]["source"] = {
+        "path": str(path_d),
+        "run_id": source_d.run_id,
+    }
+    manifest_path.write_text(json.dumps(rewired), encoding="utf-8")
+
+    action = resolve_history_action(child_row, HistoryAction.OPEN_FIGURES)
+    assert action.path == path_d.resolve()
+    assert action.path != path_a.resolve()
+    assert action.run_id == source_d.run_id
+
+
+def test_history_action_rejects_completed_source_without_current_csv(tmp_path):
+    from lte_scenario_toolkit.gui.pages.history import (
+        HistoryAction,
+        HistoryActionError,
+        _figure_source_path,
+        history_rows,
+        resolve_history_action,
+    )
+    from lte_scenario_toolkit.run_service import RunService
+
+    service = RunService(tmp_path / "runs")
+    source = service.begin("city", "default", created_at="2026-07-16T10:00:00Z")
+    (source.path / "source.csv").write_text("X,Y\n1,2\n", encoding="utf-8")
+    source_path = service.publish(
+        source,
+        status="completed",
+        artifacts=["source.csv"],
+        metadata={"run_kind": "selection"},
+    )
+    child = service.begin(
+        "city",
+        "default",
+        created_at="2026-07-16T10:00:01Z",
+        parent_run_id=source.run_id,
+    )
+    (child.path / "terrain.png").write_bytes(b"png")
+    service.publish(
+        child,
+        status="completed",
+        artifacts=["terrain.png"],
+        metadata={
+            "run_kind": "figure",
+            "source": {"path": str(source_path), "run_id": source.run_id},
+        },
+    )
+    child_row = next(
+        row for row in history_rows(service) if row.run_id == child.run_id
+    )
+    assert child_row.figure_source_path == source_path.resolve()
+
+    manifest_path = source_path / "run.json"
+    without_csv = json.loads(manifest_path.read_text(encoding="utf-8"))
+    without_csv["artifacts"] = []
+    (source_path / "source.csv").unlink()
+    manifest_path.write_text(json.dumps(without_csv), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="CSV"):
+        _figure_source_path(source_path, without_csv)
+    with pytest.raises(HistoryActionError, match="compatible figure source"):
+        resolve_history_action(child_row, HistoryAction.OPEN_FIGURES)
 
 
 def test_history_source_cycle_is_non_actionable_instead_of_recursive(tmp_path):

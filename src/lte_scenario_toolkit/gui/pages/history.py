@@ -128,6 +128,7 @@ class HistoryRow:
     figure_source_path: Path | None = None
     missing_artifacts: tuple[str, ...] = ()
     retry_formats: tuple[str, ...] = ()
+    discovery_roots: tuple[Path, ...] = ()
 
     @property
     def can_open_figures(self) -> bool:
@@ -190,6 +191,12 @@ def _figure_source_path(path: Path, record: Mapping[str, Any]) -> Path:
 
     if record.get("status") != "completed":
         raise ValueError("figure source run must be completed")
+    artifacts = record.get("artifacts", ())
+    if not isinstance(artifacts, (list, tuple)) or not any(
+        type(artifact) is str and Path(artifact).suffix.casefold() == ".csv"
+        for artifact in artifacts
+    ):
+        raise ValueError("figure source run must contain a current CSV artifact")
     return path
 
 
@@ -303,6 +310,7 @@ def _row_from_entry(entry: RunEntry) -> HistoryRow:
         figure_source_path=source_path,
         missing_artifacts=missing,
         retry_formats=retry_formats,
+        discovery_roots=(reference.root,),
     )
 
 
@@ -316,8 +324,19 @@ def _created_at_sort_key(row: HistoryRow) -> tuple[datetime, str, str]:
     )
 
 
-def _link_figure_sources(rows: Iterable[HistoryRow]) -> tuple[HistoryRow, ...]:
+def _link_figure_sources(
+    rows: Iterable[HistoryRow],
+    *,
+    discovery_roots: Iterable[Path] | None = None,
+) -> tuple[HistoryRow, ...]:
     values = tuple(rows)
+    linked_roots = tuple(
+        dict.fromkeys(
+            (row.root for row in values)
+            if discovery_roots is None
+            else discovery_roots
+        )
+    )
     by_identity = {
         (_path_identity(row.root), row.run_id): row for row in values
     }
@@ -389,6 +408,7 @@ def _link_figure_sources(rows: Iterable[HistoryRow]) -> tuple[HistoryRow, ...]:
                         else source.expected_path
                     )
                 ),
+                discovery_roots=linked_roots,
             )
         )
     return tuple(linked)
@@ -432,7 +452,10 @@ def history_rows(service: RunService) -> tuple[HistoryRow, ...]:
     rows, _ = _discover_rows(service)
     return tuple(
         sorted(
-            _link_figure_sources(rows),
+            _link_figure_sources(
+                rows,
+                discovery_roots=(service.output_root.resolve(strict=False),),
+            ),
             key=_created_at_sort_key,
             reverse=True,
         )
@@ -562,7 +585,7 @@ def rebuild_history(
                 continue
             seen.add(identity)
             rows.append(row)
-    rows = list(_link_figure_sources(rows))
+    rows = list(_link_figure_sources(rows, discovery_roots=roots))
     rows.sort(key=_created_at_sort_key, reverse=True)
     target = _requested_index_path(repository, index_path)
     index_enabled = True
@@ -633,6 +656,51 @@ def resolve_history_reference(
     return path, _freeze(entry.record)
 
 
+def _same_history_reference(
+    left: HistoryRunReference,
+    right: HistoryRunReference,
+) -> bool:
+    return (
+        _path_identity(left.root) == _path_identity(right.root)
+        and left.run_id == right.run_id
+        and left.scenario_id == right.scenario_id
+        and left.profile_id == right.profile_id
+        and left.created_at == right.created_at
+        and _path_identity(left.expected_path) == _path_identity(right.expected_path)
+    )
+
+
+def _fresh_linked_action_row(row: HistoryRow) -> HistoryRow:
+    """Re-discover configured roots and rebuild the source graph for one click."""
+
+    roots = row.discovery_roots or (row.root,)
+    rows: list[HistoryRow] = []
+    seen: set[tuple[str, str]] = set()
+    for root in roots:
+        try:
+            discovered, _diagnostics = _discover_rows(RunService(root))
+        except Exception as exc:
+            raise HistoryActionError(
+                "Run history changed; refresh History and try again"
+            ) from exc
+        for candidate in discovered:
+            identity = (_path_identity(candidate.path), candidate.run_id)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            rows.append(candidate)
+    matches = [
+        candidate
+        for candidate in _link_figure_sources(rows, discovery_roots=roots)
+        if _same_history_reference(candidate.reference, row.reference)
+    ]
+    if len(matches) != 1:
+        raise HistoryActionError(
+            "The selected run is no longer available; refresh History and try again"
+        )
+    return matches[0]
+
+
 def resolve_history_action(
     row: HistoryRow,
     action: HistoryAction | str,
@@ -677,13 +745,25 @@ def resolve_history_action(
         )
         if metadata.get("source") != old_metadata.get("source"):
             raise HistoryActionError("The selected run source changed; refresh History")
-        reference = row.figure_source_reference
-        if reference is None:
+        if row.figure_source_reference is None:
             raise HistoryActionError("This run has no compatible figure source")
-        if reference == row.reference:
-            path, record = clicked_path, clicked_record
-        else:
-            path, record = resolve_history_reference(reference)
+        fresh_row = _fresh_linked_action_row(row)
+        fresh_metadata_value = fresh_row.record.get("metadata", {})
+        fresh_metadata = (
+            fresh_metadata_value
+            if isinstance(fresh_metadata_value, Mapping)
+            else {}
+        )
+        if fresh_row.parent_run_id != clicked_record.get("parent_run_id"):
+            raise HistoryActionError("The selected run lineage changed; refresh History")
+        if fresh_metadata.get("source") != metadata.get("source"):
+            raise HistoryActionError("The selected run source changed; refresh History")
+        reference = fresh_row.figure_source_reference
+        if reference is None:
+            raise HistoryActionError(
+                "This run no longer has one safe compatible figure source"
+            )
+        path, record = resolve_history_reference(reference)
         try:
             path = _figure_source_path(path, record)
         except ValueError as exc:
