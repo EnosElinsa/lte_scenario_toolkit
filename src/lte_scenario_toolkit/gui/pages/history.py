@@ -1034,7 +1034,6 @@ def render_history_content(
                                         "Retry Missing Artifacts",
                                     ),
                                     lambda current=row: retry_missing(current),
-                                    role="primary",
                                     marker=f"history-retry-{row.run_id}",
                                 )
                             )

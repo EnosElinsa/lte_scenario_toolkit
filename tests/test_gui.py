@@ -6024,9 +6024,12 @@ async def test_history_cards_prioritize_human_summary_and_gate_retry_action(
     await user.should_not_see(marker=f"history-retry-{parent.run_id}")
     inspect = next(iter(user.find(marker=f"history-inspect-{child.run_id}").elements))
     open_figures = next(iter(user.find(marker=f"history-open-{child.run_id}").elements))
+    retry = next(iter(user.find(marker=f"history-retry-{child.run_id}").elements))
     reveal = next(iter(user.find(marker=f"history-reveal-{child.run_id}").elements))
     assert "outline" not in inspect.props
     assert "outline" not in open_figures.props
+    assert "outline" in retry.props
+    assert "unelevated" not in retry.props
     assert "outline" in reveal.props
 
 
