@@ -118,7 +118,40 @@ def test_gui_css_defines_field_atlas_shell_and_mobile_touch_contract():
     mobile_start = css.index("@media (max-width: 760px)")
     next_media = css.find("@media", mobile_start + 1)
     mobile_block = css[mobile_start : None if next_media == -1 else next_media]
-    assert "min-height: 44px" in mobile_block
+
+    def declarations(selector: str) -> str:
+        match = re.search(
+            rf"{re.escape(selector)}\s*\{{(?P<body>[^}}]+)\}}",
+            mobile_block,
+        )
+        assert match is not None, f"missing mobile rule for {selector}"
+        return match.group("body")
+
+    shell_menu = declarations(".lte-shell-menu")
+    assert "min-width: 44px;" in shell_menu
+    assert "min-height: 44px;" in shell_menu
+    assert "min-height: 44px;" in declarations(".lte-nav__link")
+    assert "min-height: 44px;" in declarations(".lte-language-select")
+    assert "min-height: 44px;" in declarations(
+        ".lte-language-select .q-field__control"
+    )
+
+    action_rule = re.search(
+        r"\.lte-command-bar \.q-btn,(?P<selectors>[^\{]+)"
+        r"\{(?P<body>[^}]+)\}",
+        mobile_block,
+    )
+    assert action_rule is not None
+    for selector in (
+        ".lte-card-actions .q-btn",
+        ".lte-profile-actions .q-btn",
+        ".lte-candidate-toolbar .q-btn",
+        ".lte-generate-page .q-btn",
+        ".lte-figures-page .q-btn",
+        ".lte-history-page .q-btn",
+    ):
+        assert selector in action_rule.group("selectors")
+    assert "min-height: 44px;" in action_rule.group("body")
     assert ":focus-visible" in css
     assert "@media (prefers-reduced-motion: reduce)" in css
 
@@ -153,6 +186,16 @@ def test_translation_dictionaries_have_identical_keys_and_format_values():
     assert set(module.TRANSLATIONS["en"]) == set(module.TRANSLATIONS["zh-CN"])
     assert module.Translator("zh-CN").text("nav.scenarios") == "\u573a\u666f"
     assert module.Translator("en").text("job.running", name="Scan 1") == "Running Scan 1"
+    assert module.Translator("en").text("shell.eyebrow") == "LTE / Operations"
+    assert module.Translator("zh-CN").text("shell.eyebrow") == "LTE / \u4f5c\u4e1a\u53f0"
+    assert (
+        module.Translator("en").text("action.open_navigation")
+        == "Open navigation menu"
+    )
+    assert (
+        module.Translator("zh-CN").text("action.open_navigation")
+        == "\u6253\u5f00\u5bfc\u822a\u83dc\u5355"
+    )
 
 
 def test_presentation_spec_is_an_immutable_compact_value():
@@ -1052,14 +1095,20 @@ async def test_gui_shell_renders_and_switches_language_offline(
     await user.should_see(marker="shell-menu")
     await user.should_see(marker="shell-page-context", content="Scenarios")
     await user.should_see(marker="shell-job-indicator", content="No active job")
+    await user.should_see(marker="shell-eyebrow", content="LTE / Operations")
     navigation = next(iter(user.find(marker="shell-navigation").elements))
+    menu = next(iter(user.find(marker="shell-menu").elements))
     assert navigation.tag == "q-drawer"
     assert str(navigation._props["width"]) == "224"
     assert str(navigation._props["breakpoint"]) == "980"
     assert navigation._props["show-if-above"] is True
+    assert menu._props["aria-label"] == "Open navigation menu"
     user.find("English").click()
     user.find("\u7b80\u4f53\u4e2d\u6587").click()
     await user.should_see("\u573a\u666f")
+    await user.should_see(marker="shell-eyebrow", content="LTE / \u4f5c\u4e1a\u53f0")
+    chinese_menu = next(iter(user.find(marker="shell-menu").elements))
+    assert chinese_menu._props["aria-label"] == "\u6253\u5f00\u5bfc\u822a\u83dc\u5355"
     assert json.loads(
         (tmp_path / ".lte-data/gui-settings.json").read_text(encoding="utf-8")
     )["language"] == "zh-CN"

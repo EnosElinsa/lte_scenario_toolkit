@@ -12,6 +12,7 @@ SUPPORTED_LANGUAGES: Final = ("en", "zh-CN")
 TRANSLATIONS: Final[dict[str, dict[str, str]]] = {
     "en": {
         "app.title": "LTE Scenario Toolkit",
+        "shell.eyebrow": "LTE / Operations",
         "nav.scenarios": "Scenarios",
         "nav.configure": "Configure",
         "nav.figures": "Figures",
@@ -59,6 +60,7 @@ TRANSLATIONS: Final[dict[str, dict[str, str]]] = {
         "action.inspect": "Inspect",
         "action.open_figures": "Open in Figures",
         "action.retry_missing": "Retry Missing Terrain Figures",
+        "action.open_navigation": "Open navigation menu",
         "error.job_busy": "Another job is already running",
         "job.running": "Running {name}",
         "job.kind.full_checksum": "Full checksum validation",
@@ -258,6 +260,7 @@ TRANSLATIONS: Final[dict[str, dict[str, str]]] = {
     },
     "zh-CN": {
         "app.title": "LTE \u573a\u666f\u5de5\u5177\u7bb1",
+        "shell.eyebrow": "LTE / \u4f5c\u4e1a\u53f0",
         "nav.scenarios": "\u573a\u666f",
         "nav.configure": "\u914d\u7f6e",
         "nav.figures": "\u56fe\u8868",
@@ -305,6 +308,7 @@ TRANSLATIONS: Final[dict[str, dict[str, str]]] = {
         "action.inspect": "\u67e5\u770b\u8bb0\u5f55",
         "action.open_figures": "\u5728\u56fe\u8868\u4e2d\u6253\u5f00",
         "action.retry_missing": "\u91cd\u8bd5\u7f3a\u5931\u7684\u5730\u5f62\u56fe",
+        "action.open_navigation": "\u6253\u5f00\u5bfc\u822a\u83dc\u5355",
         "error.job_busy": "\u5df2\u6709\u4efb\u52a1\u6b63\u5728\u8fd0\u884c",
         "job.running": "\u6b63\u5728\u8fd0\u884c {name}",
         "job.kind.full_checksum": "\u5b8c\u6574\u6821\u9a8c\u548c",

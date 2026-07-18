@@ -71,13 +71,16 @@ def render_app_shell(
             (
                 ui.button(icon="menu", on_click=drawer.toggle)
                 .props(
-                    f'flat round aria-label="{translator.text("app.title")}"'
+                    "flat round "
+                    f'aria-label="{translator.text("action.open_navigation")}"'
                 )
                 .classes("lte-shell-menu")
                 .mark("shell-menu")
             )
             with ui.column().classes("lte-page-context-wrap gap-0"):
-                ui.label("LTE / OPERATIONS").classes("lte-page-context__eyebrow")
+                ui.label(translator.text("shell.eyebrow")).classes(
+                    "lte-page-context__eyebrow"
+                ).mark("shell-eyebrow")
                 ui.label(page_context).classes("lte-page-context").mark(
                     "shell-page-context"
                 )

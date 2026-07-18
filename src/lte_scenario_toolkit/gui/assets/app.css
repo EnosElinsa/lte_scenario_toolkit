@@ -663,6 +663,13 @@ button:disabled,
     gap: 7px;
   }
 
+  .lte-shell-menu {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  .lte-nav__link { min-height: 44px; }
+
   .lte-command-bar .q-btn,
   .lte-card-actions .q-btn,
   .lte-profile-actions .q-btn,
@@ -691,7 +698,10 @@ button:disabled,
   .lte-language-select {
     flex-basis: 86px;
     width: 86px;
+    min-height: 44px;
   }
+
+  .lte-language-select .q-field__control { min-height: 44px; }
 
   .lte-main {
     min-height: calc(100vh - 64px);
