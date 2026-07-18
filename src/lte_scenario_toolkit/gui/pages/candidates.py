@@ -199,11 +199,7 @@ class CandidatePageState:
 
     @property
     def can_confirm(self) -> bool:
-        return (
-            self.phase == "completed"
-            and self.scan_completed
-            and self.selected_candidate is not None
-        )
+        return self.scan_completed and self.selected_candidate is not None
 
     @property
     def progress_fraction(self) -> float:
@@ -812,10 +808,10 @@ class CandidateSession:
     repo_root: Path
     map_bundle: CandidateMapBundle | None = None
     scan_result: ScanResult | None = None
-    scan_provenance: CandidateScanProvenance | None = None
     confirmed_flat_grid_id: int | None = None
     locked_candidate: Candidate | None = None
     created_at: float = field(default_factory=monotonic)
+    scan_provenance: CandidateScanProvenance | None = None
 
     def __post_init__(self) -> None:
         if type(self.session_id) is not str or not self.session_id:
@@ -1043,6 +1039,7 @@ class CandidateExplorerController:
             tuple[str, int, MapStyle], CandidateInspection
         ] = {}
         self._scan_protocol_failed_jobs: set[str] = set()
+        self._previous_completed_scan: tuple[str, CandidatePageState] | None = None
         self._closed = False
 
     @property
@@ -1079,6 +1076,71 @@ class CandidateExplorerController:
                 lambda _future, job_id=job.job_id: coordinator.finish(job_id)
             )
 
+    def _previous_completed_state(self) -> CandidatePageState | None:
+        result = self.session.scan_result
+        if result is None or not result.completed:
+            return None
+        authoritative = CandidatePageState.from_scan(
+            self._state.job_id or f"session-{self.session.session_id}",
+            result,
+            self.session.scan_provenance,
+        )
+        selected = self._state.selected_flat_grid_id
+        if selected is not None and not any(
+            candidate.flat_grid_id == selected for candidate in result.candidates
+        ):
+            selected = None
+        preserve_statistics = (
+            selected is not None and self._state.statistics_flat_grid_id == selected
+        )
+        return replace(
+            authoritative,
+            view=self._state.view,
+            map_bounds=self._state.map_bounds,
+            enabled_layers=self._state.enabled_layers,
+            dem_style=self._state.dem_style,
+            dem_opacity=self._state.dem_opacity,
+            dem_style_asset=self._state.dem_style_asset,
+            dem_style_error=self._state.dem_style_error,
+            selected_flat_grid_id=selected,
+            statistics=self._state.statistics if preserve_statistics else None,
+            statistics_flat_grid_id=(
+                self._state.statistics_flat_grid_id if preserve_statistics else None
+            ),
+            statistics_error=(
+                self._state.statistics_error if preserve_statistics else None
+            ),
+            candidate_preview_asset=(
+                self._state.candidate_preview_asset if preserve_statistics else None
+            ),
+            candidate_preview_error=(
+                self._state.candidate_preview_error if preserve_statistics else None
+            ),
+        )
+
+    def _restore_previous_completed_state(
+        self,
+        job_id: str,
+        terminal: CandidatePageState,
+    ) -> CandidatePageState:
+        tracked = self._previous_completed_scan
+        if tracked is None or tracked[0] != job_id:
+            return terminal
+        previous = tracked[1]
+        return replace(
+            previous,
+            job_id=job_id,
+            phase=terminal.phase,
+            error=terminal.error,
+            error_code=terminal.error_code,
+            error_details=terminal.error_details,
+        )
+
+    def _clear_previous_completed_state(self, job_id: str) -> None:
+        tracked = self._previous_completed_scan
+        if tracked is not None and tracked[0] == job_id:
+            self._previous_completed_scan = None
+
     def start_scan(self, *, force: bool = False) -> Job:
         if self._closed:
             raise RuntimeError("candidate explorer is closed")
@@ -1088,6 +1150,7 @@ class CandidateExplorerController:
 
         service = self.session.selection_service
         preflight = self.session.preflight
+        previous_completed = self._previous_completed_state()
 
         def worker(cancel, emit):
             return service.scan(
@@ -1100,6 +1163,11 @@ class CandidateExplorerController:
         job = self.coordinator.submit("selection.scan", worker)
         self._release_when_done(self.coordinator, job)
         self._scan_job = job
+        self._previous_completed_scan = (
+            (job.job_id, previous_completed)
+            if previous_completed is not None
+            else None
+        )
         self._state = CandidatePageState.starting(job.job_id, previous=self._state)
         return job
 
@@ -1118,6 +1186,7 @@ class CandidateExplorerController:
             self._scan_protocol_failed_jobs.discard(target.job_id)
             if self._scan_job is not None and self._scan_job.job_id == target.job_id:
                 self._scan_job = None
+            self._clear_previous_completed_state(target.job_id)
             return self._state
         while True:
             try:
@@ -1125,7 +1194,10 @@ class CandidateExplorerController:
             except Empty:
                 break
             if not isinstance(event, SelectionProgress):
-                self._state = self._state.failed("Invalid scan progress event")
+                self._state = self._restore_previous_completed_state(
+                    target.job_id,
+                    self._state.failed("Invalid scan progress event"),
+                )
                 self._scan_protocol_failed_jobs.add(target.job_id)
                 break
             self._state = reduce_progress(
@@ -1143,19 +1215,21 @@ class CandidateExplorerController:
             self._scan_protocol_failed_jobs.discard(target.job_id)
             if self._scan_job is not None and self._scan_job.job_id == target.job_id:
                 self._scan_job = None
+            self._clear_previous_completed_state(target.job_id)
             return self._state
         try:
             result = future.result()
             if not isinstance(result, ScanResult):
                 raise TypeError("selection scan returned an invalid result")
+            if not result.completed:
+                raise TypeError("selection scan returned an incomplete result")
             self._state = self._state.with_scan_result(result)
-            if result.completed:
-                provenance = CandidateScanProvenance(
-                    elapsed_seconds=self._state.elapsed_seconds,
-                    cache_status=self._state.cache_status,
-                    cache_key=self._state.cache_key,
-                )
-            if result.completed and self.registry is not None:
+            provenance = CandidateScanProvenance(
+                elapsed_seconds=self._state.elapsed_seconds,
+                cache_status=self._state.cache_status,
+                cache_key=self._state.cache_key,
+            )
+            if self.registry is not None:
                 try:
                     self.session = self.registry.set_scan_result(
                         self.session.session_id,
@@ -1170,7 +1244,7 @@ class CandidateExplorerController:
                         confirmed_flat_grid_id=None,
                         locked_candidate=None,
                     )
-            elif result.completed:
+            else:
                 self.session = replace(
                     self.session,
                     scan_result=result,
@@ -1179,18 +1253,28 @@ class CandidateExplorerController:
                     locked_candidate=None,
                 )
         except ScanCancelled:
-            self._state = self._state.cancelled()
+            self._state = self._restore_previous_completed_state(
+                target.job_id,
+                self._state.cancelled(),
+            )
         except SelectionError as exc:
-            self._state = self._state.failed(
-                exc.message,
-                code=exc.code,
-                details=exc.details,
+            self._state = self._restore_previous_completed_state(
+                target.job_id,
+                self._state.failed(
+                    exc.message,
+                    code=exc.code,
+                    details=exc.details,
+                ),
             )
         except Exception as exc:
-            self._state = self._state.failed(str(exc))
+            self._state = self._restore_previous_completed_state(
+                target.job_id,
+                self._state.failed(str(exc)),
+            )
         finally:
             if self._scan_job is not None and self._scan_job.job_id == target.job_id:
                 self._scan_job = None
+            self._clear_previous_completed_state(target.job_id)
         return self._state
 
     def cancel_scan(self) -> bool:
@@ -1426,6 +1510,7 @@ class CandidateExplorerController:
         self._closed = True
         if self.registry is not None:
             self.registry.unpin(self.session.session_id)
+        self._previous_completed_scan = None
 
 
 @dataclass(slots=True)

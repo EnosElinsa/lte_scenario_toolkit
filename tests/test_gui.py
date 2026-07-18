@@ -2736,6 +2736,37 @@ def test_candidate_scan_provenance_is_frozen_validated_and_fail_safe():
             CandidateScanProvenance(*values)
 
 
+def test_candidate_session_preserves_prior_positional_constructor_order(tmp_path):
+    from lte_scenario_toolkit.gui.pages.candidates import CandidateSession
+
+    profile = _task13_profile(tmp_path)
+    preflight = SimpleNamespace(profile=profile)
+    service = object()
+    bundle = _task14_map_bundle(tmp_path)
+    result = _task14_scan_result()
+    locked = result.candidates[1]
+
+    session = CandidateSession(
+        "legacy-positional",
+        profile,
+        preflight,
+        service,
+        tmp_path,
+        bundle,
+        result,
+        4,
+        locked,
+        123.5,
+    )
+
+    assert session.map_bundle is bundle
+    assert session.scan_result is result
+    assert session.confirmed_flat_grid_id == 4
+    assert session.locked_candidate is locked
+    assert session.created_at == pytest.approx(123.5)
+    assert session.scan_provenance is None
+
+
 def test_completed_candidate_session_restores_scan_provenance_from_registry(tmp_path):
     from lte_scenario_toolkit.gui.pages.candidates import (
         CandidateExplorerController,
@@ -2827,6 +2858,255 @@ def test_scan_controller_atomically_persists_completed_result_and_provenance(tmp
             restored.close()
         else:
             controller.close()
+        coordinator.shutdown()
+
+
+def test_cancelled_rescan_restores_prior_completed_candidate_state(tmp_path):
+    from lte_scenario_toolkit.candidate_scanner import ScanCancelled
+    from lte_scenario_toolkit.gui.pages.candidates import (
+        CandidateExplorerController,
+        CandidateScanProvenance,
+        CandidateSessionRegistry,
+    )
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.selection_service import SelectionProgress
+
+    entered = Event()
+    original = _task14_scan_result()
+    provenance = CandidateScanProvenance(8.2, "miss", "original-key")
+
+    class Service:
+        def scan(self, _preflight, *, force=False, progress=None, cancel=None):
+            assert force is True
+            progress(
+                SelectionProgress(
+                    phase="scanning",
+                    checked_positions=1,
+                    total_positions=100,
+                    candidate_count=1,
+                    elapsed_seconds=0.1,
+                    added_candidates=(original.candidates[0],),
+                    removed_flat_grid_ids=(),
+                    cache_status="forced",
+                    cache_key="rescan-key",
+                )
+            )
+            entered.set()
+            assert cancel.wait(2)
+            raise ScanCancelled()
+
+    registry = CandidateSessionRegistry()
+    registered = registry.add(_task14_session(tmp_path, Service()))
+    completed = registry.set_scan_result(
+        registered.session_id,
+        original,
+        provenance,
+    )
+    coordinator = JobCoordinator()
+    controller = CandidateExplorerController(completed, coordinator, registry=registry)
+    try:
+        controller.select_flat_grid_id(4)
+        controller.set_view("filmstrip")
+        controller.set_map_bounds((-1.0, -2.0, 3.0, 4.0))
+        controller.set_layer("stations", False)
+        controller.set_dem_opacity(0.4)
+
+        job = controller.start_scan(force=True)
+        assert entered.wait(2)
+        controller.drain_scan(job)
+        assert controller.cancel_scan() is True
+        assert job.future is not None
+        with pytest.raises(ScanCancelled):
+            job.future.result(timeout=2)
+        state = controller.drain_scan(job)
+
+        assert state.phase == "cancelled"
+        assert state.scan_completed is True
+        assert state.candidates is original.candidates
+        assert state.found_count == len(original.candidates)
+        assert state.checked_positions == original.checked_positions
+        assert state.total_positions == original.total_positions
+        assert state.elapsed_seconds == pytest.approx(8.2)
+        assert state.cache_status == "miss"
+        assert state.cache_key == "original-key"
+        assert state.selected_flat_grid_id == 4
+        assert state.view == "filmstrip"
+        assert state.map_bounds == (-1.0, -2.0, 3.0, 4.0)
+        assert "stations" not in state.enabled_layers
+        assert state.dem_opacity == pytest.approx(0.4)
+        assert state.can_confirm is True
+        stored = registry.get(registered.session_id)
+        assert stored.scan_result is original
+        assert stored.scan_provenance is provenance
+        assert controller.session.scan_result is original
+        assert controller.session.scan_provenance is provenance
+    finally:
+        controller.close()
+        coordinator.shutdown()
+
+
+def test_failed_rescan_restores_prior_completed_candidate_state(tmp_path):
+    from lte_scenario_toolkit.gui.pages.candidates import (
+        CandidateExplorerController,
+        CandidateScanProvenance,
+        CandidateSessionRegistry,
+    )
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.selection_service import SelectionScanError
+
+    original = _task14_scan_result()
+    provenance = CandidateScanProvenance(8.2, "hit", "original-key")
+
+    class Service:
+        def scan(self, *_args, **_kwargs):
+            raise SelectionScanError(
+                "scan.failed",
+                "rescan failed",
+                details={"dataset": "points"},
+            )
+
+    registry = CandidateSessionRegistry()
+    registered = registry.add(_task14_session(tmp_path, Service()))
+    completed = registry.set_scan_result(
+        registered.session_id,
+        original,
+        provenance,
+    )
+    coordinator = JobCoordinator()
+    controller = CandidateExplorerController(completed, coordinator, registry=registry)
+    try:
+        controller.select_flat_grid_id(4)
+        controller.set_layer("boundary", False)
+        job = controller.start_scan(force=True)
+        assert job.future is not None
+        with pytest.raises(SelectionScanError):
+            job.future.result(timeout=2)
+        state = controller.drain_scan(job)
+
+        assert state.phase == "failed"
+        assert state.error == "rescan failed"
+        assert state.error_code == "scan.failed"
+        assert state.error_details == (("dataset", "points"),)
+        assert state.scan_completed is True
+        assert state.candidates is original.candidates
+        assert state.selected_flat_grid_id == 4
+        assert "boundary" not in state.enabled_layers
+        assert state.elapsed_seconds == pytest.approx(8.2)
+        assert state.cache_status == "hit"
+        assert state.cache_key == "original-key"
+        assert state.can_confirm is True
+        stored = registry.get(registered.session_id)
+        assert stored.scan_result is original
+        assert stored.scan_provenance is provenance
+    finally:
+        controller.close()
+        coordinator.shutdown()
+
+
+def test_invalid_progress_rescan_restores_prior_completed_candidate_state(tmp_path):
+    from dataclasses import replace
+
+    from lte_scenario_toolkit.gui.pages.candidates import (
+        CandidateExplorerController,
+        CandidateScanProvenance,
+        CandidateSessionRegistry,
+    )
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    original = _task14_scan_result()
+    replacement = replace(
+        original,
+        candidates=(original.candidates[0],),
+        algorithm_version="replacement-version",
+    )
+    provenance = CandidateScanProvenance(8.2, "miss", "original-key")
+
+    class Service:
+        def scan(self, _preflight, *, progress=None, **_kwargs):
+            progress(object())
+            return replacement
+
+    registry = CandidateSessionRegistry()
+    registered = registry.add(_task14_session(tmp_path, Service()))
+    completed = registry.set_scan_result(
+        registered.session_id,
+        original,
+        provenance,
+    )
+    coordinator = JobCoordinator()
+    controller = CandidateExplorerController(completed, coordinator, registry=registry)
+    try:
+        controller.select_flat_grid_id(4)
+        job = controller.start_scan(force=True)
+        assert job.future is not None
+        job.future.result(timeout=2)
+        state = controller.drain_scan(job)
+
+        assert state.phase == "failed"
+        assert state.error == "Invalid scan progress event"
+        assert state.scan_completed is True
+        assert state.candidates is original.candidates
+        assert state.algorithm_version == original.algorithm_version
+        assert state.selected_flat_grid_id == 4
+        assert state.can_confirm is True
+        stored = registry.get(registered.session_id)
+        assert stored.scan_result is original
+        assert stored.scan_provenance is provenance
+    finally:
+        controller.close()
+        coordinator.shutdown()
+
+
+def test_incomplete_rescan_restores_prior_completed_candidate_state(tmp_path):
+    from dataclasses import replace
+
+    from lte_scenario_toolkit.gui.pages.candidates import (
+        CandidateExplorerController,
+        CandidateScanProvenance,
+        CandidateSessionRegistry,
+    )
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    original = _task14_scan_result()
+    incomplete = replace(
+        original,
+        candidates=(original.candidates[0],),
+        checked_positions=5,
+        completed=False,
+    )
+    provenance = CandidateScanProvenance(8.2, "miss", "original-key")
+
+    class Service:
+        def scan(self, *_args, **_kwargs):
+            return incomplete
+
+    registry = CandidateSessionRegistry()
+    registered = registry.add(_task14_session(tmp_path, Service()))
+    completed = registry.set_scan_result(
+        registered.session_id,
+        original,
+        provenance,
+    )
+    coordinator = JobCoordinator()
+    controller = CandidateExplorerController(completed, coordinator, registry=registry)
+    try:
+        controller.select_flat_grid_id(4)
+        job = controller.start_scan(force=True)
+        assert job.future is not None
+        job.future.result(timeout=2)
+        state = controller.drain_scan(job)
+
+        assert state.phase == "failed"
+        assert state.error is not None and "incomplete" in state.error
+        assert state.scan_completed is True
+        assert state.candidates is original.candidates
+        assert state.selected_flat_grid_id == 4
+        assert state.can_confirm is True
+        stored = registry.get(registered.session_id)
+        assert stored.scan_result is original
+        assert stored.scan_provenance is provenance
+    finally:
+        controller.close()
         coordinator.shutdown()
 
 
@@ -3325,6 +3605,17 @@ def test_map_bundle_and_selected_overlay_use_frozen_registered_dem_inputs(tmp_pa
     assert calls[-1][2]["max_dimension"] == 640
 
 
+async def _new_nicegui_background_tasks(previous):
+    from nicegui import background_tasks
+
+    for _ in range(20):
+        tasks = tuple(background_tasks.running_tasks - previous)
+        if tasks:
+            return tasks
+        await asyncio.sleep(0.01)
+    raise AssertionError("NiceGUI did not create an event handler background task")
+
+
 async def test_candidate_online_layer_obeys_latest_toggle_intent(
     user,
     tmp_path,
@@ -3332,6 +3623,7 @@ async def test_candidate_online_layer_obeys_latest_toggle_intent(
 ):
     from dataclasses import replace
 
+    from nicegui import background_tasks
     from nicegui.elements.leaflet.leaflet_layers import TileLayer
 
     from lte_scenario_toolkit.gui import app as app_module
@@ -3379,13 +3671,18 @@ async def test_candidate_online_layer_obeys_latest_toggle_intent(
         assert len(views) == 1
         view = views[0]
 
+        before_enable = set(background_tasks.running_tasks)
         user.find(marker="candidate-layer-online").click()
+        enable_tasks = await _new_nicegui_background_tasks(before_enable)
         assert await asyncio.to_thread(entered.wait, 1)
+        before_disable = set(background_tasks.running_tasks)
         user.find(marker="candidate-layer-online").click()
+        disable_tasks = await _new_nicegui_background_tasks(before_disable)
+        await asyncio.wait_for(asyncio.gather(*disable_tasks), timeout=2)
         assert "online" not in view.controller.state.enabled_layers
 
         release.set()
-        await asyncio.sleep(0.2)
+        await asyncio.wait_for(asyncio.gather(*enable_tasks), timeout=2)
 
         assert "online" not in view.controller.state.enabled_layers
         assert not any(isinstance(layer, TileLayer) for layer in view.map_element.layers)
@@ -3403,7 +3700,7 @@ async def test_candidate_online_probe_completion_after_page_cleanup_is_noop(
 ):
     from dataclasses import replace
 
-    from nicegui import core
+    from nicegui import background_tasks, core
     from nicegui.elements.leaflet.leaflet_layers import TileLayer
 
     from lte_scenario_toolkit.gui import app as app_module
@@ -3453,11 +3750,13 @@ async def test_candidate_online_probe_completion_after_page_cleanup_is_noop(
         assert len(views) == 1
         view = views[0]
 
+        before_enable = set(background_tasks.running_tasks)
         user.find(marker="candidate-layer-online").click()
+        enable_tasks = await _new_nicegui_background_tasks(before_enable)
         assert await asyncio.to_thread(entered.wait, 1)
         client.delete()
         release.set()
-        await asyncio.sleep(0.2)
+        await asyncio.wait_for(asyncio.gather(*enable_tasks), timeout=2)
 
         assert "online" not in view.controller.state.enabled_layers
         assert not any(isinstance(layer, TileLayer) for layer in view.map_element.layers)
