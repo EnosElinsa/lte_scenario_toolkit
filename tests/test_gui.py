@@ -64,6 +64,65 @@ def test_gui_css_and_leaflet_extension_are_declared_as_package_data():
     ]
 
 
+def test_shared_gui_asset_installer_loads_css_and_registers_station_resource(
+    monkeypatch,
+):
+    assets = _gui_module("assets")
+    calls: list[tuple[object, ...]] = []
+    fake_app = object()
+
+    class FakeUi:
+        def add_css(self, content, *, shared=False):
+            calls.append(("css", content, shared))
+
+    monkeypatch.setattr(
+        assets,
+        "register_station_dots_resource",
+        lambda app: calls.append(("station", app)) or "/station-dots.js",
+    )
+
+    url = assets.install_gui_assets(fake_app, FakeUi())
+
+    assert url == "/station-dots.js"
+    assert calls == [
+        ("css", assets.packaged_gui_css(), True),
+        ("station", fake_app),
+    ]
+    assert ":root" in assets.packaged_gui_css()
+
+
+def test_gui_css_defines_field_atlas_shell_and_mobile_touch_contract():
+    css = (
+        ROOT
+        / "src/lte_scenario_toolkit/gui/assets/app.css"
+    ).read_text(encoding="utf-8")
+
+    for declaration in (
+        "--lte-canvas: #f2f1eb;",
+        "--lte-surface: #fbfaf6;",
+        "--lte-surface-strong: #fff;",
+        "--lte-frame: #0b3032;",
+        "--lte-ink: #102d2e;",
+        "--lte-ink-muted: #62716f;",
+        "--lte-accent: #149786;",
+        "--lte-accent-soft: #d8eee8;",
+        "--lte-signal: #c9772e;",
+        "--lte-success: #16745f;",
+        "--lte-danger: #b64141;",
+        "--lte-border: #d6ddd8;",
+        "--lte-rail-width: 224px;",
+    ):
+        assert declaration in css
+
+    assert "@media (max-width: 980px)" in css
+    mobile_start = css.index("@media (max-width: 760px)")
+    next_media = css.find("@media", mobile_start + 1)
+    mobile_block = css[mobile_start : None if next_media == -1 else next_media]
+    assert "min-height: 44px" in mobile_block
+    assert ":focus-visible" in css
+    assert "@media (prefers-reduced-motion: reduce)" in css
+
+
 def test_station_dot_resource_is_local_and_registered_once():
     from lte_scenario_toolkit.gui import leaflet_assets
 
@@ -538,7 +597,7 @@ def test_create_app_uses_injected_catalog_and_shared_local_css(
     assert created is fake_app
     assert calls["shared"] is True
     assert ":root" in calls["css"]
-    assert "--lte-canvas: #ffffff" in calls["css"]
+    assert "--lte-canvas: #f2f1eb" in calls["css"]
     assert calls["page"][0] == "/"
     assert calls["removed_route"] == "/_lte_gui/assets/station-dots.js"
     assert calls["static_file"]["url_path"] == "/_lte_gui/assets/station-dots.js"
@@ -989,12 +1048,66 @@ async def test_gui_shell_renders_and_switches_language_offline(
     await user.should_see("LTE Scenario Toolkit")
     await user.should_see("Scenarios")
     await user.should_see("No active job")
+    await user.should_see(marker="shell-navigation")
+    await user.should_see(marker="shell-menu")
+    await user.should_see(marker="shell-page-context", content="Scenarios")
+    await user.should_see(marker="shell-job-indicator", content="No active job")
+    navigation = next(iter(user.find(marker="shell-navigation").elements))
+    assert navigation.tag == "q-drawer"
+    assert str(navigation._props["width"]) == "224"
+    assert str(navigation._props["breakpoint"]) == "980"
+    assert navigation._props["show-if-above"] is True
     user.find("English").click()
     user.find("\u7b80\u4f53\u4e2d\u6587").click()
     await user.should_see("\u573a\u666f")
     assert json.loads(
         (tmp_path / ".lte-data/gui-settings.json").read_text(encoding="utf-8")
     )["language"] == "zh-CN"
+
+
+async def test_gui_shell_job_indicator_tracks_coordinator_without_navigation(
+    tmp_path, user
+):
+    from lte_scenario_toolkit.gui.app import create_app
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    coordinator = JobCoordinator()
+    try:
+        create_app(
+            catalog=SimpleNamespace(root=tmp_path.resolve()),
+            coordinator=coordinator,
+            testing=True,
+        )
+        await user.open("/generate")
+
+        await user.should_see(
+            marker="shell-page-context",
+            content="Generate Scenario",
+        )
+        await user.should_see(
+            marker="shell-job-indicator",
+            content="No active job",
+        )
+        await user.should_not_see("Ready")
+        await user.should_not_see(marker="shell-app-status")
+
+        job = coordinator.start("selection.scan")
+        await user.should_see(
+            marker="shell-job-indicator",
+            content="Candidate scan",
+            retries=12,
+        )
+
+        assert coordinator.finish(job.job_id) is True
+        await user.should_see(
+            marker="shell-job-indicator",
+            content="No active job",
+            retries=12,
+        )
+        await user.should_not_see("Ready")
+        await user.should_not_see(marker="shell-app-status")
+    finally:
+        coordinator.shutdown()
 
 
 def test_nicegui_cleanup_preserves_regular_toolkit_module_imports(monkeypatch):
@@ -2076,8 +2189,8 @@ def test_custom_coordinator_does_not_create_or_own_shared_coordinator(
     monkeypatch.setitem(sys.modules, "nicegui", SimpleNamespace(app=fake_app, ui=FakeUi()))
     monkeypatch.setattr(
         module,
-        "register_station_dots_resource",
-        lambda _app: "/_lte_gui/assets/station-dots.js",
+        "install_gui_assets",
+        lambda _app, _ui: "/_lte_gui/assets/station-dots.js",
     )
     monkeypatch.setattr(
         module,

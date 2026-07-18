@@ -10,7 +10,6 @@ import sys
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from importlib import resources
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -22,9 +21,9 @@ from ..jobs import JobCoordinator
 from ..map_assets import MapAssetService
 from ..profiles import ProfileStore
 from ..selection_service import SelectionService
+from .assets import install_gui_assets
 from .i18n import Translator, validate_translations
 from .layout import render_app_shell
-from .leaflet_assets import register_station_dots_resource
 from .pages.candidates import (
     CandidateMapBundle,
     CandidateSession,
@@ -175,14 +174,6 @@ def _preflight(repo_root: Path, catalog_path: Path) -> DataCatalog:
     return load_data_catalog(catalog_path, repo_root=repo_root)
 
 
-def _css_text() -> str:
-    return (
-        resources.files("lte_scenario_toolkit.gui")
-        .joinpath("assets", "app.css")
-        .read_text(encoding="utf-8")
-    )
-
-
 def _is_redirected_path(path: Path) -> bool:
     if path.is_symlink():
         return True
@@ -291,7 +282,7 @@ def create_app(
 
     from nicegui import app, ui
 
-    station_layer_resource = register_station_dots_resource(app)
+    station_layer_resource = install_gui_assets(app, ui)
 
     if catalog is None:
         repo_root = Path.cwd().resolve()
@@ -321,8 +312,6 @@ def create_app(
     bundle_builder = candidate_bundle_builder or build_candidate_map_bundle
     static_asset_urls: dict[Path, str] = {}
 
-    ui.add_css(_css_text(), shared=True)
-
     if hasattr(app, "on_shutdown"):
         if uses_shared_coordinator:
             app.on_shutdown(shutdown_job_coordinator)
@@ -334,10 +323,13 @@ def create_app(
         "reconnect_timeout": 0 if testing else 3.0,
     }
 
-    def render_shell(active_route: str, body: Callable[[Translator], None]) -> None:
+    def render_shell(
+        active_route: str,
+        page_context_key: str,
+        body: Callable[[Translator], None],
+    ) -> None:
         settings = store.load()
         translator = Translator(settings.language)
-        job_snapshot = runtime.coordinator.snapshot()
 
         def change_language(event) -> None:
             try:
@@ -351,7 +343,8 @@ def create_app(
             ui,
             translator,
             active_route=active_route,
-            active_job=job_snapshot.kind if job_snapshot.active else None,
+            page_context=translator.text(page_context_key),
+            get_job_snapshot=runtime.coordinator.snapshot,
             on_language_change=change_language,
         )
         with content:
@@ -483,6 +476,7 @@ def create_app(
     def configure_scenario(scenario_id: str, profile: str | None = None) -> None:
         render_shell(
             "/configure",
+            "nav.configure",
             lambda translator: render_configure_page(
                 ui,
                 translator,
@@ -502,6 +496,7 @@ def create_app(
         if session is None:
             render_shell(
                 "/configure",
+                "candidates.title",
                 lambda translator: render_candidate_unavailable(ui, translator),
             )
             return
@@ -510,6 +505,7 @@ def create_app(
         if prepared_bundle is not None:
             render_shell(
                 "/configure",
+                "candidates.title",
                 lambda translator: render_candidate_explorer_body(
                     translator,
                     session,
@@ -532,6 +528,7 @@ def create_app(
 
         render_shell(
             "/configure",
+            "candidates.title",
             render_loading,
         )
         assert loading_container is not None
@@ -583,6 +580,7 @@ def create_app(
     def candidate_without_session() -> None:
         render_shell(
             "/configure",
+            "candidates.title",
             lambda translator: render_candidate_unavailable(ui, translator),
         )
 
@@ -616,6 +614,7 @@ def create_app(
     def generate_session(session_id: str) -> None:
         render_shell(
             "/configure",
+            "generate.title",
             lambda translator: generation_body(translator, session_id),
         )
 
@@ -623,6 +622,7 @@ def create_app(
     def generate_without_session() -> None:
         render_shell(
             "/configure",
+            "generate.title",
             lambda translator: render_generation_unavailable(ui, translator),
         )
 
@@ -672,6 +672,7 @@ def create_app(
         )
         render_shell(
             "/figures",
+            "figures.title",
             lambda translator: (
                 render_figures_unavailable(ui, translator)
                 if not valid_request
@@ -681,7 +682,11 @@ def create_app(
 
     @ui.page("/figures", **page_options)
     def figures() -> None:
-        render_shell("/figures", lambda translator: figures_body(translator))
+        render_shell(
+            "/figures",
+            "figures.title",
+            lambda translator: figures_body(translator),
+        )
 
     def open_history_source(
         path: Path,
@@ -722,6 +727,7 @@ def create_app(
         snapshot = await run.io_bound(rebuild_history, repo_root, roots)
         render_shell(
             "/history",
+            "history.title",
             lambda translator: render_history_page(
                 ui,
                 translator,
@@ -751,6 +757,7 @@ def create_app(
     def configure_picker() -> None:
         render_shell(
             "/configure",
+            "nav.configure",
             lambda translator: render_configure_picker(
                 ui,
                 translator,
@@ -762,6 +769,7 @@ def create_app(
     def scenarios() -> None:
         render_shell(
             "/scenarios",
+            "nav.scenarios",
             lambda translator: render_scenarios_page(
                 ui,
                 translator,
@@ -774,6 +782,7 @@ def create_app(
     def index() -> None:
         render_shell(
             "/scenarios",
+            "nav.scenarios",
             lambda translator: render_scenarios_page(
                 ui,
                 translator,

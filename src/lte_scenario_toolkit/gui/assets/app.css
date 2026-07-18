@@ -1,19 +1,28 @@
 :root {
-  --lte-canvas: #ffffff;
-  --lte-ink: #102a2e;
-  --lte-ink-soft: #496165;
-  --lte-nav: #10282c;
-  --lte-accent: #0f8f83;
-  --lte-accent-strong: #08766d;
-  --lte-border: #dbe5e4;
-  --lte-focus: #2dd4bf;
-  --lte-radius-sm: 5px;
+  --lte-canvas: #f2f1eb;
+  --lte-surface: #fbfaf6;
+  --lte-surface-strong: #fff;
+  --lte-frame: #0b3032;
+  --lte-ink: #102d2e;
+  --lte-ink-muted: #62716f;
+  --lte-accent: #149786;
+  --lte-accent-soft: #d8eee8;
+  --lte-signal: #c9772e;
+  --lte-success: #16745f;
+  --lte-danger: #b64141;
+  --lte-border: #d6ddd8;
+  --lte-focus: #1bb39f;
+  --lte-ink-soft: var(--lte-ink-muted);
+  --lte-nav: var(--lte-frame);
+  --lte-rail-width: 224px;
+  --lte-command-height: 72px;
+  --lte-radius-sm: 4px;
+  --lte-radius-md: 9px;
   --lte-space-1: 4px;
   --lte-space-2: 8px;
   --lte-space-3: 12px;
   --lte-space-4: 16px;
   --lte-space-5: 24px;
-  --lte-topbar-height: 58px;
   color-scheme: light;
 }
 
@@ -24,111 +33,292 @@ body,
   min-height: 100%;
   background: var(--lte-canvas);
   color: var(--lte-ink);
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
-    "Segoe UI", sans-serif;
+  font-family: Aptos, "Segoe UI Variable", "Segoe UI", sans-serif;
   font-size: 14px;
-  line-height: 1.45;
+  line-height: 1.48;
 }
 
-.lte-topbar {
-  min-height: var(--lte-topbar-height);
-  padding: 0 var(--lte-space-5);
-  background: var(--lte-nav);
-  color: #ffffff;
-  border-bottom: 2px solid var(--lte-accent);
-  box-shadow: none;
+body {
+  background-image:
+    linear-gradient(rgb(11 48 50 / 2.5%) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(11 48 50 / 2.5%) 1px, transparent 1px);
+  background-size: 32px 32px;
 }
 
-.lte-topbar__inner {
-  width: 100%;
-  min-height: var(--lte-topbar-height);
-  gap: var(--lte-space-5);
+h1,
+h2,
+h3,
+.lte-brand-title,
+.lte-page-context,
+.lte-page-title,
+.lte-card-title,
+.lte-section-title {
+  font-family: Bahnschrift, "Aptos Display", Aptos, sans-serif;
 }
 
-.lte-brand {
-  flex: 0 0 auto;
-  font-size: 15px;
+.lte-navigation-rail {
+  width: var(--lte-rail-width) !important;
+  color: #edf5f1;
+  background:
+    radial-gradient(circle at 16% 4%, rgb(20 151 134 / 24%), transparent 28%),
+    var(--lte-frame);
+  border-right: 1px solid rgb(255 255 255 / 9%);
+  box-shadow: 8px 0 28px rgb(11 48 50 / 10%);
+}
+
+.lte-navigation-rail .q-drawer__content {
+  overflow-x: hidden;
+}
+
+.lte-rail-layout {
+  min-height: 100%;
+  padding: 20px 14px 16px;
+}
+
+.lte-rail-brand {
+  min-width: 0;
+  gap: 11px;
+  padding: 4px 8px 24px;
+  border-bottom: 1px solid rgb(255 255 255 / 12%);
+}
+
+.lte-brand-mark {
+  position: relative;
+  display: block;
+  flex: 0 0 34px;
+  width: 34px;
+  height: 34px;
+  border: 1px solid rgb(255 255 255 / 62%);
+  border-radius: 50%;
+  background:
+    radial-gradient(circle, var(--lte-signal) 0 3px, transparent 4px),
+    radial-gradient(circle, transparent 0 8px, rgb(255 255 255 / 40%) 9px 10px, transparent 11px),
+    radial-gradient(circle, transparent 0 14px, rgb(20 151 134 / 90%) 15px 16px, transparent 17px);
+}
+
+.lte-brand-mark::after {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  width: 22px;
+  height: 1px;
+  background: rgb(255 255 255 / 58%);
+  transform: rotate(-34deg);
+  transform-origin: left center;
+  content: "";
+}
+
+.lte-brand-copy {
+  min-width: 0;
+}
+
+.lte-brand-kicker,
+.lte-page-context__eyebrow {
+  color: #8bd4c7;
+  font-family: "Cascadia Code", "Cascadia Mono", Consolas, monospace;
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: 0.16em;
+  line-height: 1.2;
+}
+
+.lte-brand-title {
+  overflow: hidden;
+  color: #fff;
+  font-size: 14px;
   font-weight: 650;
   letter-spacing: 0.01em;
+  line-height: 1.25;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.lte-nav {
-  align-self: stretch;
-  gap: var(--lte-space-1);
+.lte-rail-nav {
+  width: 100%;
+  padding-top: 18px;
 }
 
 .lte-nav__link {
   position: relative;
-  display: inline-flex;
-  align-items: center;
-  min-height: var(--lte-topbar-height);
-  padding: 0 var(--lte-space-3);
-  color: #c8d7d8;
+  display: flex;
+  width: 100%;
+  min-height: 42px;
+  gap: 11px;
+  padding: 0 12px;
+  overflow: hidden;
+  color: #b9ceca;
+  border: 1px solid transparent;
+  border-radius: var(--lte-radius-sm);
   font-size: 13px;
   font-weight: 560;
-  line-height: 1;
   text-decoration: none;
-  transition: color 140ms ease, background-color 140ms ease;
+  transition: color 140ms ease, background-color 140ms ease, border-color 140ms ease;
 }
 
 .lte-nav__link:hover {
-  color: #ffffff;
+  color: #fff;
   background: rgb(255 255 255 / 7%);
+  border-color: rgb(255 255 255 / 9%);
 }
 
 .lte-nav__link--active {
-  color: #ffffff;
+  color: #fff;
+  background: rgb(20 151 134 / 20%);
+  border-color: rgb(117 213 197 / 28%);
 }
 
-.lte-nav__link--active::after {
+.lte-nav__link--active::before {
   position: absolute;
-  right: var(--lte-space-3);
-  bottom: 0;
-  left: var(--lte-space-3);
-  height: 3px;
-  background: var(--lte-focus);
+  top: 9px;
+  bottom: 9px;
+  left: 0;
+  width: 3px;
+  background: #5fd2bf;
+  border-radius: 0 2px 2px 0;
   content: "";
 }
 
-.lte-topbar__utilities {
-  min-width: 0;
-  margin-left: auto;
-  gap: var(--lte-space-3);
-  color: #d5e1e1;
+.lte-nav__icon {
+  flex: 0 0 auto;
+  color: currentcolor;
+  font-size: 18px;
 }
 
-.lte-job-status,
-.lte-app-status {
-  font-size: 12px;
-  font-weight: 520;
+.lte-nav__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.lte-app-status {
-  padding-left: var(--lte-space-3);
-  color: #8ee7dc;
-  border-left: 1px solid rgb(255 255 255 / 18%);
+.lte-command-bar {
+  min-height: var(--lte-command-height);
+  padding: 0 24px;
+  color: var(--lte-ink);
+  background: rgb(251 250 246 / 94%);
+  border-bottom: 1px solid var(--lte-border);
+  box-shadow: 0 8px 24px rgb(11 48 50 / 5%);
+  backdrop-filter: blur(10px);
+}
+
+.lte-command-bar__inner {
+  width: 100%;
+  min-height: var(--lte-command-height);
+  gap: 16px;
+}
+
+.lte-shell-menu {
+  display: none;
+  flex: 0 0 auto;
+  color: var(--lte-frame);
+}
+
+.lte-page-context-wrap {
+  min-width: 0;
+}
+
+.lte-page-context__eyebrow {
+  color: var(--lte-accent);
+}
+
+.lte-page-context {
+  overflow: hidden;
+  color: var(--lte-ink);
+  font-size: 21px;
+  font-weight: 660;
+  letter-spacing: -0.02em;
+  line-height: 1.18;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lte-job-indicator {
+  position: relative;
+  max-width: 220px;
+  min-height: 30px;
+  padding: 6px 10px 6px 26px;
+  overflow: hidden;
+  color: var(--lte-ink-muted);
+  background: #eef0eb;
+  border: 1px solid var(--lte-border);
+  border-radius: 999px;
+  font-family: "Cascadia Code", "Cascadia Mono", Consolas, monospace;
+  font-size: 10px;
+  font-weight: 620;
+  letter-spacing: 0.015em;
+  line-height: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lte-job-indicator::before {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  width: 8px;
+  height: 8px;
+  background: #9ba7a4;
+  border-radius: 50%;
+  content: "";
+}
+
+.lte-job-indicator--active,
+.lte-job-indicator--info {
+  color: #075c53;
+  background: var(--lte-accent-soft);
+  border-color: #abd7cc;
+}
+
+.lte-job-indicator--active::before,
+.lte-job-indicator--info::before {
+  background: var(--lte-accent);
+  box-shadow: 0 0 0 4px rgb(20 151 134 / 13%);
+}
+
+.lte-job-indicator--active::before {
+  animation: lte-status-pulse 1.4s ease-in-out infinite;
+}
+
+.lte-job-indicator--warning::before {
+  background: var(--lte-signal);
+}
+
+.lte-job-indicator--success::before {
+  background: var(--lte-success);
+}
+
+.lte-job-indicator--danger::before {
+  background: var(--lte-danger);
+}
+
+@keyframes lte-status-pulse {
+  0%,
+  100% { opacity: 0.52; }
+  50% { opacity: 1; }
 }
 
 .lte-language-select {
+  flex: 0 0 112px;
   width: 112px;
-  color: #ffffff;
+  color: var(--lte-ink);
   font-size: 12px;
 }
 
 .lte-language-select .q-field__native,
 .lte-language-select .q-field__input,
 .lte-language-select .q-field__marginal {
-  color: #ffffff;
+  color: var(--lte-ink);
   font-size: 12px;
 }
 
 .lte-main {
   width: 100%;
-  min-height: calc(100vh - var(--lte-topbar-height));
-  padding: var(--lte-space-5);
-  background: var(--lte-canvas);
+  min-height: calc(100vh - var(--lte-command-height));
+  padding: 28px 28px 40px;
+  background:
+    linear-gradient(rgb(11 48 50 / 2.2%) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(11 48 50 / 2.2%) 1px, transparent 1px),
+    var(--lte-canvas);
+  background-size: 32px 32px;
 }
 
 .lte-page {
@@ -139,15 +329,25 @@ body,
 
 .lte-page-title {
   color: var(--lte-ink);
-  font-size: 24px;
-  font-weight: 680;
-  letter-spacing: -0.02em;
+  font-size: clamp(25px, 2vw, 32px);
+  font-weight: 660;
+  letter-spacing: -0.035em;
+  line-height: 1.12;
 }
 
 .lte-page-subtitle,
 .lte-card-id {
-  color: var(--lte-ink-soft);
+  color: var(--lte-ink-muted);
   font-size: 13px;
+}
+
+.lte-card-id,
+.lte-candidate-metric,
+.lte-candidate-statistics,
+.lte-artifact-status,
+.lte-validation-message,
+.lte-cli-guidance {
+  font-family: "Cascadia Code", "Cascadia Mono", Consolas, monospace;
 }
 
 .lte-card-grid {
@@ -159,61 +359,78 @@ body,
 
 .lte-scenario-card,
 .lte-guidance-card,
-.lte-form-card {
+.lte-form-card,
+.lte-candidate-progress,
+.lte-candidate-map-card,
+.lte-candidate-inspector,
+.lte-candidate-filmstrip,
+.lte-generate-summary,
+.lte-generate-artifacts,
+.lte-figure-source,
+.lte-figure-style,
+.lte-figure-export {
   min-width: 0;
-  padding: var(--lte-space-4);
   border: 1px solid var(--lte-border);
-  border-radius: var(--lte-radius-sm);
-  background: #ffffff;
-  box-shadow: 0 8px 22px rgb(16 42 46 / 6%);
+  border-radius: var(--lte-radius-md);
+  background: var(--lte-surface-strong);
+  box-shadow: 0 12px 30px rgb(11 48 50 / 5%);
+}
+
+.lte-scenario-card,
+.lte-guidance-card,
+.lte-form-card {
+  padding: 18px;
 }
 
 .lte-scenario-card {
   width: 100%;
   align-self: stretch;
   gap: var(--lte-space-3);
+  border-top: 3px solid var(--lte-frame);
 }
 
 .lte-card-title,
 .lte-section-title {
   color: var(--lte-ink);
-  font-size: 16px;
+  font-size: 17px;
   font-weight: 650;
+  letter-spacing: -0.012em;
 }
 
 .lte-status-chip {
   min-height: 24px;
   color: var(--lte-ink);
-  background: #edf4f3;
+  background: #edf0eb;
   font-size: 11px;
   font-weight: 650;
 }
 
 .lte-status-chip--ready {
   color: #075c53;
-  background: #d8f5ef;
+  background: var(--lte-accent-soft);
 }
 
 .lte-status-chip--dem-pending,
 .lte-status-chip--boundary-ready {
-  color: #77580b;
-  background: #fff2c9;
+  color: #704312;
+  background: #f5e3d1;
 }
 
 .lte-status-chip--invalid {
-  color: #962f3b;
-  background: #ffe3e6;
+  color: #8d2929;
+  background: #f6dddd;
 }
 
 .lte-card-actions,
-.lte-profile-actions {
+.lte-profile-actions,
+.lte-candidate-toolbar {
   align-items: center;
   gap: var(--lte-space-2);
 }
 
 .lte-card-actions .q-btn,
 .lte-profile-actions .q-btn {
-  min-height: 34px;
+  min-height: 36px;
   border-radius: var(--lte-radius-sm);
   box-shadow: none;
 }
@@ -221,11 +438,10 @@ body,
 .lte-cli-guidance {
   width: 100%;
   overflow-x: auto;
-  border: 1px solid #d7e3e1;
-  border-radius: var(--lte-radius-sm);
-  background: #f5f8f8;
   color: #173b3f;
-  font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+  background: #eef1ed;
+  border: 1px solid var(--lte-border);
+  border-radius: var(--lte-radius-sm);
   font-size: 12px;
 }
 
@@ -234,37 +450,24 @@ body,
   font-weight: 650;
 }
 
-.lte-validation-result--ok {
-  color: #08766d;
-}
-
-.lte-validation-result--error {
-  color: #a12635;
-}
+.lte-validation-result--ok { color: var(--lte-success); }
+.lte-validation-result--error { color: var(--lte-danger); }
 
 .lte-validation-message {
-  color: var(--lte-ink-soft);
-  font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+  color: var(--lte-ink-muted);
   font-size: 11px;
 }
 
-.lte-configure-page {
-  max-width: 1040px;
-}
-
-.lte-profile-select {
-  width: min(420px, 100%);
-}
+.lte-configure-page { max-width: 1040px; }
+.lte-profile-select { width: min(420px, 100%); }
 
 .lte-dirty-indicator {
-  color: var(--lte-ink-soft);
+  color: var(--lte-ink-muted);
   font-size: 12px;
   font-weight: 600;
 }
 
-.lte-dirty-indicator--dirty {
-  color: #8b6100;
-}
+.lte-dirty-indicator--dirty { color: #8a531c; }
 
 .lte-form-card {
   width: 100%;
@@ -276,51 +479,36 @@ body,
   gap: var(--lte-space-3) var(--lte-space-4);
 }
 
-.lte-form-grid > * {
-  min-width: 0;
-}
+.lte-form-grid > * { min-width: 0; }
 
 .lte-callout {
   width: 100%;
   padding: var(--lte-space-3) var(--lte-space-4);
+  background: #e7f3ef;
   border-left: 3px solid var(--lte-accent);
-  background: #f2f8f7;
 }
 
 .lte-callout--warning {
-  border-left-color: #b17a00;
-  background: #fff8e5;
+  background: #f8eadc;
+  border-left-color: var(--lte-signal);
 }
 
 .lte-confirmation-dialog {
   width: min(460px, calc(100vw - 32px));
   gap: var(--lte-space-3);
-  border-radius: var(--lte-radius-sm);
+  border-radius: var(--lte-radius-md);
 }
 
-.lte-candidate-page {
-  max-width: 1540px;
-}
+.lte-candidate-page { max-width: 1540px; }
 
 .lte-candidate-progress,
 .lte-candidate-map-card,
 .lte-candidate-inspector,
 .lte-candidate-filmstrip {
-  min-width: 0;
   padding: var(--lte-space-4);
-  border: 1px solid var(--lte-border);
-  border-radius: var(--lte-radius-sm);
-  background: #fff;
-  box-shadow: 0 8px 22px rgb(16 42 46 / 6%);
 }
 
-.lte-candidate-toolbar {
-  gap: var(--lte-space-2);
-}
-
-.lte-candidate-id-input {
-  width: 126px;
-}
+.lte-candidate-id-input { width: 126px; }
 
 .lte-candidate-workspace {
   grid-template-columns: minmax(0, 3fr) minmax(280px, 1fr) !important;
@@ -329,9 +517,7 @@ body,
 }
 
 .lte-candidate-map-card,
-.lte-candidate-inspector {
-  height: min(68vh, 760px);
-}
+.lte-candidate-inspector { height: min(68vh, 760px); }
 
 .lte-candidate-map-wrap,
 .lte-candidate-map {
@@ -339,17 +525,9 @@ body,
   height: 100%;
 }
 
-.lte-layer-controls {
-  gap: var(--lte-space-2);
-}
-
-.lte-dem-opacity {
-  width: 120px;
-}
-
-.lte-dem-style {
-  width: 144px;
-}
+.lte-layer-controls { gap: var(--lte-space-2); }
+.lte-dem-opacity { width: 120px; }
+.lte-dem-style { width: 144px; }
 
 .lte-candidate-inspector {
   overflow-y: auto;
@@ -360,14 +538,14 @@ body,
   width: 100%;
   max-height: 300px;
   overflow: hidden;
+  background: var(--lte-frame);
   border: 1px solid var(--lte-border);
   border-radius: var(--lte-radius-sm);
-  background: #102a2e;
 }
 
 .lte-candidate-metric,
 .lte-candidate-statistics {
-  color: var(--lte-ink-soft);
+  color: var(--lte-ink-muted);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
@@ -384,13 +562,13 @@ body,
   overflow: hidden;
   cursor: pointer;
   border: 2px solid transparent;
-  border-radius: var(--lte-radius-sm);
+  border-radius: var(--lte-radius-md);
   box-shadow: none;
 }
 
 .lte-filmstrip-card--selected {
-  border-color: #16a36a;
-  box-shadow: 0 0 0 2px rgb(22 163 106 / 14%);
+  border-color: var(--lte-accent);
+  box-shadow: 0 0 0 2px rgb(20 151 134 / 14%);
 }
 
 .lte-filmstrip-thumbnail {
@@ -398,13 +576,11 @@ body,
   width: 100%;
   height: 144px;
   object-fit: cover;
-  background-color: #102a2e;
+  background-color: var(--lte-frame);
 }
 
 .lte-filmstrip-card-title,
-.lte-filmstrip-card > .lte-page-subtitle {
-  margin: 0 var(--lte-space-3);
-}
+.lte-filmstrip-card > .lte-page-subtitle { margin: 0 var(--lte-space-3); }
 
 .lte-filmstrip-card-title {
   color: var(--lte-ink);
@@ -414,9 +590,7 @@ body,
 
 .lte-generate-page,
 .lte-figures-page,
-.lte-history-page {
-  max-width: 1180px;
-}
+.lte-history-page { max-width: 1180px; }
 
 .lte-generate-summary,
 .lte-generate-artifacts,
@@ -425,13 +599,10 @@ body,
 .lte-figure-export {
   gap: var(--lte-space-3);
   padding: var(--lte-space-4);
-  border: 1px solid var(--lte-border);
-  border-radius: var(--lte-radius-sm);
-  box-shadow: 0 8px 22px rgb(16 42 46 / 6%);
 }
 
 .lte-artifact-status {
-  color: var(--lte-ink-soft);
+  color: var(--lte-ink-muted);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
@@ -440,9 +611,9 @@ body,
   width: 100%;
   max-height: 620px;
   object-fit: contain;
+  background: #edf0eb;
   border: 1px solid var(--lte-border);
-  border-radius: var(--lte-radius-sm);
-  background: #f5f8f8;
+  border-radius: var(--lte-radius-md);
 }
 
 .lte-figure-warnings,
@@ -471,37 +642,89 @@ button:disabled,
 }
 
 @media (max-width: 980px) {
-  .lte-topbar {
-    padding: 0 var(--lte-space-3);
+  .lte-command-bar { padding: 0 16px; }
+  .lte-command-bar__inner { gap: 12px; }
+  .lte-shell-menu { display: inline-flex; }
+  .lte-main { padding: 22px 18px 32px; }
+  .lte-form-grid { grid-template-columns: 1fr !important; }
+  .lte-candidate-workspace { grid-template-columns: 1fr !important; }
+  .lte-candidate-map-card,
+  .lte-candidate-inspector { height: auto; }
+}
+
+@media (max-width: 760px) {
+  .lte-command-bar {
+    min-height: 64px;
+    padding: 0 10px;
   }
 
-  .lte-topbar__inner {
-    gap: var(--lte-space-3);
-    overflow-x: auto;
+  .lte-command-bar__inner {
+    min-height: 64px;
+    gap: 7px;
   }
 
-  .lte-job-status,
-  .lte-app-status {
-    display: none;
+  .lte-command-bar .q-btn,
+  .lte-card-actions .q-btn,
+  .lte-profile-actions .q-btn,
+  .lte-candidate-toolbar .q-btn,
+  .lte-generate-page .q-btn,
+  .lte-figures-page .q-btn,
+  .lte-history-page .q-btn {
+    min-height: 44px;
+  }
+
+  .lte-page-context__eyebrow { display: none; }
+
+  .lte-page-context {
+    max-width: 96px;
+    font-size: 17px;
+  }
+
+  .lte-job-indicator {
+    max-width: 104px;
+    min-height: 28px;
+    padding-right: 8px;
+    padding-left: 24px;
+    font-size: 9px;
+  }
+
+  .lte-language-select {
+    flex-basis: 86px;
+    width: 86px;
   }
 
   .lte-main {
-    padding: var(--lte-space-4);
+    min-height: calc(100vh - 64px);
+    padding: 18px 12px 28px;
   }
 
-  .lte-form-grid {
-    grid-template-columns: 1fr !important;
-  }
+  .lte-card-grid,
+  .lte-filmstrip-grid { grid-template-columns: minmax(0, 1fr); }
 
-  .lte-candidate-workspace {
-    grid-template-columns: 1fr !important;
-  }
-
+  .lte-scenario-card,
+  .lte-guidance-card,
+  .lte-form-card,
+  .lte-candidate-progress,
   .lte-candidate-map-card,
-  .lte-candidate-inspector {
-    height: auto;
+  .lte-candidate-inspector,
+  .lte-candidate-filmstrip,
+  .lte-generate-summary,
+  .lte-generate-artifacts,
+  .lte-figure-source,
+  .lte-figure-style,
+  .lte-figure-export { padding: 14px; }
+
+  .lte-card-actions,
+  .lte-profile-actions,
+  .lte-candidate-toolbar {
+    width: 100%;
+    flex-wrap: wrap;
   }
+
+  .lte-candidate-map-wrap,
+  .lte-candidate-map { min-height: 360px; }
 }
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
