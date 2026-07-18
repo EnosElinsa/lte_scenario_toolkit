@@ -1147,6 +1147,80 @@ button:disabled,
   .lte-candidate-toolbar-group .q-btn { flex: 1 1 auto; }
 }
 
+@media (max-width: 390px) {
+  .lte-web-selector-frame,
+  .lte-candidate-page {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    overflow-x: clip;
+  }
+
+  .lte-web-selector-frame { padding: 8px; }
+
+  .lte-web-selector-actions,
+  .lte-candidate-heading,
+  .lte-candidate-progress,
+  .lte-candidate-toolbar,
+  .lte-candidate-workspace,
+  .lte-candidate-map-card,
+  .lte-candidate-map-wrap,
+  .lte-candidate-map,
+  .lte-candidate-inspector,
+  .lte-candidate-filmstrip {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+  }
+
+  .lte-candidate-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .lte-segmented-control {
+    display: flex;
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .lte-segmented-control .q-btn {
+    flex: 1 1 0;
+    min-width: 0;
+    min-height: 44px;
+    padding-right: 8px;
+    padding-left: 8px;
+  }
+
+  .lte-candidate-toolbar,
+  .lte-candidate-toolbar-group,
+  .lte-layer-controls {
+    align-items: stretch;
+    min-width: 0;
+  }
+
+  .lte-candidate-toolbar-group {
+    width: 100%;
+    flex-direction: column;
+  }
+
+  .lte-candidate-toolbar-group .q-btn,
+  .lte-candidate-id-input {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+  }
+
+  .lte-candidate-workspace { grid-template-columns: minmax(0, 1fr); }
+
+  .lte-filmstrip-grid {
+    grid-auto-flow: column;
+    grid-auto-columns: clamp(220px, 84vw, 280px);
+    max-width: 100%;
+    overflow-x: auto;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

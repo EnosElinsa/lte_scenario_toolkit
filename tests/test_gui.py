@@ -3983,6 +3983,39 @@ def test_candidate_workbench_css_is_bounded_and_mobile_safe():
     assert ".lte-filmstrip-grid { grid-template-columns" not in mobile_block
 
 
+def test_candidate_workbench_has_explicit_390px_overflow_safeguards():
+    css = (
+        ROOT / "src/lte_scenario_toolkit/gui/assets/app.css"
+    ).read_text(encoding="utf-8")
+
+    narrow_start = css.index("@media (max-width: 390px)")
+    next_media = css.find("@media", narrow_start + 1)
+    narrow = css[narrow_start : None if next_media == -1 else next_media]
+
+    for selector in (
+        ".lte-web-selector-frame",
+        ".lte-candidate-page",
+        ".lte-candidate-workspace",
+        ".lte-candidate-map-card",
+        ".lte-candidate-map-wrap",
+        ".lte-candidate-inspector",
+    ):
+        assert selector in narrow
+    assert "min-width: 0;" in narrow
+    assert "max-width: 100%;" in narrow
+    assert "overflow-x: clip;" in narrow
+    assert ".lte-candidate-toolbar-group" in narrow
+    assert "flex-direction: column;" in narrow
+    assert ".lte-candidate-id-input" in narrow
+    assert "width: 100%;" in narrow
+    assert ".lte-segmented-control .q-btn" in narrow
+    assert "min-height: 44px;" in narrow
+    assert ".lte-filmstrip-grid" in narrow
+    assert "grid-auto-flow: column;" in narrow
+    assert "overflow-x: auto;" in narrow
+    assert ".lte-filmstrip-grid { grid-template-columns" not in narrow
+
+
 async def test_candidate_page_can_disable_all_rescan_entrypoints(user, tmp_path):
     from dataclasses import replace
 
