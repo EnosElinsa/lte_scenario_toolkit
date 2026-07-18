@@ -9,6 +9,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from io import BytesIO
+from numbers import Real
 from pathlib import Path
 from queue import Empty
 from threading import Lock
@@ -39,6 +40,28 @@ STATION_DOT_STYLE = {
     "interactive": True,
     "bubblingMouseEvents": False,
 }
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateScanProvenance:
+    """UI-only metadata retained alongside one authoritative completed scan."""
+
+    elapsed_seconds: float
+    cache_status: str
+    cache_key: str
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.elapsed_seconds, bool)
+            or not isinstance(self.elapsed_seconds, Real)
+            or not math.isfinite(self.elapsed_seconds)
+            or self.elapsed_seconds < 0
+        ):
+            raise ValueError("elapsed_seconds must be numeric, finite, and non-negative")
+        if type(self.cache_status) is not str or not self.cache_status:
+            raise ValueError("cache_status must be non-empty text")
+        if type(self.cache_key) is not str:
+            raise ValueError("cache_key must be text")
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,16 +151,30 @@ class CandidatePageState:
         )
 
     @classmethod
-    def from_scan(cls, job_id: str, result: ScanResult) -> CandidatePageState:
+    def from_scan(
+        cls,
+        job_id: str,
+        result: ScanResult,
+        provenance: CandidateScanProvenance | None = None,
+    ) -> CandidatePageState:
         if not isinstance(result, ScanResult):
             raise ValueError("result must be a ScanResult")
+        if provenance is not None and not isinstance(
+            provenance, CandidateScanProvenance
+        ):
+            raise ValueError("provenance must be a CandidateScanProvenance")
         return cls(
             job_id=job_id,
             phase="completed" if result.completed else "scanning",
             checked_positions=result.checked_positions,
             total_positions=result.total_positions,
+            elapsed_seconds=(
+                provenance.elapsed_seconds if provenance is not None else 0.0
+            ),
             candidates=result.candidates,
             found_count=len(result.candidates),
+            cache_status=(provenance.cache_status if provenance is not None else "none"),
+            cache_key=provenance.cache_key if provenance is not None else "",
             scan_completed=result.completed,
             algorithm_version=result.algorithm_version,
         )
@@ -775,6 +812,7 @@ class CandidateSession:
     repo_root: Path
     map_bundle: CandidateMapBundle | None = None
     scan_result: ScanResult | None = None
+    scan_provenance: CandidateScanProvenance | None = None
     confirmed_flat_grid_id: int | None = None
     locked_candidate: Candidate | None = None
     created_at: float = field(default_factory=monotonic)
@@ -784,6 +822,14 @@ class CandidateSession:
             raise ValueError("session_id must be non-empty text")
         if getattr(self.preflight, "profile", None) is not self.profile_snapshot:
             raise ValueError("preflight must retain the exact frozen profile snapshot")
+        if self.scan_provenance is not None and not isinstance(
+            self.scan_provenance, CandidateScanProvenance
+        ):
+            raise ValueError("scan_provenance must be CandidateScanProvenance")
+        if self.scan_provenance is not None and (
+            self.scan_result is None or not self.scan_result.completed
+        ):
+            raise ValueError("scan provenance requires a completed scan result")
         object.__setattr__(self, "repo_root", Path(self.repo_root).resolve())
 
 
@@ -899,12 +945,16 @@ class CandidateSessionRegistry:
         self,
         session_id: str,
         result: ScanResult,
+        provenance: CandidateScanProvenance,
     ) -> CandidateSession:
         if not isinstance(result, ScanResult) or not result.completed:
             raise ValueError("session scan result must be a completed ScanResult")
+        if not isinstance(provenance, CandidateScanProvenance):
+            raise ValueError("session scan provenance must be CandidateScanProvenance")
         return self._replace(
             session_id,
             scan_result=result,
+            scan_provenance=provenance,
             confirmed_flat_grid_id=None,
             locked_candidate=None,
         )
@@ -974,10 +1024,11 @@ class CandidateExplorerController:
             self.session = registry.pin(session.session_id)
         if initial_state is not None:
             self._state = initial_state
-        elif session.scan_result is not None:
+        elif self.session.scan_result is not None:
             self._state = CandidatePageState.from_scan(
-                f"session-{session.session_id}",
-                session.scan_result,
+                f"session-{self.session.session_id}",
+                self.session.scan_result,
+                self.session.scan_provenance,
             )
         else:
             self._state = CandidatePageState()
@@ -1016,6 +1067,10 @@ class CandidateExplorerController:
             job is not None and job.future is not None and not job.future.done()
             for job in (self._scan_job, self._statistics_job, self._dem_style_job)
         )
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
 
     @staticmethod
     def _release_when_done(coordinator: JobCoordinator, job: Job) -> None:
@@ -1094,16 +1149,35 @@ class CandidateExplorerController:
             if not isinstance(result, ScanResult):
                 raise TypeError("selection scan returned an invalid result")
             self._state = self._state.with_scan_result(result)
+            if result.completed:
+                provenance = CandidateScanProvenance(
+                    elapsed_seconds=self._state.elapsed_seconds,
+                    cache_status=self._state.cache_status,
+                    cache_key=self._state.cache_key,
+                )
             if result.completed and self.registry is not None:
                 try:
                     self.session = self.registry.set_scan_result(
                         self.session.session_id,
                         result,
+                        provenance,
                     )
                 except KeyError:
-                    self.session = replace(self.session, scan_result=result)
+                    self.session = replace(
+                        self.session,
+                        scan_result=result,
+                        scan_provenance=provenance,
+                        confirmed_flat_grid_id=None,
+                        locked_candidate=None,
+                    )
             elif result.completed:
-                self.session = replace(self.session, scan_result=result)
+                self.session = replace(
+                    self.session,
+                    scan_result=result,
+                    scan_provenance=provenance,
+                    confirmed_flat_grid_id=None,
+                    locked_candidate=None,
+                )
         except ScanCancelled:
             self._state = self._state.cancelled()
         except SelectionError as exc:
@@ -1444,6 +1518,10 @@ def render_candidate_page(
     display_bounds: tuple[CandidateDisplayBounds, ...] = ()
     candidate_layers: dict[int, Any] = {}
     online_layer: Any | None = None
+    online_intent_token = 0
+    online_desired = False
+    page_closed = False
+    page_client = ui.context.client
     last_filmstrip_signature: tuple[
         tuple[int, ...], int | None, str | None, str
     ] | None = None
@@ -2104,7 +2182,10 @@ def render_candidate_page(
         refresh(controller.state)
 
     async def toggle_online(enabled: bool) -> None:
-        nonlocal online_layer
+        nonlocal online_desired, online_intent_token, online_layer
+        online_intent_token += 1
+        intent_token = online_intent_token
+        online_desired = enabled
         if not enabled:
             if online_layer is not None and online_layer in map_element.layers:
                 map_element.remove_layer(online_layer)
@@ -2114,6 +2195,14 @@ def render_candidate_page(
         from nicegui import run
 
         available = await run.io_bound(online_tiles_available, online_tile_probe)
+        if (
+            intent_token != online_intent_token
+            or not online_desired
+            or page_closed
+            or page_client.is_deleted
+            or controller.closed
+        ):
+            return
         if not available:
             online_switch.value = False
             controller.set_layer("online", False)
@@ -2276,6 +2365,16 @@ def render_candidate_page(
     )
 
     def cleanup() -> None:
+        nonlocal online_desired, online_intent_token, online_layer, page_closed
+        if page_closed:
+            return
+        page_closed = True
+        online_intent_token += 1
+        online_desired = False
+        if online_layer is not None and online_layer in map_element.layers:
+            map_element.remove_layer(online_layer)
+        online_layer = None
+        controller.set_layer("online", False)
         timer.deactivate()
         coordinator_timer.deactivate()
         controller.close()
@@ -2304,6 +2403,7 @@ __all__ = [
     "CandidatePageView",
     "CandidatePageState",
     "CandidateProgressEvent",
+    "CandidateScanProvenance",
     "CandidateSession",
     "CandidateSessionRegistry",
     "CandidateStatisticsEvent",

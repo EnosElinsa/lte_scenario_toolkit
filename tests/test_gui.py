@@ -2701,8 +2701,140 @@ def _task14_session(tmp_path, service, *, session_id="session-1", map_bundle=Non
     )
 
 
+def test_candidate_scan_provenance_is_frozen_validated_and_fail_safe():
+    from lte_scenario_toolkit.gui.pages.candidates import (
+        CandidatePageState,
+        CandidateScanProvenance,
+    )
+
+    provenance = CandidateScanProvenance(8.2, "miss", "cache-key")
+
+    assert provenance.elapsed_seconds == pytest.approx(8.2)
+    assert provenance.cache_status == "miss"
+    assert provenance.cache_key == "cache-key"
+    assert not hasattr(provenance, "__dict__")
+    with pytest.raises(FrozenInstanceError):
+        provenance.cache_status = "hit"
+
+    fallback = CandidatePageState.from_scan("scan", _task14_scan_result())
+    assert fallback.elapsed_seconds == pytest.approx(0.0)
+    assert fallback.cache_status == "none"
+    assert fallback.cache_key == ""
+
+    invalid_values = (
+        (True, "miss", "cache-key"),
+        (-0.1, "miss", "cache-key"),
+        (float("inf"), "miss", "cache-key"),
+        (float("nan"), "miss", "cache-key"),
+        ("8.2", "miss", "cache-key"),
+        (8.2, "", "cache-key"),
+        (8.2, 1, "cache-key"),
+        (8.2, "miss", None),
+    )
+    for values in invalid_values:
+        with pytest.raises(ValueError):
+            CandidateScanProvenance(*values)
+
+
+def test_completed_candidate_session_restores_scan_provenance_from_registry(tmp_path):
+    from lte_scenario_toolkit.gui.pages.candidates import (
+        CandidateExplorerController,
+        CandidateScanProvenance,
+        CandidateSessionRegistry,
+    )
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    result = _task14_scan_result()
+    provenance = CandidateScanProvenance(8.2, "miss", "cache-key")
+    registry = CandidateSessionRegistry()
+    session = registry.add(_task14_session(tmp_path, object()))
+    completed = registry.set_scan_result(session.session_id, result, provenance)
+    coordinator = JobCoordinator()
+    controller = CandidateExplorerController(completed, coordinator, registry=registry)
+    try:
+        state = controller.state
+        assert state.elapsed_seconds == pytest.approx(8.2)
+        assert state.cache_status == "miss"
+        assert state.cache_key == "cache-key"
+        assert state.candidates is result.candidates
+        assert state.found_count == len(result.candidates)
+        assert state.checked_positions == result.checked_positions
+        assert state.total_positions == result.total_positions
+        assert state.algorithm_version == result.algorithm_version
+        assert registry.get(session.session_id).scan_provenance is provenance
+    finally:
+        controller.close()
+        coordinator.shutdown()
+
+
+def test_scan_controller_atomically_persists_completed_result_and_provenance(tmp_path):
+    from lte_scenario_toolkit.gui.pages.candidates import (
+        CandidateExplorerController,
+        CandidateSessionRegistry,
+    )
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.selection_service import SelectionProgress
+
+    result = _task14_scan_result()
+
+    class Service:
+        def scan(self, _preflight, *, force=False, progress=None, cancel=None):
+            assert force is False
+            assert cancel is not None
+            progress(
+                SelectionProgress(
+                    phase="scanning",
+                    checked_positions=result.checked_positions,
+                    total_positions=result.total_positions,
+                    candidate_count=len(result.candidates),
+                    elapsed_seconds=8.2,
+                    added_candidates=result.candidates,
+                    removed_flat_grid_ids=(),
+                    cache_status="miss",
+                    cache_key="cache-key",
+                )
+            )
+            return result
+
+    registry = CandidateSessionRegistry()
+    session = registry.add(_task14_session(tmp_path, Service()))
+    coordinator = JobCoordinator()
+    controller = CandidateExplorerController(session, coordinator, registry=registry)
+    restored = None
+    try:
+        job = controller.start_scan()
+        assert job.future is not None
+        job.future.result(timeout=2)
+        state = controller.drain_scan(job)
+
+        stored = registry.get(session.session_id)
+        assert stored is not None
+        assert stored.scan_result is result
+        assert stored.scan_provenance is not None
+        assert stored.scan_provenance.elapsed_seconds == pytest.approx(8.2)
+        assert stored.scan_provenance.cache_status == "miss"
+        assert stored.scan_provenance.cache_key == "cache-key"
+        assert controller.session is stored
+        assert state.elapsed_seconds == pytest.approx(8.2)
+
+        controller.close()
+        restored = CandidateExplorerController(stored, coordinator, registry=registry)
+        assert restored.state.elapsed_seconds == pytest.approx(8.2)
+        assert restored.state.cache_status == "miss"
+        assert restored.state.cache_key == "cache-key"
+    finally:
+        if restored is not None:
+            restored.close()
+        else:
+            controller.close()
+        coordinator.shutdown()
+
+
 def test_candidate_session_registry_is_bounded_opaque_and_confirms_final_identity(tmp_path):
-    from lte_scenario_toolkit.gui.pages.candidates import CandidateSessionRegistry
+    from lte_scenario_toolkit.gui.pages.candidates import (
+        CandidateScanProvenance,
+        CandidateSessionRegistry,
+    )
 
     service = object()
     registry = CandidateSessionRegistry(max_sessions=2)
@@ -2714,7 +2846,11 @@ def test_candidate_session_registry_is_bounded_opaque_and_confirms_final_identit
     assert registry.get("opaque-1") is None
     assert registry.get(second.session_id) is second
     result = _task14_scan_result()
-    updated = registry.set_scan_result(third.session_id, result)
+    updated = registry.set_scan_result(
+        third.session_id,
+        result,
+        CandidateScanProvenance(0.0, "none", ""),
+    )
     confirmed = registry.confirm(third.session_id, 4)
     assert updated.scan_result is result
     assert confirmed.confirmed_flat_grid_id == 4
@@ -3187,6 +3323,150 @@ def test_map_bundle_and_selected_overlay_use_frozen_registered_dem_inputs(tmp_pa
     assert selected.style is MapStyle.HILLSHADE
     assert calls[-1][2]["bounds"] == (0.0, 0.0, 2000.0, 2000.0)
     assert calls[-1][2]["max_dimension"] == 640
+
+
+async def test_candidate_online_layer_obeys_latest_toggle_intent(
+    user,
+    tmp_path,
+    monkeypatch,
+):
+    from dataclasses import replace
+
+    from nicegui.elements.leaflet.leaflet_layers import TileLayer
+
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.gui.pages.candidates import CandidateSessionRegistry
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    entered = Event()
+    release = Event()
+    views = []
+    actual_render = app_module.render_candidate_page
+
+    def delayed_probe():
+        entered.set()
+        assert release.wait(2)
+        return True
+
+    def capture_render(*args, **kwargs):
+        view = actual_render(*args, **kwargs)
+        views.append(view)
+        return view
+
+    monkeypatch.setattr(app_module, "render_candidate_page", capture_render)
+    registry = CandidateSessionRegistry()
+    registry.add(
+        replace(
+            _task14_session(
+                tmp_path,
+                object(),
+                map_bundle=_task14_map_bundle(tmp_path),
+            ),
+            scan_result=_task14_scan_result(),
+        )
+    )
+    coordinator = JobCoordinator()
+    try:
+        app_module.create_app(
+            catalog=_Task13Catalog(tmp_path),
+            profile_store=object(),
+            candidate_registry=registry,
+            coordinator=coordinator,
+            online_tile_probe=delayed_probe,
+            testing=True,
+        )
+        await user.open("/candidates/session-1")
+        assert len(views) == 1
+        view = views[0]
+
+        user.find(marker="candidate-layer-online").click()
+        assert await asyncio.to_thread(entered.wait, 1)
+        user.find(marker="candidate-layer-online").click()
+        assert "online" not in view.controller.state.enabled_layers
+
+        release.set()
+        await asyncio.sleep(0.2)
+
+        assert "online" not in view.controller.state.enabled_layers
+        assert not any(isinstance(layer, TileLayer) for layer in view.map_element.layers)
+    finally:
+        release.set()
+        if user.client is not None and not user.client.is_deleted:
+            user.client.delete()
+        coordinator.shutdown()
+
+
+async def test_candidate_online_probe_completion_after_page_cleanup_is_noop(
+    user,
+    tmp_path,
+    monkeypatch,
+):
+    from dataclasses import replace
+
+    from nicegui import core
+    from nicegui.elements.leaflet.leaflet_layers import TileLayer
+
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.gui.pages.candidates import CandidateSessionRegistry
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    entered = Event()
+    release = Event()
+    unhandled = []
+    views = []
+    actual_render = app_module.render_candidate_page
+
+    def delayed_probe():
+        entered.set()
+        assert release.wait(2)
+        return True
+
+    def capture_render(*args, **kwargs):
+        view = actual_render(*args, **kwargs)
+        views.append(view)
+        return view
+
+    monkeypatch.setattr(app_module, "render_candidate_page", capture_render)
+    monkeypatch.setattr(core.app, "handle_exception", unhandled.append)
+    registry = CandidateSessionRegistry()
+    registry.add(
+        replace(
+            _task14_session(
+                tmp_path,
+                object(),
+                map_bundle=_task14_map_bundle(tmp_path),
+            ),
+            scan_result=_task14_scan_result(),
+        )
+    )
+    coordinator = JobCoordinator()
+    try:
+        app_module.create_app(
+            catalog=_Task13Catalog(tmp_path),
+            profile_store=object(),
+            candidate_registry=registry,
+            coordinator=coordinator,
+            online_tile_probe=delayed_probe,
+            testing=True,
+        )
+        client = await user.open("/candidates/session-1")
+        assert len(views) == 1
+        view = views[0]
+
+        user.find(marker="candidate-layer-online").click()
+        assert await asyncio.to_thread(entered.wait, 1)
+        client.delete()
+        release.set()
+        await asyncio.sleep(0.2)
+
+        assert "online" not in view.controller.state.enabled_layers
+        assert not any(isinstance(layer, TileLayer) for layer in view.map_element.layers)
+        assert unhandled == []
+    finally:
+        release.set()
+        if user.client is not None and not user.client.is_deleted:
+            user.client.delete()
+        coordinator.shutdown()
 
 
 async def test_candidate_route_uses_one_offline_leaflet_and_preserves_it_on_view_switch(
