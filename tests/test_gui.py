@@ -4034,10 +4034,10 @@ async def test_candidate_workbench_presents_progress_and_technical_details(
         ),
         (
             "zh-CN",
-            "候选区域选择地图",
-            "候选区域 1 的地形预览",
-            "候选区域 1 的地图预览",
-            "地形图表预览",
+            "\u5019\u9009\u533a\u57df\u9009\u62e9\u5730\u56fe",
+            "\u5019\u9009\u533a\u57df 1 \u7684\u5730\u5f62\u9884\u89c8",
+            "\u5019\u9009\u533a\u57df 1 \u7684\u5730\u56fe\u9884\u89c8",
+            "\u5730\u5f62\u56fe\u8868\u9884\u89c8",
         ),
     ),
 )
@@ -5424,7 +5424,11 @@ async def test_figure_primary_source_error_is_localized_and_raw_detail_is_collap
 
         await user.should_see(
             marker="figure-source-error",
-            content="无法加载该图表来源。请检查路径以及运行是否已完成，然后重试。",
+            content=(
+                "\u65e0\u6cd5\u52a0\u8f7d\u8be5\u56fe\u8868\u6765\u6e90\u3002"
+                "\u8bf7\u68c0\u67e5\u8def\u5f84\u4ee5\u53ca\u8fd0\u884c\u662f\u5426"
+                "\u5df2\u5b8c\u6210\uff0c\u7136\u540e\u91cd\u8bd5\u3002"
+            ),
         )
         primary = next(iter(user.find(marker="figure-source-error").elements))
         assert raw_detail not in primary.text
@@ -5487,11 +5491,14 @@ async def test_figure_warning_error_and_invalid_style_keep_raw_detail_technical(
 
         await user.should_see(
             marker="figure-warning-summary-0",
-            content="图表操作已完成，但出现了警告",
+            content=(
+                "\u56fe\u8868\u64cd\u4f5c\u5df2\u5b8c\u6210\uff0c"
+                "\u4f46\u51fa\u73b0\u4e86\u8b66\u544a"
+            ),
         )
         await user.should_see(
             marker="figure-error-summary",
-            content="图表操作未能完成",
+            content="\u56fe\u8868\u64cd\u4f5c\u672a\u80fd\u5b8c\u6210",
         )
         warning = next(
             iter(user.find(marker="figure-warning-summary-0").elements)
@@ -5506,7 +5513,9 @@ async def test_figure_warning_error_and_invalid_style_keep_raw_detail_technical(
         assert raw_error in technical.text
 
         user.find(marker="figure-dpi").clear().type("0")
-        await user.should_see("请检查图表样式设置")
+        await user.should_see(
+            "\u8bf7\u68c0\u67e5\u56fe\u8868\u6837\u5f0f\u8bbe\u7f6e"
+        )
         assert "DPI must be a positive integer" in technical.text
         assert not user.notify.contains("DPI must be a positive integer")
     finally:
