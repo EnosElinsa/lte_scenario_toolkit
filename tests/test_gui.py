@@ -200,6 +200,12 @@ def test_translation_dictionaries_have_identical_keys_and_format_values():
         module.Translator("zh-CN").text("action.open_navigation")
         == "\u6253\u5f00\u5bfc\u822a\u83dc\u5355"
     )
+    assert module.Translator("en").text("candidates.dem_opacity") == (
+        "Terrain opacity"
+    )
+    assert module.Translator("zh-CN").text("candidates.dem_opacity") == (
+        "\u5730\u5f62\u56fe\u5c42\u4e0d\u900f\u660e\u5ea6"
+    )
     assert (
         module.Translator("en").text("technical.machine_status", status="ready")
         == "Machine status: ready"
@@ -3926,6 +3932,8 @@ async def test_candidate_workbench_presents_progress_and_technical_details(
     await user.should_see(marker="candidate-view-control")
     progress = next(iter(user.find(kind=ui.linear_progress).elements))
     assert tuple(progress.default_slot.children) == ()
+    opacity = next(iter(user.find(marker="candidate-dem-opacity").elements))
+    assert opacity.props["aria-label"] == "Terrain opacity"
 
     map_button = next(iter(user.find(marker="candidate-view-map").elements))
     filmstrip_button = next(

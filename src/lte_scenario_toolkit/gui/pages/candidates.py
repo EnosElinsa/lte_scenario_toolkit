@@ -1751,6 +1751,8 @@ def render_candidate_page(
                         max=1.0,
                         step=0.05,
                         value=controller.state.dem_opacity,
+                    ).props(
+                        f'aria-label="{translator.text("candidates.dem_opacity")}"'
                     ).classes("lte-dem-opacity").mark("candidate-dem-opacity")
                     dem_style_select = ui.select(
                         {
