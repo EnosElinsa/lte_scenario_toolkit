@@ -39,7 +39,6 @@ from lte_scenario_toolkit.selection_service import (
 
 def _profile(tmp_path: Path, **changes) -> ExperimentProfile:
     profile = ExperimentProfile(
-        schema_version=2,
         profile_id="chicago-default",
         display_name="Chicago default",
         scenario_id="chicago",
@@ -193,7 +192,6 @@ def test_preflight_resolves_catalog_inputs_and_manifest_fingerprints(
             return (tmp_path / path).resolve()
 
     manifest = {
-        "schema_version": 2,
         "datasets": [
             {
                 **dataset,
@@ -590,7 +588,7 @@ def test_end_to_end_fixture_run(
     selection_export_fixture,
     monkeypatch,
 ):
-    """Publish one fixture selection with traceable CSV, preview, and run schemas."""
+    """Publish one fixture selection with traceable CSV, preview, and run records."""
     service, preflight, result, candidate, prepared = selection_export_fixture
     monkeypatch.setattr(
         "lte_scenario_toolkit.selection_service.gpd.read_file",
@@ -635,7 +633,6 @@ def test_end_to_end_fixture_run(
     )
     assert frame["run_id"].unique().tolist() == [run_record["run_id"]]
     assert selection.keys() == {
-        "schema_version",
         "run_id",
         "scenario_id",
         "profile_id",
@@ -681,7 +678,6 @@ def test_end_to_end_fixture_run(
     assert run_record["status"] == "completed"
     assert run_record["errors"] == []
     assert run_record["metadata"] == {
-        "schema_version": 1,
         "run_kind": "selection",
         "candidate": {
             "candidate_id": "candidate-0001",
@@ -698,7 +694,6 @@ def test_end_to_end_fixture_run(
             "total_positions": 1,
         },
         "cache": {
-            "schema_version": 1,
             "key": selection["scan"]["cache_key"],
         },
         "inputs": {
@@ -731,7 +726,6 @@ def test_end_to_end_fixture_run(
         "sidecars": {
             "config": "run-config.yaml",
             "selection": "selection.json",
-            "compatibility_records": [],
         },
         "requested_artifacts": ["csv", "preview_png"],
         "artifact_paths": {

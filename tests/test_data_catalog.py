@@ -66,7 +66,6 @@ def catalog_document(*, dem_dataset_id: str | None = "dem") -> dict:
         }
     )
     return {
-        "schema_version": 2,
         "datasets": [boundary, dem],
         "scenarios": [
             {
@@ -341,7 +340,7 @@ def test_save_data_catalog_validates_and_atomically_replaces_yaml(tmp_path, monk
 
     written = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert written["scenarios"][0]["display_name"] == "Updated City"
-    assert list(written) == ["schema_version", "datasets", "scenarios"]
+    assert list(written) == ["datasets", "scenarios"]
     assert replace_calls and replace_calls[0][1] == path
     assert replace_calls[0][0].parent == path.parent
     assert not replace_calls[0][0].exists()
@@ -367,16 +366,16 @@ def test_save_data_catalog_does_not_replace_file_when_document_is_invalid(tmp_pa
     path = write_catalog(tmp_path)
     catalog = load_data_catalog(path)
     invalid = deepcopy(catalog.document)
-    invalid["schema_version"] = 1
+    invalid["schema_version"] = 2
     original = path.read_text(encoding="utf-8")
 
-    with pytest.raises(CatalogError, match="schema_version"):
+    with pytest.raises(CatalogError, match="unexpected.*schema_version"):
         save_data_catalog(catalog, invalid)
 
     assert path.read_text(encoding="utf-8") == original
 
 
-def test_update_data_manifest_writes_schema_scenarios_metadata_and_checksums(tmp_path):
+def test_update_data_manifest_writes_scenarios_metadata_and_checksums(tmp_path):
     create_entrypoints(tmp_path)
     catalog = load_data_catalog(write_catalog(tmp_path))
 
@@ -384,7 +383,7 @@ def test_update_data_manifest_writes_schema_scenarios_metadata_and_checksums(tmp
 
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert output == (tmp_path / "data" / "manifest.json").resolve()
-    assert payload["schema_version"] == 2
+    assert "schema_version" not in payload
     assert payload["generated_at"].endswith("Z")
     assert payload["scenarios"] == catalog.document["scenarios"]
     datasets = {item["dataset_id"]: item for item in payload["datasets"]}

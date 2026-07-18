@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import errno
-import hashlib
 import json
 import os
 import re
@@ -15,7 +14,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
@@ -23,9 +22,6 @@ from .io import _json_safe, atomic_write_json
 
 _SLUG_PATTERN = re.compile(r"^[a-z][a-z0-9-]*$")
 _RUN_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
-_LEGACY_RECORD_NAMES = frozenset(
-    {"run-select-sites.json", "run-generate-figures.json"}
-)
 _WINDOWS_RESERVED = frozenset(
     {"con", "prn", "aux", "nul"}
     | {f"com{index}" for index in range(1, 10)}
@@ -42,6 +38,7 @@ _RUN_RECORD_FIELDS = frozenset(
         "artifacts",
         "metadata",
         "errors",
+        "published_at",
     }
 )
 
@@ -209,19 +206,6 @@ def _safe_slug(value: Any, *, field: str) -> str:
             f"{field} must be a safe lowercase slug and not a Windows device name"
         )
     return value
-
-
-def _legacy_slug(value: Any, *, fallback: str) -> str:
-    raw = value if type(value) is str else ""
-    token = re.sub(r"[^a-z0-9]+", "-", raw.casefold()).strip("-")
-    if not token or not token[0].isalpha():
-        token = f"legacy-{token}".rstrip("-")
-    if token in _WINDOWS_RESERVED:
-        token = f"legacy-{token}"
-    try:
-        return _safe_slug(token, field="legacy slug")
-    except ValueError:
-        return _safe_slug(fallback, field="legacy slug fallback")
 
 
 def _safe_run_id(value: Any, *, field: str = "run_id") -> str:
@@ -628,9 +612,6 @@ class RunService:
                 continue
             for child in children:
                 name = child.name.casefold()
-                if name in _LEGACY_RECORD_NAMES:
-                    records.append(child)
-                    continue
                 try:
                     redirected = _is_redirected_path(child)
                 except OSError as exc:
@@ -663,222 +644,6 @@ class RunService:
         diagnostics.sort(key=lambda item: item["path"])
         return tuple(records), tuple(diagnostics)
 
-    @staticmethod
-    def _legacy_relative_reference(value: Any, *, description: str) -> Path:
-        if type(value) is not str or not value.strip():
-            raise ValueError(f"{description} artifact path must be non-empty text")
-        text = value.strip()
-        posix = PurePosixPath(text)
-        windows = PureWindowsPath(text)
-        if ".." in posix.parts or ".." in windows.parts:
-            raise ValueError(f"{description} artifact path contains traversal")
-        if windows.drive and not windows.is_absolute():
-            raise ValueError(f"{description} artifact path is drive-relative")
-        absolute = Path(text).is_absolute() or posix.is_absolute() or windows.is_absolute()
-        if absolute:
-            name = windows.name if windows.is_absolute() or "\\" in text else posix.name
-            relative = Path(name)
-        else:
-            relative = Path(*PurePosixPath(text.replace("\\", "/")).parts)
-        if (
-            relative.is_absolute()
-            or relative.drive
-            or not relative.parts
-            or relative == Path(".")
-            or ".." in relative.parts
-        ):
-            raise ValueError(f"{description} artifact path is unsafe")
-        return relative
-
-    def _validate_legacy_record(
-        self,
-        record_path: Path,
-        document: Any,
-    ) -> tuple[dict[str, Any], datetime]:
-        if not isinstance(document, dict):
-            raise ValueError("legacy operation record must be a JSON object")
-        required = {"timestamp", "command", "config", "inputs", "software", "outputs"}
-        missing = sorted(required - document.keys())
-        if missing:
-            raise ValueError(
-                "legacy operation record is missing required fields: " + ", ".join(missing)
-            )
-        self._assert_contained(record_path, description="legacy operation record")
-        if _is_redirected_path(record_path) or not record_path.is_file():
-            raise ValueError("legacy operation record must be a regular file")
-
-        created_at, parsed_created_at = _normalise_created_at(document["timestamp"])
-        command = document["command"]
-        if not isinstance(command, list) or not all(type(item) is str for item in command):
-            raise ValueError("legacy operation command must be an array of strings")
-        config = document["config"]
-        if not isinstance(config, Mapping):
-            raise ValueError("legacy operation config must be a JSON object")
-        inputs = document["inputs"]
-        if not isinstance(inputs, list) or not all(
-            isinstance(item, Mapping) for item in inputs
-        ):
-            raise ValueError("legacy operation inputs must be an array of objects")
-        software = document["software"]
-        if not isinstance(software, Mapping):
-            raise ValueError("legacy operation software must be a JSON object")
-        outputs = document["outputs"]
-        if not isinstance(outputs, list):
-            raise ValueError("legacy operation outputs must be a JSON array")
-        source_record = document.get("source_record")
-        if source_record == "run.json":
-            authoritative_record = record_path.parent / "run.json"
-            self._assert_contained(
-                authoritative_record,
-                description="authoritative run record",
-            )
-            if (
-                _is_redirected_path(authoritative_record)
-                or not authoritative_record.is_file()
-            ):
-                raise ValueError(
-                    "compatibility operation record is missing authoritative run.json"
-                )
-            authoritative_document = json.loads(
-                authoritative_record.read_text(encoding="utf-8")
-            )
-            if not isinstance(authoritative_document, dict):
-                raise ValueError("authoritative run.json must be a JSON object")
-            compatibility_run_id = _safe_run_id(document.get("run_id"))
-            authoritative_run_id = _safe_run_id(authoritative_document.get("run_id"))
-            if compatibility_run_id != authoritative_run_id:
-                raise ValueError(
-                    "compatibility operation run_id does not match authoritative run.json"
-                )
-
-        references: list[Path] = []
-        if record_path.name.casefold() == "run-generate-figures.json":
-            local_source: Any = None
-            if document.get("source_record") == "run.json":
-                configured_source = config.get("source")
-                if isinstance(configured_source, Mapping):
-                    local_source = configured_source.get("artifact")
-            if (
-                type(local_source) is str
-                and PureWindowsPath(local_source).suffix.casefold() == ".csv"
-            ):
-                references.append(
-                    self._legacy_relative_reference(
-                        local_source,
-                        description="compatibility source CSV",
-                    )
-                )
-            else:
-                for item in inputs:
-                    input_path = item.get("path")
-                    if type(input_path) is str and (
-                        PureWindowsPath(input_path).suffix.casefold() == ".csv"
-                        or PurePosixPath(input_path).suffix.casefold() == ".csv"
-                    ):
-                        references.append(
-                            self._legacy_relative_reference(
-                                input_path,
-                                description="legacy input CSV",
-                            )
-                        )
-        references.extend(
-            self._legacy_relative_reference(value, description="legacy output")
-            for value in outputs
-        )
-        unique_references: list[Path] = []
-        seen_references: set[str] = set()
-        for reference in references:
-            identity = reference.as_posix().casefold()
-            if identity in seen_references:
-                continue
-            seen_references.add(identity)
-            unique_references.append(reference)
-        artifacts = self._artifact_paths(record_path.parent, unique_references)
-
-        explicit_run_id = document.get("run_id")
-        if explicit_run_id is None:
-            canonical = json.dumps(
-                document,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-            )
-            record_identity = os.path.normcase(
-                os.path.normpath(str(record_path.resolve(strict=True)))
-            )
-            run_id = hashlib.sha256(
-                f"{record_identity}\0{canonical}".encode()
-            ).hexdigest()[:32]
-        else:
-            run_id = _safe_run_id(explicit_run_id)
-        status = document.get("status", "completed")
-        if status not in self.VALID_STATUSES:
-            raise ValueError(f"invalid legacy run status: {status!r}")
-        errors = document.get("errors", [])
-        if not isinstance(errors, list):
-            raise ValueError("legacy operation errors must be a JSON array")
-        parent_run_id = document.get("parent_run_id")
-        if parent_run_id is not None:
-            parent_run_id = _safe_run_id(parent_run_id, field="parent_run_id")
-
-        scenario_id = _legacy_slug(
-            config.get("scenario_id", config.get("city_name")),
-            fallback="legacy",
-        )
-        profile_id = _legacy_slug(
-            config.get("profile_id", config.get("experiment_name")),
-            fallback="legacy-profile",
-        )
-        run_kind = (
-            "figure"
-            if record_path.name.casefold() == "run-generate-figures.json"
-            else "selection"
-        )
-        metadata: dict[str, Any] = {
-            "run_kind": run_kind,
-            "entrypoint": list(command),
-            "git_commit": document.get("git_commit"),
-            "software_versions": dict(software),
-            "inputs": [dict(item) for item in inputs],
-            "parameters": dict(config),
-            "legacy_record": {
-                "filename": record_path.name,
-                "path": record_path.relative_to(self.output_root).as_posix(),
-                "source_record": document.get("source_record"),
-            },
-        }
-        csv_artifacts = [
-            artifact for artifact in artifacts if Path(artifact).suffix.casefold() == ".csv"
-        ]
-        if len(csv_artifacts) == 1:
-            csv_artifact = csv_artifacts[0]
-            metadata["source"] = {
-                "kind": "legacy-csv",
-                "artifact": csv_artifact,
-                "path": str((record_path.parent / csv_artifact).resolve(strict=True)),
-            }
-        for source_field, target_field in (
-            ("target_crs", "target_crs"),
-            ("rect_size", "rectangle_size_m"),
-            ("rectangle_size_m", "rectangle_size_m"),
-            ("figure_spec", "figure_spec"),
-        ):
-            if source_field in config:
-                metadata[target_field] = config[source_field]
-
-        record = {
-            "run_id": run_id,
-            "scenario_id": scenario_id,
-            "profile_id": profile_id,
-            "created_at": created_at,
-            "parent_run_id": parent_run_id,
-            "status": status,
-            "artifacts": artifacts,
-            "metadata": metadata,
-            "errors": list(errors),
-        }
-        return record, parsed_created_at
-
     def _validate_discovered_record(
         self,
         record_path: Path,
@@ -889,11 +654,17 @@ class RunService:
         missing = sorted(_RUN_RECORD_FIELDS - document.keys())
         if missing:
             raise ValueError(f"run record is missing required fields: {', '.join(missing)}")
+        unexpected = sorted(set(document) - _RUN_RECORD_FIELDS)
+        if unexpected:
+            raise ValueError(
+                "run record has unexpected fields: " + ", ".join(unexpected)
+            )
 
         run_id = _safe_run_id(document["run_id"])
         scenario_id = _safe_slug(document["scenario_id"], field="scenario_id")
         profile_id = _safe_slug(document["profile_id"], field="profile_id")
         created_at, parsed_created_at = _normalise_created_at(document["created_at"])
+        published_at, _ = _normalise_created_at(document["published_at"])
         parent_run_id = document["parent_run_id"]
         if parent_run_id is not None:
             _safe_run_id(parent_run_id, field="parent_run_id")
@@ -923,6 +694,7 @@ class RunService:
         artifacts = self._artifact_paths(final_path, document["artifacts"])
         record = dict(document)
         record["created_at"] = created_at
+        record["published_at"] = published_at
         record["artifacts"] = artifacts
         return record, parsed_created_at
 
@@ -943,12 +715,10 @@ class RunService:
                 if _is_redirected_path(record_path) or not record_path.is_file():
                     raise ValueError("run record must be a regular file")
                 document = json.loads(record_path.read_text(encoding="utf-8"))
-                validator = (
-                    self._validate_legacy_record
-                    if record_path.name.casefold() in _LEGACY_RECORD_NAMES
-                    else self._validate_discovered_record
+                record, parsed_created_at = self._validate_discovered_record(
+                    record_path,
+                    document,
                 )
-                record, parsed_created_at = validator(record_path, document)
             except Exception as exc:
                 diagnostics.append(
                     {
@@ -976,7 +746,7 @@ class RunService:
         )
 
     def discover(self) -> RunDiscovery:
-        """Return backward-compatible manifest dictionaries for valid live runs."""
+        """Return manifest dictionaries for valid live runs."""
 
         discovered = self.discover_entries()
         return RunDiscovery(
@@ -1017,334 +787,6 @@ class RunService:
         if len(matches) != 1:
             raise ValueError("run path is ambiguous; provide one unique run_id")
         return matches[0]
-
-    @staticmethod
-    def _compatibility_payload(
-        entry: RunEntry,
-        exact_directory: Path,
-        compatibility_record: str,
-    ) -> dict[str, Any]:
-        """Build the former operation-record shape from a modern run manifest."""
-
-        record = _thaw_record(entry.record)
-        metadata_value = record.get("metadata", {})
-        metadata = metadata_value if isinstance(metadata_value, Mapping) else {}
-        entrypoint = metadata.get("entrypoint", [])
-        command = (
-            list(entrypoint)
-            if isinstance(entrypoint, (list, tuple))
-            and all(type(item) is str for item in entrypoint)
-            else []
-        )
-        raw_inputs = metadata.get("inputs", {})
-        inputs = []
-        if isinstance(raw_inputs, Mapping):
-            for name, value in sorted(raw_inputs.items(), key=lambda item: str(item[0])):
-                item = {"name": str(name)}
-                if isinstance(value, Mapping):
-                    item.update(_thaw_record(value))
-                inputs.append(item)
-        parameters = metadata.get("parameters", {})
-        config: dict[str, Any] = {
-            "schema_version": 2,
-            "scenario_id": record["scenario_id"],
-            "profile_id": record["profile_id"],
-            "parameters": (
-                _thaw_record(parameters) if isinstance(parameters, Mapping) else {}
-            ),
-        }
-        if (entry.run_dir / "run-config.yaml").is_file():
-            config["run_config"] = str(exact_directory / "run-config.yaml")
-        for field in (
-            "target_crs",
-            "rectangle_size_m",
-            "figure_spec",
-            "source",
-            "candidate",
-        ):
-            if field in metadata:
-                config[field] = _thaw_record(metadata[field])
-        software = metadata.get("software_versions", {})
-        artifacts = list(record.get("artifacts", []))
-        if compatibility_record.casefold() == "run-generate-figures.json":
-            artifacts = [
-                relative
-                for relative in artifacts
-                if Path(relative).name.casefold() != "source.csv"
-            ]
-        return {
-            "timestamp": record["created_at"],
-            "command": command,
-            "git_commit": metadata.get("git_commit"),
-            "config": config,
-            "inputs": inputs,
-            "software": (
-                _thaw_record(software) if isinstance(software, Mapping) else {}
-            ),
-            "outputs": [str(exact_directory / relative) for relative in artifacts],
-            "run_id": record["run_id"],
-            "status": record["status"],
-            "source_record": "run.json",
-        }
-
-    @staticmethod
-    def _exact_source_files(run_directory: Path) -> tuple[Path, ...]:
-        files: list[Path] = []
-        for source in sorted(run_directory.iterdir(), key=lambda path: path.name):
-            if _is_redirected_path(source) or not source.is_file():
-                raise ValueError(
-                    "exact-directory publication supports regular run files only: "
-                    f"{source}"
-                )
-            files.append(source)
-        if not any(path.name.casefold() == "run.json" for path in files):
-            raise ValueError("exact-directory publication requires run.json")
-        return tuple(files)
-
-    @staticmethod
-    def _copy_file_without_replacement(source: Path, destination: Path) -> None:
-        """Fallback publication for writable filesystems without hard links."""
-
-        descriptor: int | None = None
-        created = False
-        destination_identity: tuple[int, int] | None = None
-        try:
-            mode = source.stat().st_mode & 0o777
-            descriptor = os.open(
-                destination,
-                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                mode,
-            )
-            created = True
-            status = os.fstat(descriptor)
-            destination_identity = (status.st_dev, status.st_ino)
-            with source.open("rb") as input_stream, os.fdopen(
-                descriptor,
-                "wb",
-                closefd=True,
-            ) as output_stream:
-                descriptor = None
-                shutil.copyfileobj(input_stream, output_stream)
-                output_stream.flush()
-                os.fsync(output_stream.fileno())
-            current = destination.stat()
-            if (current.st_dev, current.st_ino) != destination_identity:
-                raise OSError(
-                    f"exact output changed during fallback publication: {destination}"
-                )
-            source.unlink()
-            created = False
-        except FileExistsError as exc:
-            raise FileExistsError(
-                f"exact output conflict: {destination.name}"
-            ) from exc
-        finally:
-            if descriptor is not None:
-                os.close(descriptor)
-            if created:
-                try:
-                    current = destination.stat()
-                except FileNotFoundError:
-                    pass
-                else:
-                    if (current.st_dev, current.st_ino) == destination_identity:
-                        destination.unlink()
-
-    @staticmethod
-    def _move_file_without_replacement(source: Path, destination: Path) -> None:
-        """Move a same-filesystem regular file without an overwrite race."""
-
-        try:
-            os.link(source, destination, follow_symlinks=False)
-        except FileExistsError as exc:
-            raise FileExistsError(
-                f"exact output conflict: {destination.name}"
-            ) from exc
-        except OSError as exc:
-            fallback_errors = {
-                errno.EACCES,
-                errno.EINVAL,
-                errno.ENOSYS,
-                errno.EPERM,
-                errno.EXDEV,
-            }
-            for name in ("ENOTSUP", "EOPNOTSUPP"):
-                value = getattr(errno, name, None)
-                if value is not None:
-                    fallback_errors.add(value)
-            if exc.errno not in fallback_errors:
-                raise
-            RunService._copy_file_without_replacement(source, destination)
-            return
-        try:
-            source.unlink()
-        except BaseException as exc:
-            try:
-                destination.unlink()
-            except OSError as cleanup_error:
-                exc.add_note(
-                    "Exact-directory link cleanup also failed: "
-                    f"{destination}: {cleanup_error}"
-                )
-            raise
-
-    def relocate_to_exact_directory(
-        self,
-        run_path: str | os.PathLike[str],
-        exact_directory: str | os.PathLike[str],
-        *,
-        compatibility_record: str | None = None,
-    ) -> Path:
-        """Merge one just-published run into an exact legacy output directory.
-
-        All destination conflicts are rejected before the first move. Files are
-        rolled back to the validated unique run if publication fails, and the
-        authoritative ``run.json`` is always moved last.
-        """
-
-        raw_target = Path(exact_directory).expanduser()
-        if not raw_target.is_absolute():
-            raise ValueError("exact output directory must be absolute")
-        _assert_unredirected_chain(raw_target, description="exact output directory")
-        if _is_redirected_path(raw_target):
-            raise ValueError("exact output directory must not be redirected")
-        target = raw_target.resolve(strict=False)
-        if target != self.output_root:
-            raise ValueError(
-                "exact output directory must equal this RunService output root"
-            )
-        if not target.is_dir():
-            raise ValueError("exact output directory must be an existing directory")
-        entry = self.entry_for_path(run_path)
-        source_directory = entry.run_dir
-        if source_directory == target:
-            raise ValueError("published run is already the exact output directory")
-
-        compatibility_name: str | None = None
-        if compatibility_record is not None:
-            if type(compatibility_record) is not str:
-                raise ValueError("compatibility record name must be text")
-            relative = Path(compatibility_record)
-            if (
-                relative.is_absolute()
-                or len(relative.parts) != 1
-                or relative.name != compatibility_record
-                or relative.suffix.casefold() != ".json"
-                or relative.name.casefold() == "run.json"
-            ):
-                raise ValueError("compatibility record must be a safe JSON filename")
-            compatibility_name = relative.name
-
-        original_sources = self._exact_source_files(source_directory)
-        original_names = tuple(path.name for path in original_sources)
-        original_identities = {name.casefold() for name in original_names}
-        if (
-            compatibility_name is not None
-            and compatibility_name.casefold() in original_identities
-        ):
-            raise FileExistsError(
-                f"compatibility record already exists in published run: "
-                f"{compatibility_name}"
-            )
-        planned_names = (
-            *original_names,
-            *((compatibility_name,) if compatibility_name else ()),
-        )
-        if len({name.casefold() for name in planned_names}) != len(planned_names):
-            raise FileExistsError(
-                "exact publication has case-insensitive filename conflicts"
-            )
-
-        def conflicts() -> tuple[Path, ...]:
-            values = []
-            existing = {
-                child.name.casefold(): child
-                for child in target.iterdir()
-            }
-            for name in planned_names:
-                destination = target / name
-                self._assert_contained(
-                    destination,
-                    description="exact publication destination",
-                )
-                conflict = existing.get(name.casefold())
-                if conflict is not None or os.path.lexists(destination):
-                    values.append(conflict or destination)
-            return tuple(values)
-
-        initial_conflicts = conflicts()
-        if initial_conflicts:
-            names = ", ".join(path.name for path in initial_conflicts)
-            raise FileExistsError(f"exact output conflict: {names}")
-
-        generated_compatibility: Path | None = None
-        moved: list[tuple[Path, Path]] = []
-        try:
-            with self._publication_claim(target / ".exact-directory"):
-                current_entry = self.entry_for_path(source_directory)
-                if current_entry.record != entry.record:
-                    raise ValueError("published run changed before exact relocation")
-                current_sources = self._exact_source_files(source_directory)
-                if tuple(path.name for path in current_sources) != original_names:
-                    raise ValueError(
-                        "published run files changed before exact relocation"
-                    )
-                claimed_conflicts = conflicts()
-                if claimed_conflicts:
-                    names = ", ".join(path.name for path in claimed_conflicts)
-                    raise FileExistsError(f"exact output conflict: {names}")
-                if compatibility_name is not None:
-                    generated_compatibility = source_directory / compatibility_name
-                    atomic_write_json(
-                        generated_compatibility,
-                        self._compatibility_payload(
-                            entry,
-                            target,
-                            compatibility_name,
-                        ),
-                    )
-                sources = list(self._exact_source_files(source_directory))
-                sources.sort(
-                    key=lambda path: (path.name.casefold() == "run.json", path.name)
-                )
-                for source in sources:
-                    destination = target / source.name
-                    self._move_file_without_replacement(source, destination)
-                    moved.append((source, destination))
-        except BaseException as exc:
-            rollback_errors: list[str] = []
-            for source, destination in reversed(moved):
-                try:
-                    self._move_file_without_replacement(destination, source)
-                except OSError as rollback_error:
-                    rollback_errors.append(f"{destination}: {rollback_error}")
-            if (
-                generated_compatibility is not None
-                and generated_compatibility.exists()
-            ):
-                try:
-                    generated_compatibility.unlink()
-                except OSError as cleanup_error:
-                    rollback_errors.append(
-                        f"{generated_compatibility}: {cleanup_error}"
-                    )
-            if rollback_errors:
-                exc.add_note(
-                    "Exact-directory rollback also failed: "
-                    + "; ".join(rollback_errors)
-                )
-            raise
-
-        current = source_directory
-        while current != target:
-            parent = current.parent
-            try:
-                current.rmdir()
-            except OSError:
-                break
-            current = parent
-        return target
-
 
 __all__ = [
     "RunDiscovery",

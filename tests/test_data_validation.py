@@ -153,7 +153,7 @@ def _catalog_document(
                 "config_path": None,
             }
         )
-    return {"schema_version": 2, "datasets": datasets, "scenarios": scenarios}
+    return {"datasets": datasets, "scenarios": scenarios}
 
 
 def _write_catalog(
@@ -190,7 +190,6 @@ def _write_catalog(
             )
             records.append(record)
         manifest_payload = {
-            "schema_version": 2,
             "generated_at": "2026-01-01T00:00:00Z",
             "datasets": records,
             "scenarios": document["scenarios"],
@@ -408,7 +407,7 @@ def test_present_dem_metadata_drift_is_still_checked(tmp_path):
 @pytest.mark.parametrize(
     ("mutator", "code"),
     [
-        (lambda payload: payload.update({"schema_version": 1}), "manifest.schema"),
+        (lambda payload: payload.update({"schema_version": 2}), "manifest.structure"),
         (
             lambda payload: payload["datasets"].append(dict(payload["datasets"][0])),
             "manifest.duplicate",
@@ -486,7 +485,7 @@ def test_boundary_sidecar_extension_matching_is_case_insensitive(tmp_path):
     assert report.ok
 
 
-def test_config_boundary_and_dem_mismatches_are_reported(tmp_path):
+def test_removed_flat_config_is_rejected(tmp_path):
     config_path = "configs/city.yaml"
     _, catalog = _write_catalog(tmp_path, dem=True, config_path=config_path)
     config = {
@@ -519,14 +518,11 @@ def test_config_boundary_and_dem_mismatches_are_reported(tmp_path):
     report = validate_scenario_data(catalog, "city")
 
     assert not report.ok
-    assert {message.code for message in report.messages} >= {
-        "config.boundary",
-        "config.dem",
-    }
+    assert "config.invalid" in {message.code for message in report.messages}
     assert not (tmp_path / "results").exists()
 
 
-def test_schema_v2_linked_profile_uses_catalog_owned_boundary_and_dem(tmp_path):
+def test_linked_profile_uses_catalog_owned_boundary_and_dem(tmp_path):
     config_path = "configs/city/default.yaml"
     catalog_path, _ = _write_catalog(tmp_path, dem=True, config_path=config_path)
     catalog_document = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
@@ -560,7 +556,6 @@ def test_schema_v2_linked_profile_uses_catalog_owned_boundary_and_dem(tmp_path):
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     profile = {
-        "schema_version": 2,
         "profile": {
             "id": "default",
             "display_name": "Default",

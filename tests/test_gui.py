@@ -457,40 +457,39 @@ def test_missing_gui_settings_use_english_defaults_without_writing(tmp_path):
 @pytest.mark.parametrize(
     "document",
     [
-        {"schema_version": 1, "language": "fr", "output_roots": []},
-        {"schema_version": True, "language": "en", "output_roots": []},
-        {"schema_version": 1, "language": "en", "output_roots": "outputs"},
-        {"schema_version": 1, "language": "en", "output_roots": ["relative"]},
+        {"language": "fr", "output_roots": []},
+        {"language": True, "output_roots": []},
+        {"language": "en", "output_roots": "outputs"},
+        {"language": "en", "output_roots": ["relative"]},
         {
-            "schema_version": 1,
             "language": "en",
             "output_roots": [],
             "unknown": True,
         },
     ],
 )
-def test_gui_settings_reject_malformed_documents(tmp_path, document):
+def test_gui_settings_fall_back_for_malformed_documents(tmp_path, document):
     module = _gui_module("settings")
     path = tmp_path / ".lte-data/gui-settings.json"
     path.parent.mkdir()
     path.write_text(json.dumps(document), encoding="utf-8")
     original = path.read_bytes()
 
-    with pytest.raises(module.GuiSettingsError):
-        module.GuiSettingsStore(tmp_path).load()
+    settings = module.GuiSettingsStore(tmp_path).load()
 
+    assert settings == module.GuiSettings()
     assert path.read_bytes() == original
 
 
-def test_gui_settings_reject_invalid_json_without_overwriting_it(tmp_path):
+def test_gui_settings_fall_back_for_invalid_json_without_overwriting_it(tmp_path):
     module = _gui_module("settings")
     path = tmp_path / ".lte-data/gui-settings.json"
     path.parent.mkdir()
     path.write_text("{broken", encoding="utf-8")
 
-    with pytest.raises(module.GuiSettingsError, match="Could not read"):
-        module.GuiSettingsStore(tmp_path).load()
+    settings = module.GuiSettingsStore(tmp_path).load()
 
+    assert settings == module.GuiSettings()
     assert path.read_text(encoding="utf-8") == "{broken"
 
 
@@ -585,7 +584,6 @@ def test_gui_settings_never_persist_environment_or_credentials(tmp_path, monkeyp
     assert "do-not-persist" not in document
     assert "secret.json" not in document
     assert set(json.loads(document)) == {
-        "schema_version",
         "language",
         "output_roots",
     }
@@ -879,7 +877,6 @@ def _task13_profile(tmp_path: Path):
     )
 
     return ExperimentProfile(
-        schema_version=2,
         profile_id="default",
         display_name="Default",
         scenario_id="ready-city",
@@ -901,32 +898,6 @@ def _task13_profile(tmp_path: Path):
     )
 
 
-def _task17_legacy_profile_store(tmp_path: Path):
-    from lte_scenario_toolkit.profiles import ProfileStore
-
-    catalog = _Task13Catalog(tmp_path)
-    catalog.resolve = lambda value: (tmp_path / value).resolve()
-    legacy_entrypoints = {
-        "points": "points_shp/USA_Clear_LTE_Base_Station/USA_Clear_LTE_Base_Station.shp",
-        "boundary": "boundary_shp/Chicago/Chicago.shp",
-        "dem": "dem/Chicago/elevation.tif",
-    }
-    for dataset_id, entrypoint in legacy_entrypoints.items():
-        catalog.datasets_by_id[dataset_id]["entrypoint"] = entrypoint
-        path = tmp_path / entrypoint
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(dataset_id, encoding="utf-8")
-    source = tmp_path / "configs" / "ready.yaml"
-    source.parent.mkdir()
-    source.write_bytes(
-        (ROOT / "tests" / "fixtures" / "legacy" / "experiment-v1.yaml").read_bytes()
-    )
-    catalog_path = tmp_path / "data" / "datasets.yaml"
-    catalog_path.parent.mkdir()
-    catalog_path.write_text("test catalog is injected\n", encoding="utf-8")
-    store = ProfileStore(tmp_path, catalog_path)
-    store._load_catalog = lambda: catalog
-    return catalog, store, source
 
 
 def test_scenario_cards_are_immutable_and_enable_only_ready_statuses(tmp_path):
@@ -1092,7 +1063,6 @@ def test_configure_model_prefers_catalog_default_and_builds_explicit_draft(tmp_p
     assert draft.profile.min_spacing == 3000
     assert draft.profile.points_dataset_id == "points"
     assert draft.profile.output_root == (tmp_path / "results").resolve()
-    assert draft.migration_error is None
     with pytest.raises(FrozenInstanceError):
         draft.dirty = True
 
@@ -1181,121 +1151,14 @@ def test_configure_draft_rejects_missing_or_ambiguous_points_datasets(tmp_path):
         configure_model(ambiguous, EmptyStore(), "without-default")
 
 
-def test_configure_model_reports_legacy_yaml_without_parsing_or_writing(tmp_path):
-    from lte_scenario_toolkit.gui.pages.configure import configure_model
-
-    class LegacyStore:
-        def discover(self, scenario_id):
-            raise ValueError("Missing required configuration value: schema_version")
-
-    model = configure_model(_Task13Catalog(tmp_path), LegacyStore(), "ready-city")
-
-    assert model.is_persisted is False
-    assert model.migration_error is not None
-    assert "schema version 2" in model.migration_error
-    assert not (tmp_path / ".lte-data").exists()
 
 
-def test_configure_model_preserves_catalog_legacy_read_only_preview(tmp_path):
-    from lte_scenario_toolkit.gui.pages.configure import (
-        configure_model,
-        profile_with_form_values,
-    )
-
-    catalog, store, source = _task17_legacy_profile_store(tmp_path)
-
-    model = configure_model(catalog, store, "ready-city")
-
-    assert model.is_persisted is True
-    assert model.is_legacy_preview is True
-    assert model.profile.is_legacy_preview is True
-    assert model.profile.source_path == source.resolve()
-    assert model.profile.rect_size == 2400
-    assert model.profile.target_count == 24
-    assert model.profile.tolerance == 2
-    assert model.profile.scan_step == 30
-    assert model.profile.min_spacing == 1800
-    assert model.migration_error is not None
-    assert model.management_error is None
-    assert model.can_start is False
-    with pytest.raises(ValueError, match="read-only.*Save|Save.*read-only"):
-        profile_with_form_values(model.profile, {"rect_size": 2500})
 
 
-def test_unrelated_legacy_discovery_error_does_not_block_profileless_draft(tmp_path):
-    from lte_scenario_toolkit.gui.pages.configure import configure_model
-
-    class LegacyStore:
-        def discover(self, scenario_id):
-            raise ValueError("Missing required configuration value: schema_version")
-
-    model = configure_model(
-        _Task13Catalog(tmp_path),
-        LegacyStore(),
-        "without-default",
-    )
-
-    assert model.is_persisted is False
-    assert model.migration_error is None
-    assert model.management_error is not None
-    assert model.can_start is True
-    assert model.profile.schema_version == 2
 
 
-def test_real_profile_store_degrades_cleanly_with_unrelated_legacy_yaml(tmp_path):
-    from lte_scenario_toolkit.gui.pages.configure import configure_model
-    from lte_scenario_toolkit.profiles import ProfileStore
-
-    legacy = tmp_path / "configs/legacy.yaml"
-    legacy.parent.mkdir()
-    legacy.write_text("experiment:\n  name: legacy\n", encoding="utf-8")
-    store = ProfileStore(tmp_path, tmp_path / "data/datasets.yaml")
-    catalog = _Task13Catalog(tmp_path)
-
-    draft = configure_model(catalog, store, "without-default")
-    blocked_selection = configure_model(
-        catalog,
-        store,
-        "without-default",
-        selected_profile_id="default",
-    )
-
-    assert draft.management_error is not None
-    assert draft.migration_error is None
-    assert draft.can_start is True
-    assert blocked_selection.migration_error is None
-    assert blocked_selection.selection_error is not None
-    assert blocked_selection.can_start is False
 
 
-async def test_legacy_blocked_profile_management_keeps_only_draft_run_available(
-    user, tmp_path
-):
-    from lte_scenario_toolkit.gui.app import create_app
-    from lte_scenario_toolkit.profiles import ProfileStore
-
-    legacy = tmp_path / "configs/legacy.yaml"
-    legacy.parent.mkdir()
-    legacy.write_text("experiment:\n  name: legacy\n", encoding="utf-8")
-    store = ProfileStore(tmp_path, tmp_path / "data/datasets.yaml")
-    create_app(
-        catalog=_Task13Catalog(tmp_path),
-        profile_store=store,
-        testing=True,
-    )
-
-    await user.open("/configure/without-default")
-    await user.should_see("Profile management temporarily unavailable")
-    assert all(not element.enabled for element in user.find(marker="profile-save").elements)
-    assert all(element.enabled for element in user.find(marker="profile-start-scan").elements)
-
-    await user.open("/configure/without-default?profile=default")
-    await user.should_see("Saved profile temporarily unavailable")
-    assert all(
-        not element.enabled
-        for element in user.find(marker="profile-start-scan").elements
-    )
-    await user.should_not_see("lte-select-sites --config 'None'")
 
 
 def test_form_integer_fields_reject_fractional_values_without_truncating(tmp_path):
@@ -1603,78 +1466,8 @@ async def test_scenario_routes_share_content_and_disable_nonready_actions(
     await user.should_see("Choose a scenario")
 
 
-async def test_configure_route_shows_legacy_migration_placeholder(user, tmp_path):
-    from lte_scenario_toolkit.gui.app import create_app
-
-    class LegacyStore:
-        def discover(self, scenario_id):
-            raise ValueError("Missing required configuration value: schema_version")
-
-    create_app(
-        catalog=_Task13Catalog(tmp_path),
-        profile_store=LegacyStore(),
-        testing=True,
-    )
-
-    await user.open("/configure/ready-city")
-    await user.should_see("Profile migration required")
-    await user.should_see("schema version 2")
-    await user.should_see("Start Scan")
-    assert all(
-        not element.enabled
-        for element in user.find(marker="profile-start-scan").elements
-    )
-    for marker in (
-        "profile-copy",
-        "profile-rename",
-        "profile-set-default",
-        "profile-delete",
-        "profile-save",
-    ):
-        assert all(not element.enabled for element in user.find(marker=marker).elements)
 
 
-async def test_real_legacy_profile_renders_read_only_migration_preview(user, tmp_path):
-    from lte_scenario_toolkit.gui.app import create_app
-
-    catalog, store, _ = _task17_legacy_profile_store(tmp_path)
-    create_app(catalog=catalog, profile_store=store, testing=True)
-
-    await user.open("/configure/ready-city")
-
-    await user.should_see("Read-only migration preview")
-    await user.should_see("schema version 2")
-    for marker in (
-        "profile-id",
-        "profile-display-name",
-        "profile-target-crs",
-        "profile-rect-size",
-        "profile-target-count",
-        "profile-scan-step",
-        "profile-max-rects",
-        "profile-tolerance",
-        "profile-strategy",
-        "profile-random-seed",
-        "profile-min-spacing",
-        "profile-scan-mode",
-        "profile-output-root",
-        "profile-browse",
-        "profile-copy",
-        "profile-rename",
-        "profile-set-default",
-        "profile-delete",
-        "profile-start-scan",
-    ):
-        elements = user.find(marker=marker).elements
-        assert elements, marker
-        assert all(not element.enabled for element in elements), marker
-    for marker in ("profile-select", "profile-discard", "profile-save"):
-        elements = user.find(marker=marker).elements
-        assert elements, marker
-        assert all(element.enabled for element in elements), marker
-
-    user.find(marker="profile-save").click()
-    await user.should_see("Convert legacy profile")
 
 
 async def test_configure_route_renders_complete_form_and_blocks_nonready_direct_url(
@@ -1975,25 +1768,6 @@ async def test_profile_rename_navigates_to_new_profile_id(user, tmp_path):
     assert profiles[0].profile_id == "renamed"
 
 
-async def test_legacy_cli_guidance_quotes_unsafe_powershell_path(user, tmp_path):
-    from lte_scenario_toolkit.gui.app import create_app
-
-    class LegacyStore:
-        def discover(self, scenario_id):
-            raise ValueError("Missing required configuration value: schema_version")
-
-    catalog = _Task13Catalog(tmp_path)
-    catalog.scenarios_by_id["ready-city"] = {
-        **catalog.scenarios_by_id["ready-city"],
-        "config_path": "configs/legacy; profile.yaml",
-    }
-    create_app(catalog=catalog, profile_store=LegacyStore(), testing=True)
-
-    await user.open("/configure/ready-city")
-
-    await user.should_see(
-        "lte-select-sites --config 'configs/legacy; profile.yaml'"
-    )
 
 
 async def test_fractional_gui_integer_does_not_call_profile_store(user, tmp_path):
@@ -3577,157 +3351,12 @@ def test_history_model_includes_partial_and_parent_runs(tmp_path):
     )
 
 
-def test_legacy_history_action_opens_unique_csv_and_preserves_explicit_rectangle_choice(
-    tmp_path,
-):
-    from lte_scenario_toolkit.gui.pages.figures import load_figure_source
-    from lte_scenario_toolkit.gui.pages.history import (
-        HistoryAction,
-        history_rows,
-        resolve_history_action,
-    )
-    from lte_scenario_toolkit.run_service import RunService
-
-    fixture_root = ROOT / "tests" / "fixtures" / "legacy"
-    legacy_dir = tmp_path / "results" / "legacy-selection"
-    legacy_dir.mkdir(parents=True)
-    protected = {}
-    for name in ("run-select-sites.json", "scenario.csv"):
-        destination = legacy_dir / name
-        destination.write_bytes((fixture_root / name).read_bytes())
-        protected[destination] = destination.read_bytes()
-
-    rows = history_rows(RunService(tmp_path / "results"))
-
-    assert len(rows) == 1
-    row = rows[0]
-    csv_path = (legacy_dir / "scenario.csv").resolve()
-    assert row.can_open_figures is True
-    assert row.figure_source_path == csv_path
-    action = resolve_history_action(row, HistoryAction.OPEN_FIGURES)
-    assert action.path == csv_path
-    choice = load_figure_source(action.path)
-    assert choice.rectangle_ids == (1, 2)
-    assert choice.requires_rectangle is True
-    assert choice.source is None
-    assert load_figure_source(action.path, rect_id=2).source.rectangle["rect_id"] == 2
-    assert {path: path.read_bytes() for path in protected} == protected
 
 
-def test_identical_legacy_record_copies_have_distinct_stable_actionable_ids(tmp_path):
-    from lte_scenario_toolkit.gui.pages.history import (
-        HistoryAction,
-        history_rows,
-        resolve_history_action,
-    )
-    from lte_scenario_toolkit.run_service import RunService
-
-    fixture_root = ROOT / "tests" / "fixtures" / "legacy"
-    root = tmp_path / "results"
-    expected_paths = set()
-    for directory_name in ("archive-a", "archive-b"):
-        directory = root / directory_name
-        directory.mkdir(parents=True)
-        for name in ("run-select-sites.json", "scenario.csv"):
-            (directory / name).write_bytes((fixture_root / name).read_bytes())
-        expected_paths.add((directory / "scenario.csv").resolve())
-    service = RunService(root)
-
-    first = history_rows(service)
-    second = history_rows(service)
-
-    assert len(first) == 2
-    assert len({row.run_id for row in first}) == 2
-    assert [row.run_id for row in first] == [row.run_id for row in second]
-    assert {
-        resolve_history_action(row, HistoryAction.OPEN_FIGURES).path for row in first
-    } == expected_paths
 
 
-def test_legacy_figure_record_opens_csv_without_requiring_retry_style(tmp_path):
-    from lte_scenario_toolkit.gui.pages.history import (
-        HistoryAction,
-        history_rows,
-        resolve_history_action,
-    )
-    from lte_scenario_toolkit.run_service import RunService
-
-    fixture_root = ROOT / "tests" / "fixtures" / "legacy"
-    legacy_dir = tmp_path / "results" / "legacy-figure"
-    legacy_dir.mkdir(parents=True)
-    for name in ("run-generate-figures.json", "scenario.csv"):
-        (legacy_dir / name).write_bytes((fixture_root / name).read_bytes())
-    (legacy_dir / "terrain.png").write_bytes(b"legacy terrain fixture\n")
-    row = history_rows(RunService(tmp_path / "results"))[0]
-
-    action = resolve_history_action(row, HistoryAction.OPEN_FIGURES)
-
-    assert action.path == (legacy_dir / "scenario.csv").resolve()
-    assert action.figure_spec is None
 
 
-def test_exact_modern_figure_history_uses_authoritative_run_snapshot(tmp_path):
-    from lte_scenario_toolkit.figure_service import FigureService, FigureSpec
-    from lte_scenario_toolkit.gui.pages.history import (
-        HistoryAction,
-        HistoryActionError,
-        history_rows,
-        resolve_history_action,
-    )
-    from lte_scenario_toolkit.run_service import RunService
-
-    exact = tmp_path / "exact"
-    service = RunService(exact)
-    run = service.begin("city", "profile", created_at="2026-07-16T10:00:00Z")
-    (run.path / "source.csv").write_text(
-        "rect_id,pt_count,left_x,bottom_y,center_x,center_y,X,Y\n"
-        "1,1,0,0,1,1,0.5,0.5\n",
-        encoding="utf-8",
-    )
-    (run.path / "terrain.png").write_bytes(b"png")
-    figure_spec = FigureSpec.from_preset("publication")
-    final = service.publish(
-        run,
-        status="completed",
-        artifacts=["source.csv", "terrain.png"],
-        metadata={
-            "run_kind": "figure",
-            "source": {
-                "kind": "csv",
-                "artifact": "source.csv",
-                "path": "archived/source.csv",
-            },
-            "inputs": {"csv": {"path": "archived/source.csv"}},
-            "target_crs": "EPSG:32616",
-            "rectangle_size_m": 2,
-            "rect_id": 1,
-            "figure_spec": figure_spec.as_dict(),
-        },
-    )
-    service.relocate_to_exact_directory(
-        final,
-        exact,
-        compatibility_record="run-generate-figures.json",
-    )
-
-    row = history_rows(service)[0]
-    action = resolve_history_action(row, HistoryAction.OPEN_FIGURES)
-    loaded = FigureService.load_source(action.path)
-
-    assert row.figure_source_path == exact.resolve()
-    assert action.path == exact.resolve()
-    assert action.figure_spec == figure_spec
-    assert loaded.source_kind == "run"
-    assert loaded.target_crs == "EPSG:32616"
-    assert loaded.run_id == run.run_id
-    assert not any("EPSG:3857" in warning for warning in loaded.warnings)
-
-    manifest_path = exact / "run.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["run_id"] = "b" * 32
-    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
-    with pytest.raises(HistoryActionError, match="no longer"):
-        resolve_history_action(row, HistoryAction.OPEN_FIGURES)
 
 
 def test_history_roots_reject_lexical_traversal(tmp_path):
@@ -3773,20 +3402,6 @@ def test_history_roots_reject_junction_or_reparse_root(tmp_path, monkeypatch):
         history_roots(tmp_path, (redirected,))
 
 
-def test_history_rebuild_deduplicates_same_legacy_record_across_nested_roots(tmp_path):
-    from lte_scenario_toolkit.gui.pages.history import rebuild_history
-
-    fixture_root = ROOT / "tests" / "fixtures" / "legacy"
-    results_root = tmp_path / "results"
-    legacy_dir = results_root / "legacy-city"
-    legacy_dir.mkdir(parents=True)
-    for name in ("run-select-sites.json", "scenario.csv"):
-        (legacy_dir / name).write_bytes((fixture_root / name).read_bytes())
-
-    snapshot = rebuild_history(tmp_path, (results_root, legacy_dir))
-
-    assert len(snapshot.rows) == 1
-    assert snapshot.rows[0].path == legacy_dir.resolve()
 
 
 def test_history_rows_sort_fractional_seconds_newest_first(tmp_path):
@@ -3874,54 +3489,17 @@ def test_figure_form_does_not_render_until_refresh():
     assert bounded.max_pixels == 600
 
 
-def test_legacy_figure_source_lists_rectangles_before_required_choice(tmp_path):
-    import pandas as pd
-
-    from lte_scenario_toolkit.gui.pages.figures import load_figure_source
-
-    rows = [
-        {
-            "rect_id": rect_id,
-            "pt_count": 1,
-            "left_x": float(rect_id * 10),
-            "bottom_y": 0.0,
-            "center_x": float(rect_id * 10 + 5),
-            "center_y": 5.0,
-            "X": float(rect_id * 10 + 1),
-            "Y": 1.0,
-        }
-        for rect_id in (1, 7)
-    ]
-    csv_path = tmp_path / "legacy.csv"
-    pd.DataFrame(rows).to_csv(csv_path, index=False)
-
-    choice = load_figure_source(csv_path)
-
-    assert choice.rectangle_ids == (1, 7)
-    assert choice.source is None
-    assert choice.requires_rectangle is True
-    selected = load_figure_source(csv_path, rect_id=7)
-    assert selected.source.rectangle["rect_id"] == 7
-    assert selected.source.dem_path is None
-    assert any("EPSG:3857" in warning for warning in selected.warnings)
 
 
 def test_preview_cache_is_explicit_and_style_changes_only_mark_stale(tmp_path):
     from dataclasses import replace
 
-    from lte_scenario_toolkit.figure_service import FigureService
     from lte_scenario_toolkit.gui.pages.figures import (
         FigurePageState,
         preview_cache_path,
     )
 
-    source_path = tmp_path / "single.csv"
-    source_path.write_text(
-        "rect_id,pt_count,left_x,bottom_y,center_x,center_y,X,Y\n"
-        "1,1,0,0,5,5,1,1\n",
-        encoding="utf-8",
-    )
-    source = FigureService.load_source(source_path)
+    source = _task15_figure_source(tmp_path)
     expected = preview_cache_path(tmp_path, source, FigurePageState.for_source(source).spec)
     assert expected.parent == tmp_path / ".lte-data/cache/previews"
     assert not expected.exists()
@@ -3938,19 +3516,75 @@ def test_preview_cache_is_explicit_and_style_changes_only_mark_stale(tmp_path):
 
 
 def _task15_figure_source(tmp_path):
-    from dataclasses import replace
+    import geopandas as gpd
+    import pandas as pd
 
-    from lte_scenario_toolkit.figure_service import FigureService
-
-    csv_path = tmp_path / "controller.csv"
-    csv_path.write_text(
-        "rect_id,pt_count,left_x,bottom_y,center_x,center_y,X,Y\n"
-        "1,1,0,0,5,5,1,1\n",
-        encoding="utf-8",
+    from lte_scenario_toolkit.figure_service import (
+        FigureSource,
+        SelectionFigureIdentity,
+    )
+    row = {
+        "rect_id": 1,
+        "pt_count": 1,
+        "left_x": 0.0,
+        "bottom_y": 0.0,
+        "center_x": 5.0,
+        "center_y": 5.0,
+        "X": 1.0,
+        "Y": 1.0,
+        "elevation": 10.0,
+    }
+    frame = pd.DataFrame([row])
+    points = gpd.GeoDataFrame(
+        frame.copy(),
+        geometry=gpd.points_from_xy(frame["X"], frame["Y"]),
+        crs="EPSG:3857",
     )
     dem_path = tmp_path / "controller-dem.tif"
     dem_path.write_bytes(b"dem identity")
-    return replace(FigureService.load_source(csv_path), dem_path=dem_path)
+    return FigureSource(
+        path=None,
+        csv_path=None,
+        csv_identity=None,
+        frame=frame,
+        rectangle={
+            key: row[key]
+            for key in (
+                "rect_id",
+                "pt_count",
+                "left_x",
+                "bottom_y",
+                "center_x",
+                "center_y",
+            )
+        },
+        points=points,
+        target_crs="EPSG:3857",
+        rectangle_size_m=10.0,
+        source_kind="selection",
+        dem_path=dem_path,
+        dem_fingerprint="controller-dem",
+        scenario_id="city",
+        profile_id="default",
+        selection_identity=SelectionFigureIdentity(
+            scenario_id="city",
+            profile_id="default",
+            profile_fingerprint="profile",
+            points_fingerprint="points",
+            boundary_fingerprint="boundary",
+            dem_fingerprint="controller-dem",
+            scan_algorithm_version="row-sweep-v1",
+            scan_checked_positions=1,
+            scan_total_positions=1,
+            candidate_index=1,
+            candidate_flat_grid_id=0,
+            candidate_point_count=1,
+            candidate_left_x=0.0,
+            candidate_bottom_y=0.0,
+            candidate_center_x=5.0,
+            candidate_center_y=5.0,
+        ),
+    )
 
 
 def test_figure_controller_busy_submission_does_not_leave_running_phase(tmp_path):
@@ -4044,48 +3678,6 @@ def test_figure_target_does_not_infer_cross_root_parent_and_revalidates_explicit
         coordinator.shutdown()
 
 
-def test_legacy_shared_directory_parent_is_revalidated_by_run_id(tmp_path):
-    from lte_scenario_toolkit.figure_service import FigureService
-    from lte_scenario_toolkit.gui.pages.figures import FigureController
-    from lte_scenario_toolkit.jobs import JobCoordinator
-    from lte_scenario_toolkit.run_service import RunService
-
-    fixture_root = ROOT / "tests" / "fixtures" / "legacy"
-    output_root = tmp_path / "results"
-    legacy_dir = output_root / "legacy-shared"
-    legacy_dir.mkdir(parents=True)
-    for name in (
-        "run-select-sites.json",
-        "run-generate-figures.json",
-        "scenario.csv",
-    ):
-        (legacy_dir / name).write_bytes((fixture_root / name).read_bytes())
-    (legacy_dir / "terrain.png").write_bytes(b"legacy terrain fixture\n")
-    service = RunService(output_root)
-    entries = service.discover_entries().entries
-    selection = next(
-        entry for entry in entries if entry.record["metadata"]["run_kind"] == "selection"
-    )
-
-    with pytest.raises(ValueError, match="ambiguous"):
-        service.entry_for_path(legacy_dir)
-    assert service.entry_for_path(legacy_dir, run_id=selection.run_id) == selection
-
-    source = FigureService.load_source(legacy_dir / "scenario.csv", rect_id=1)
-    coordinator = JobCoordinator()
-    controller = FigureController(
-        tmp_path,
-        coordinator,
-        source=source,
-        output_root=output_root,
-        parent_run_id=selection.run_id,
-        parent_run_path=legacy_dir,
-    )
-    try:
-        assert controller._target(source) == (output_root.resolve(), selection.run_id)
-    finally:
-        controller.close()
-        coordinator.shutdown()
 
 
 def test_stale_preview_job_cannot_replace_changed_style(tmp_path, monkeypatch):

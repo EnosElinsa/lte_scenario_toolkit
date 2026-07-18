@@ -60,7 +60,6 @@ def _write_catalog(tmp_path: Path, *, dem_dataset_id: str | None = "dem") -> Pat
     ).to_file(boundary_path)
 
     document = {
-        "schema_version": 2,
         "datasets": [
             {
                 "dataset_id": "boundary",

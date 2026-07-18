@@ -27,7 +27,6 @@ def build_output_dataframe(
     bottom_y,
     center_x,
     center_y,
-    rect_size,
     run_id: str | None = None,
     scenario_id: str | None = None,
     profile_id: str | None = None,
@@ -36,7 +35,6 @@ def build_output_dataframe(
 ) -> pd.DataFrame:
     """Build the stable CSV schema used by downstream figure generation."""
 
-    del rect_size  # retained in the public signature for compatibility
     frame = pd.DataFrame(index=range(len(selected)))
     for column in ("cell", "Cell", "CELL"):
         if column in selected.columns:
@@ -169,7 +167,7 @@ def create_data_manifest(
     repo_root: str | Path | None = None,
     dataset_ids: Iterable[str] | None = None,
 ) -> Path:
-    """Validate a schema-v2 catalog and update its checksummed JSON manifest."""
+    """Validate the catalog and update its checksummed JSON manifest."""
 
     from .data_catalog import load_data_catalog, update_data_manifest
 

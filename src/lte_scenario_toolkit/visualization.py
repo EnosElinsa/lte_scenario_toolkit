@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-import geopandas as gpd
 import numpy as np
 
 
@@ -97,75 +95,6 @@ def save_preview(points_gdf, boundary, selected_rectangles, config) -> Path:
     finally:
         figure.clear()
     return output
-
-
-def interactive_select(points_gdf, boundary, results, config):
-    """Display the legacy single-selection GUI and return zero or one result."""
-
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Rectangle
-
-    if not results:
-        return []
-    rectangle_size = float(config["rect_size"])
-    selected_index = [None]
-    patches = []
-    figure, axis = plt.subplots(figsize=(14, 11))
-    gpd.GeoSeries([boundary], crs=points_gdf.crs).plot(
-        ax=axis, facecolor="none", edgecolor="black", linewidth=1.5
-    )
-    points_gdf.plot(ax=axis, color="gray", markersize=0.5, alpha=0.3)
-    for result in results:
-        patch = Rectangle(
-            (result["left_x"], result["bottom_y"]),
-            rectangle_size,
-            rectangle_size,
-            facecolor="red",
-            edgecolor="red",
-            alpha=0.3,
-            linewidth=1.5,
-        )
-        axis.add_patch(patch)
-        patches.append(patch)
-    axis.set_aspect("equal")
-    axis.autoscale_view()
-
-    def on_click(event):
-        toolbar = figure.canvas.manager.toolbar
-        if toolbar is not None and toolbar.mode != "":
-            return
-        if event.inaxes != axis or event.xdata is None or event.ydata is None:
-            return
-        for index in reversed(range(len(results))):
-            result = results[index]
-            inside = (
-                result["left_x"] <= event.xdata <= result["left_x"] + rectangle_size
-                and result["bottom_y"]
-                <= event.ydata
-                <= result["bottom_y"] + rectangle_size
-            )
-            if not inside:
-                continue
-            previous = selected_index[0]
-            if previous is not None:
-                patches[previous].set_facecolor("red")
-                patches[previous].set_edgecolor("red")
-                patches[previous].set_alpha(0.3)
-            if previous == index:
-                selected_index[0] = None
-            else:
-                patches[index].set_facecolor("green")
-                patches[index].set_edgecolor("green")
-                patches[index].set_alpha(0.45)
-                selected_index[0] = index
-            figure.canvas.draw_idle()
-            return
-
-    figure.canvas.mpl_connect("button_press_event", on_click)
-    figure.tight_layout()
-    plt.show()
-    plt.close(figure)
-    return [] if selected_index[0] is None else [results[selected_index[0]]]
 
 
 def prepare_terrain_arrays(
@@ -274,63 +203,6 @@ def prepare_terrain_arrays(
     }
 
 
-def _terrain_arrays(rectangle, selected_points, dem, rectangle_size, target_crs):
-    """Compatibility alias for callers that used the former private helper."""
-
-    return prepare_terrain_arrays(
-        rectangle,
-        selected_points,
-        dem,
-        rectangle_size,
-        target_crs,
-        max_pixels=1800,
-    )
-
-
-def _legacy_render_request(config, *, publication_style):
-    from .figure_service import FigureSpec
-
-    preset = "publication" if publication_style else "preview"
-    spec = FigureSpec.from_preset(preset)
-    updates = {
-        "colormap": config.get("colormap", spec.colormap),
-        "dpi": config.get("dpi", spec.dpi),
-        "azimuth": config.get("azimuth", config.get("azimuth_deg", spec.azimuth)),
-        "elevation_angle": config.get(
-            "elevation_angle",
-            config.get("elevation_deg", spec.elevation_angle),
-        ),
-        "vertical_exaggeration": config.get(
-            "vertical_exaggeration",
-            spec.vertical_exaggeration,
-        ),
-        "station_color": config.get("station_color", spec.station_color),
-        "station_size": config.get(
-            "station_size",
-            config.get("station_marker_size", spec.station_size),
-        ),
-        "title": config.get("title", spec.title),
-    }
-    spec = replace(spec, **updates).validate()
-    png_path = None
-    eps_path = None
-    html_path = None
-    if config.get("save_terrain_png", True):
-        png_path = Path(config["output_3d_png"])
-        if config.get("save_terrain_eps", False):
-            eps_path = png_path.with_suffix(".eps")
-    if config.get("save_terrain_html", True):
-        html_path = Path(config["output_3d_html"])
-    return (
-        spec,
-        float(config["rect_size"]),
-        str(config.get("target_crs", "EPSG:3857")),
-        png_path,
-        eps_path,
-        html_path,
-    )
-
-
 def render_3d_terrain(
     rectangle: dict[str, Any],
     selected_points,
@@ -343,29 +215,14 @@ def render_3d_terrain(
     eps_path: str | Path | None = None,
     html_path: str | Path | None = None,
     terrain_arrays: Mapping[str, np.ndarray] | None = None,
-    publication_style: bool = False,
 ) -> list[Path]:
-    """Render requested outputs from validated style and explicit paths.
+    """Render requested outputs from a validated style and explicit paths."""
 
-    A mapping in the fourth positional argument is accepted as a compatibility
-    adapter for the pre-service selection exporter.
-    """
+    from .figure_service import FigureSpec
 
-    if isinstance(spec, Mapping):
-        (
-            spec,
-            rectangle_size,
-            target_crs,
-            png_path,
-            eps_path,
-            html_path,
-        ) = _legacy_render_request(spec, publication_style=publication_style)
-    else:
-        from .figure_service import FigureSpec
-
-        if not isinstance(spec, FigureSpec):
-            raise ValueError("spec must be a FigureSpec")
-        spec.validate()
+    if not isinstance(spec, FigureSpec):
+        raise ValueError("spec must be a FigureSpec")
+    spec.validate()
     if rectangle_size is None or not math.isfinite(float(rectangle_size)):
         raise ValueError("rectangle_size must be a finite positive number")
     rectangle_size = float(rectangle_size)

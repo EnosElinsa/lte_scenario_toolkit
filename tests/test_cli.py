@@ -26,19 +26,21 @@ def test_select_sites_exposes_reproducible_configuration_arguments():
 
     assert "--config" in help_text
     assert "--city" in help_text
-    assert "--output-dir" in help_text
     assert "--output-root" in help_text
-    assert "--selector" in help_text
     assert "--select-index" in help_text
+    assert "--output-dir" not in help_text
+    assert "--selector" not in help_text
     assert not (ROOT / "select_sites.py").exists()
 
 
 def test_figure_generator_exposes_reproducible_configuration_arguments():
     help_text = command_help("scripts/generate_scenario_figures.py")
 
-    assert "--config" in help_text
-    assert "--city" in help_text
-    assert "--output-dir" in help_text
+    assert "--run-dir" in help_text
+    assert "--output-root" in help_text
+    assert "--format" in help_text
+    assert "--config" not in help_text
+    assert "--output-dir" not in help_text
     assert not (ROOT / "generate_scenario_figures.py").exists()
 
 
@@ -81,7 +83,7 @@ def test_select_sites_thin_script_forwards_help():
 
 
 def test_generate_figures_thin_script_forwards_help():
-    assert "--config" in command_help("scripts/generate_scenario_figures.py")
+    assert "--run-dir" in command_help("scripts/generate_scenario_figures.py")
 
 
 def test_city_specific_dem_exporters_are_removed():
@@ -97,7 +99,6 @@ def _write_cli_catalog(tmp_path: Path) -> Path:
         boundary.write_bytes(b"boundary")
 
     document = {
-        "schema_version": 2,
         "datasets": [
             {
                 "dataset_id": "boundary_zulu",

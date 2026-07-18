@@ -11,21 +11,21 @@ ROOT = Path(__file__).resolve().parents[1]
 def write_config(path: Path, *, strategy: str = "uniform") -> None:
     path.write_text(
         f"""
-experiment:
-  name: fixture_run
-  random_seed: 7
+profile:
+  id: fixture
+  display_name: Fixture
+  scenario_id: test-city
 inputs:
-  points_root: points
-  points_layer: stations
-  boundary_root: boundaries
-  city: TestCity
-  dem_path: dem/test.tif
+  points_dataset_id: points
+experiment:
+  random_seed: 7
 spatial:
   target_crs: EPSG:3857
   rectangle_size_m: 1000
   target_base_station_count: 3
   count_tolerance: 1
 scan:
+  mode: fast
   strategy: {strategy}
   step_m: 50
   max_rectangles: 4
@@ -36,31 +36,31 @@ outputs:
   save_preview_png: false
   save_terrain_png: true
   save_terrain_eps: false
+figures:
+  preset: publication
 """.strip(),
         encoding="utf-8",
     )
 
 
-def test_load_experiment_config_maps_yaml_and_cli_overrides(tmp_path):
+def test_load_experiment_config_maps_current_profile_and_output_override(tmp_path):
     config_path = tmp_path / "experiment.yaml"
     write_config(config_path)
 
     config = load_experiment_config(
         config_path,
         repo_root=tmp_path,
-        city="OverrideCity",
         output_dir=tmp_path / "custom-output",
     )
 
-    assert config["experiment_name"] == "fixture_run"
+    assert config["profile_id"] == "fixture"
+    assert config["scenario_id"] == "test-city"
     assert config["random_seed"] == 7
-    assert config["city_name"] == "OverrideCity"
     assert config["rect_size"] == 1000
     assert config["target_count"] == 3
     assert config["strategy"] == "uniform"
-    assert config["points_root"] == tmp_path / "points"
     assert config["output_root"] == tmp_path / "custom-output"
-    assert config["output_dir_is_final"] is True
+    assert config.profile_snapshot.profile_id == "fixture"
 
 
 def test_load_experiment_config_rejects_unknown_scan_strategy(tmp_path):
@@ -71,30 +71,24 @@ def test_load_experiment_config_rejects_unknown_scan_strategy(tmp_path):
         load_experiment_config(config_path, repo_root=tmp_path)
 
 
-@pytest.mark.parametrize("bad_version", [3, "2", True, 2.0])
-def test_load_experiment_config_rejects_explicit_invalid_schema_versions(
-    tmp_path,
-    bad_version,
-):
+def test_load_experiment_config_rejects_removed_schema_discriminator(tmp_path):
     config_path = tmp_path / "experiment.yaml"
     write_config(config_path)
     document = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    document["schema_version"] = bad_version
+    document["schema_version"] = 2
     config_path.write_text(yaml.safe_dump(document), encoding="utf-8")
 
-    with pytest.raises(
-        ValueError,
-        match=r"^schema_version must be the integer 2$",
-    ):
+    with pytest.raises(ValueError, match="unexpected.*schema_version"):
         load_experiment_config(config_path, repo_root=tmp_path)
 
 
-def test_repository_config_resolves_inputs_from_repository_root():
+def test_repository_config_resolves_from_repository_root():
     config = load_experiment_config(ROOT / "configs" / "example.yaml")
 
     assert config["repo_root"] == ROOT
-    assert config["points_root"] == ROOT / "points_shp"
-    assert config["boundary_root"] == ROOT / "boundary_shp"
+    assert config["profile_id"] == "chicago-default"
+    assert config["scenario_id"] == "chicago"
+    assert config["output_root"] == ROOT / "results"
 
 
 def test_config_in_configs_directory_infers_external_project_root(tmp_path):
@@ -107,46 +101,4 @@ def test_config_in_configs_directory_infers_external_project_root(tmp_path):
     config = load_experiment_config(config_path)
 
     assert config["repo_root"] == project
-    assert config["points_root"] == project / "points"
-
-
-def test_public_loader_supports_schema_version_2_profiles(tmp_path):
-    profile_path = tmp_path / "profile.yaml"
-    profile_path.write_text(
-        """
-schema_version: 2
-profile:
-  id: chicago-default
-  display_name: Chicago default
-  scenario_id: chicago
-inputs:
-  points_dataset_id: points
-experiment:
-  random_seed: 7
-spatial:
-  target_crs: EPSG:3857
-  rectangle_size_m: 2000
-  target_base_station_count: 20
-  count_tolerance: 1
-scan:
-  mode: complete
-  strategy: uniform
-  step_m: 25
-  max_rectangles: 40
-  minimum_center_spacing_m: 1500
-outputs:
-  root: results
-  save_csv: true
-figures:
-  preset: publication
-  dpi: 300
-""".strip(),
-        encoding="utf-8",
-    )
-
-    config = load_experiment_config(profile_path, repo_root=tmp_path)
-
-    assert config["profile_id"] == "chicago-default"
-    assert config["scenario_id"] == "chicago"
-    assert config["rect_size"] == 2000
-    assert config["scan_mode"] == "complete"
+    assert config["output_root"] == project / "results" / "fixture"

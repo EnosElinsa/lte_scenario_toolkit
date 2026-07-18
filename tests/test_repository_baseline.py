@@ -158,8 +158,8 @@ def test_generated_package_metadata_is_not_a_public_source_surface():
     assert _is_public_text_file(ROOT / "src" / "lte_scenario_toolkit" / "data_cli.py")
 
 
-def test_public_surfaces_have_no_legacy_city_exporter_or_project_id():
-    legacy_terms = (
+def test_public_surfaces_have_no_removed_city_exporter_or_project_id():
+    removed_terms = (
         "lte-" + "download-newyork-dem",
         "download_newyork_" + "1m_dem.py",
         "newyork_" + "dem.py",
@@ -181,7 +181,7 @@ def test_public_surfaces_have_no_legacy_city_exporter_or_project_id():
     offenders: list[str] = []
     for path in sorted(set(paths)):
         text = path.read_text(encoding="utf-8")
-        if any(term in text for term in legacy_terms) or project_id_pattern.search(text):
+        if any(term in text for term in removed_terms) or project_id_pattern.search(text):
             offenders.append(path.relative_to(ROOT).as_posix())
     assert not offenders, f"stale city-specific or project-secret references: {offenders}"
 
@@ -277,7 +277,7 @@ def test_repository_catalog_registers_every_boundary_and_scenario():
     datasets = {item["dataset_id"]: item for item in metadata["datasets"]}
     scenarios = {item["scenario_id"]: item for item in metadata["scenarios"]}
 
-    assert metadata["schema_version"] == 2
+    assert set(metadata) == {"datasets", "scenarios"}
     assert set(scenarios) == set(SCENARIOS)
     assert "administrative_boundaries" not in datasets
     assert datasets["usa_clear_lte_base_stations"]["role"] == "points"
@@ -349,12 +349,12 @@ def test_registered_boundary_entrypoints_match_declared_geometry():
         assert frame.geometry.is_valid.all(), boundary_id
 
 
-def test_manifest_uses_schema_v2_and_preserves_scenario_links():
+def test_manifest_preserves_current_scenario_links():
     manifest = json.loads((ROOT / "data" / "manifest.json").read_text(encoding="utf-8"))
     datasets = {item["dataset_id"]: item for item in manifest["datasets"]}
     scenarios = {item["scenario_id"]: item for item in manifest["scenarios"]}
 
-    assert manifest["schema_version"] == 2
+    assert set(manifest) == {"generated_at", "datasets", "scenarios"}
     assert set(scenarios) == set(SCENARIOS)
     assert "administrative_boundaries" not in datasets
     assert set(BOUNDARIES) <= set(datasets)

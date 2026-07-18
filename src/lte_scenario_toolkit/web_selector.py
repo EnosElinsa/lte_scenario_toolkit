@@ -135,7 +135,7 @@ def _wait_for_port_release(host: str, port: int) -> bool:
 def _open_default_browser(url: str) -> None:
     guidance = (
         "Could not open the local web selector in a browser. Use --select-index "
-        "for headless selection, or --selector legacy only with a supported display."
+        "for headless selection."
     )
     try:
         opened = webbrowser.open(url, new=2)

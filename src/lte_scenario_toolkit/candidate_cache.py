@@ -20,16 +20,12 @@ from threading import Lock
 from typing import Any
 
 import numpy as np
-import shapely
-from shapely.geometry import box
 
-from .candidate_scanner import Candidate, ScanRequest, ScanResult, grid_axes
+from .candidate_scanner import Candidate, ScanRequest, ScanResult
 from .io import atomic_write_json
-from .scenario import validate_results
 
-CACHE_SCHEMA_VERSION = 1
 _CACHE_KEY_PATTERN = re.compile(r"^[0-9a-f]{64}$")
-_PAYLOAD_FIELDS = frozenset({"schema_version", "key", "request", "result"})
+_PAYLOAD_FIELDS = frozenset({"key", "request", "result"})
 _REQUEST_FIELDS = frozenset(field.name for field in fields(ScanRequest))
 _RESULT_FIELDS = frozenset(
     {
@@ -41,7 +37,6 @@ _RESULT_FIELDS = frozenset(
     }
 )
 _CANDIDATE_FIELDS = frozenset(field.name for field in fields(Candidate))
-_LEGACY_COORDINATE_DECIMALS = 2
 _THREAD_LOCKS_GUARD = Lock()
 _THREAD_LOCKS: dict[Path, Lock] = {}
 
@@ -88,28 +83,6 @@ def _is_redirected_path(path: Path) -> bool:
         return False
     reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     return bool(attributes & reparse_point)
-
-
-def _assert_unredirected_regular_file(path: Path, *, description: str) -> Path:
-    """Reject traversal and every existing redirected component in one file path."""
-
-    candidate = path.expanduser()
-    if not candidate.is_absolute():
-        candidate = Path.cwd() / candidate
-    if ".." in candidate.parts:
-        raise ValueError(f"{description} must not contain path traversal: {path}")
-    current = Path(candidate.anchor)
-    for part in candidate.parts[1:]:
-        current /= part
-        if os.path.lexists(current) and _is_redirected_path(current):
-            raise ValueError(f"{description} must not use redirected paths: {path}")
-    try:
-        resolved = candidate.resolve(strict=True)
-    except (OSError, RuntimeError) as exc:
-        raise ValueError(f"{description} is not a readable regular file: {path}") from exc
-    if resolved != candidate or not resolved.is_file():
-        raise ValueError(f"{description} must be an unredirected regular file: {path}")
-    return resolved
 
 
 def _thread_lock_for(path: Path) -> Lock:
@@ -209,7 +182,6 @@ def cache_key(
     if not isinstance(request, ScanRequest):
         raise ValueError("request must be a ScanRequest")
     payload = {
-        "schema_version": CACHE_SCHEMA_VERSION,
         "request": asdict(request),
         "scenario_id": _required_text(scenario_id, field="scenario_id"),
         "boundary_fingerprint": _required_text(
@@ -229,45 +201,6 @@ def cache_key(
         ensure_ascii=False,
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def _legacy_filename_number(value: Real, *, field: str) -> str:
-    number = float(value)
-    if not math.isfinite(number):
-        raise ValueError(f"{field} must be finite")
-    return str(int(number)) if number.is_integer() else format(number, ".15g")
-
-
-def legacy_cache_filename(scenario_tag: str, request: ScanRequest) -> str:
-    """Return the exact cache basename emitted by the legacy CLI workflow."""
-
-    if (
-        type(scenario_tag) is not str
-        or not scenario_tag.strip()
-        or scenario_tag != scenario_tag.strip()
-        or Path(scenario_tag).name != scenario_tag
-        or "/" in scenario_tag
-        or "\\" in scenario_tag
-    ):
-        raise ValueError("scenario_tag must be one non-empty path-safe filename token")
-    if not isinstance(request, ScanRequest):
-        raise ValueError("request must be a ScanRequest")
-    rectangle_size = _legacy_filename_number(
-        request.rectangle_size,
-        field="request.rectangle_size",
-    )
-    step = _legacy_filename_number(request.step, field="request.step")
-    spacing = _legacy_filename_number(
-        request.minimum_spacing,
-        field="request.minimum_spacing",
-    )
-    return (
-        f"{scenario_tag}_{rectangle_size}m_"
-        f"target{request.target_count}_tol{request.tolerance}_"
-        f"step{step}_sp{spacing}_{request.strategy}_"
-        f"seed{request.random_seed}_cache.json"
-    )
-
 
 def _strict_mapping(
     value: Any,
@@ -644,12 +577,6 @@ class CandidateCache:
                 )
                 payload = json.loads(content.decode("utf-8"))
                 mapping = _strict_mapping(payload, _PAYLOAD_FIELDS, field="cache")
-                schema_version = mapping["schema_version"]
-                if (
-                    type(schema_version) is not int
-                    or schema_version != CACHE_SCHEMA_VERSION
-                ):
-                    raise ValueError("cache.schema_version is invalid")
                 if mapping["key"] != validated_key:
                     raise ValueError("cache.key does not match its path")
                 cached_request = _request_from_payload(mapping["request"])
@@ -678,7 +605,6 @@ class CandidateCache:
         result_payload = _result_payload(result)
         _result_from_payload(result_payload, validated_request)
         payload = {
-            "schema_version": CACHE_SCHEMA_VERSION,
             "key": validated_key,
             "request": request_payload,
             "result": result_payload,
@@ -686,177 +612,3 @@ class CandidateCache:
         with self._key_lock(validated_key):
             path = self.path_for(validated_key)
             return atomic_write_json(path, payload)
-
-    @staticmethod
-    def _legacy_number(value: Any, *, field: str) -> float:
-        return _finite_number(value, field=field)
-
-    @staticmethod
-    def _axis_index(axis: np.ndarray, value: float, *, field: str) -> int:
-        serialized_axis = np.fromiter(
-            (round(float(item), _LEGACY_COORDINATE_DECIMALS) for item in axis),
-            dtype=float,
-            count=len(axis),
-        )
-        matches = np.flatnonzero(
-            np.isclose(serialized_axis, value, rtol=0.0, atol=1e-12),
-        )
-        if len(matches) != 1:
-            raise ValueError(f"{field} does not map unambiguously to the scan grid")
-        return int(matches[0])
-
-    def import_legacy(
-        self,
-        legacy_path: str | Path,
-        key: str,
-        request: ScanRequest,
-        boundary: Any,
-        coordinates: Any,
-        *,
-        scenario_tag: str,
-    ) -> ScanResult:
-        validated_key = _validated_key(key)
-        if not isinstance(request, ScanRequest):
-            raise ValueError("request must be a ScanRequest")
-        if request.mode != "fast":
-            raise ValueError(
-                "Legacy candidate caches lack exhaustive coverage metadata and "
-                "cannot be imported for complete mode"
-            )
-        source = _assert_unredirected_regular_file(
-            Path(legacy_path),
-            description="Legacy candidate cache",
-        )
-        expected_filename = legacy_cache_filename(scenario_tag, request)
-        if source.name != expected_filename:
-            raise ValueError(
-                "Legacy candidate cache filename does not match its effective "
-                f"configuration: expected {expected_filename!r}, got {source.name!r}"
-            )
-        try:
-            document = json.loads(source.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise ValueError(f"Legacy candidate cache is unreadable: {source}") from exc
-        if not isinstance(document, list):
-            raise ValueError("Legacy candidate cache must be a JSON array")
-        if len(document) > request.max_candidates:
-            raise ValueError("Legacy candidate cache exceeds max_candidates")
-
-        points = np.asarray(coordinates)
-        if points.ndim != 2 or points.shape[1] < 2:
-            raise ValueError("coordinates must be an N-by-at-least-2 array")
-        if not np.issubdtype(points.dtype, np.number) or np.issubdtype(
-            points.dtype,
-            np.complexfloating,
-        ):
-            raise ValueError("coordinates must contain real numeric values")
-        if not bool(np.isfinite(points[:, :2]).all()):
-            raise ValueError("coordinates must contain finite real values")
-
-        x_origins, y_origins = grid_axes(
-            boundary,
-            request.rectangle_size,
-            request.step,
-        )
-        candidates: list[Candidate] = []
-        legacy_results: list[dict[str, Any]] = []
-        for index, item in enumerate(document):
-            prefix = f"legacy[{index}]"
-            mapping = _strict_mapping(
-                item,
-                frozenset(
-                    {"left_x", "bottom_y", "center_x", "center_y", "pt_count"}
-                ),
-                field=prefix,
-            )
-            left_x = self._legacy_number(mapping["left_x"], field=f"{prefix}.left_x")
-            bottom_y = self._legacy_number(
-                mapping["bottom_y"],
-                field=f"{prefix}.bottom_y",
-            )
-            center_x = self._legacy_number(
-                mapping["center_x"],
-                field=f"{prefix}.center_x",
-            )
-            center_y = self._legacy_number(
-                mapping["center_y"],
-                field=f"{prefix}.center_y",
-            )
-            point_count = _strict_integer(
-                mapping["pt_count"],
-                field=f"{prefix}.pt_count",
-                minimum=0,
-            )
-            original_x_index = self._axis_index(
-                x_origins,
-                left_x,
-                field=f"{prefix}.left_x",
-            )
-            original_y_index = self._axis_index(
-                y_origins,
-                bottom_y,
-                field=f"{prefix}.bottom_y",
-            )
-            original_left_x = float(x_origins[original_x_index])
-            original_bottom_y = float(y_origins[original_y_index])
-            original_center_x = original_left_x + request.rectangle_size / 2.0
-            original_center_y = original_bottom_y + request.rectangle_size / 2.0
-            if not math.isclose(
-                center_x,
-                round(original_center_x, _LEGACY_COORDINATE_DECIMALS),
-                rel_tol=0.0,
-                abs_tol=1e-12,
-            ) or not math.isclose(
-                center_y,
-                round(original_center_y, _LEGACY_COORDINATE_DECIMALS),
-                rel_tol=0.0,
-                abs_tol=1e-12,
-            ):
-                raise ValueError(f"{prefix} center is inconsistent")
-            geometry = box(
-                original_left_x,
-                original_bottom_y,
-                original_left_x + request.rectangle_size,
-                original_bottom_y + request.rectangle_size,
-            )
-            if not bool(shapely.contains(boundary, geometry)) or bool(
-                shapely.intersects(boundary.boundary, geometry)
-            ):
-                raise ValueError(f"{prefix} rectangle is not strictly inside boundary")
-            flat_grid_id = original_y_index * len(x_origins) + original_x_index
-            candidates.append(
-                Candidate(
-                    flat_grid_id=flat_grid_id,
-                    point_count=point_count,
-                    left_x=original_left_x,
-                    bottom_y=original_bottom_y,
-                    center_x=original_center_x,
-                    center_y=original_center_y,
-                )
-            )
-            legacy_results.append(
-                {
-                    "left_x": original_left_x,
-                    "bottom_y": original_bottom_y,
-                    "pt_count": point_count,
-                }
-            )
-
-        mismatches = validate_results(
-            legacy_results,
-            points,
-            request.rectangle_size,
-        )
-        if mismatches:
-            raise ValueError(f"Legacy candidate point counts are invalid: {mismatches}")
-        total_positions = int(len(x_origins) * len(y_origins))
-        result = ScanResult(
-            candidates=tuple(candidates),
-            checked_positions=total_positions,
-            total_positions=total_positions,
-            completed=True,
-            algorithm_version=request.algorithm_version,
-        )
-        _result_from_payload(_result_payload(result), request)
-        self.store(validated_key, request, result)
-        return result

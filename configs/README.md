@@ -2,18 +2,16 @@
 
 Files in `configs/` describe experiment choices. Dataset ownership remains in
 `data/datasets.yaml`: boundary and DEM paths, provider, license, acquisition
-date, CRS, checksums, and registered entrypoints are not repeated in a
-schema-version-2 profile.
+date, CRS, checksums, and registered entrypoints are not repeated in a profile.
 
-## Schema version 2
-
-The GUI creates profiles below `configs/<scenario-id>/<profile-id>.yaml`. A
+The GUI creates profiles below `configs/<scenario-id>/<profile-id>.yaml`. These
+user-created files are ignored by Git and stay on the local workstation. A
 scenario may have multiple profiles; its catalog `config_path` identifies the
 default. Profile IDs are stable lowercase slugs and display names are free-form
-labels.
+labels. `example.yaml` and `newyork.yaml` are tracked examples of the current
+format.
 
 ```yaml
-schema_version: 2
 profile:
   id: chicago-default
   display_name: Chicago default
@@ -64,30 +62,17 @@ parameters, seed, and scanner version.
 The GUI supports create, copy, rename, Save, default selection, and guarded
 delete. Overwrite and default-changing operations require confirmation. A
 default profile cannot be deleted until another same-scenario profile is
-selected.
-
-## Legacy YAML compatibility
-
-The top-level `example.yaml` and `newyork.yaml` use the original
-`experiment`/`inputs`/`spatial`/`scan`/`outputs` layout. CLI commands continue to
-read them. The GUI presents their effective values as a read-only migration
-preview. An explicit Save first verifies the displayed source revision, then
-writes a canonical schema-version-2 profile and atomically keeps or repoints
-the catalog default. Effective scan and output settings are preserved; no
-legacy file changes before that confirmed Save.
-
-Legacy YAML repeats boundary and DEM paths. Those links are checked against the
-catalog so drift is reported instead of silently selecting different data.
-New profiles should use dataset IDs and let the catalog remain authoritative.
+selected. Documents containing removed or unknown top-level fields are rejected;
+recreate their settings in the GUI or from a tracked example.
 
 ## Commands
 
 ```powershell
 lte-select-sites --config configs/example.yaml
-lte-generate-figures --config configs/example.yaml
+lte-generate-figures --run-dir results/chicago/default/<run-directory>
 lte-gui
 ```
 
-CLI overrides such as `--size`, `--target`, `--output-root`, and figure style
-options apply only to that invocation. They do not modify the profile, catalog,
-manifest, or cached source data.
+Selection overrides such as `--size`, `--target`, and `--output-root`, and
+figure-rendering style options, apply only to that invocation. They do not
+modify the profile, catalog, manifest, or cached source data.

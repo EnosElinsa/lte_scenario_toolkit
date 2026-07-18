@@ -17,7 +17,6 @@ from .config import load_experiment_config
 from .data_catalog import DataCatalog
 from .dem_data import validate_dem_coverage
 from .io import sha256_file
-from .spatial import resolve_io_paths
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 _POLYGON_TYPES = frozenset({"Polygon", "MultiPolygon"})
@@ -483,7 +482,7 @@ def _validate_manifest(
     full_checksum: bool,
     dataset_ids: tuple[str, ...] = (),
 ) -> dict[str, dict[str, Any]]:
-    """Read and validate the schema-v2 manifest, returning indexed records."""
+    """Read and validate the current manifest, returning indexed records."""
 
     path = catalog.root / "data" / "manifest.json"
     if not path.is_file():
@@ -494,12 +493,16 @@ def _validate_manifest(
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         _error(report, "manifest.parse", f"Cannot parse manifest {path}: {exc}")
         return {}
-    if (
-        not isinstance(payload, dict)
-        or type(payload.get("schema_version")) is not int
-        or payload.get("schema_version") != 2
-    ):
-        _error(report, "manifest.schema", "Manifest schema_version must be 2")
+    if not isinstance(payload, dict):
+        _error(report, "manifest.structure", "Manifest must be a JSON object")
+        return {}
+    unexpected = sorted(set(payload) - {"generated_at", "datasets", "scenarios"})
+    if unexpected:
+        _error(
+            report,
+            "manifest.structure",
+            "Manifest has unexpected fields: " + ", ".join(unexpected),
+        )
         return {}
     raw_datasets = payload.get("datasets")
     if not isinstance(raw_datasets, list):
@@ -658,60 +661,25 @@ def _validate_config(
         _error(report, "config.invalid", f"Cannot load linked experiment config: {exc}")
         return
 
-    if "scenario_id" in config or "points_dataset_id" in config:
-        configured_scenario = config.get("scenario_id")
-        if configured_scenario != scenario.get("scenario_id"):
-            _error(
-                report,
-                "config.scenario",
-                "Profile scenario does not match the catalog scenario "
-                f"({configured_scenario!r} != {scenario.get('scenario_id')!r})",
-            )
-        points_dataset_id = config.get("points_dataset_id")
-        try:
-            points = catalog.dataset(points_dataset_id)
-            if points.get("role") != "points":
-                raise ValueError("registered dataset does not have role 'points'")
-        except Exception as exc:
-            _error(
-                report,
-                "config.points",
-                f"Profile points dataset is invalid: {exc}",
-            )
-        return
-
+    configured_scenario = config.get("scenario_id")
+    if configured_scenario != scenario.get("scenario_id"):
+        _error(
+            report,
+            "config.scenario",
+            "Profile scenario does not match the catalog scenario "
+            f"({configured_scenario!r} != {scenario.get('scenario_id')!r})",
+        )
+    points_dataset_id = config.get("points_dataset_id")
     try:
-        paths = resolve_io_paths(config, create_output=False)
+        points = catalog.dataset(points_dataset_id)
+        if points.get("role") != "points":
+            raise ValueError("registered dataset does not have role 'points'")
     except Exception as exc:
-        _error(report, "config.invalid", f"Cannot resolve linked experiment config: {exc}")
-        return
-
-    try:
-        expected_boundary = catalog.resolve(boundary.get("entrypoint", "")).resolve()
-        actual_boundary = Path(paths["boundary_shp"]).resolve()
-        if actual_boundary != expected_boundary:
-            _error(
-                report,
-                "config.boundary",
-                f"Config boundary does not match registry ({actual_boundary} != {expected_boundary})",
-            )
-    except Exception as exc:
-        _error(report, "config.boundary", f"Cannot compare config boundary: {exc}")
-
-    try:
-        actual_dem = Path(paths["dem_path"]).resolve()
-        if dem is None:
-            _error(report, "config.dem", "Config declares a DEM but scenario does not")
-        else:
-            expected_dem = catalog.resolve(dem.get("entrypoint", "")).resolve()
-            if actual_dem != expected_dem:
-                _error(
-                    report,
-                    "config.dem",
-                    f"Config DEM does not match registry ({actual_dem} != {expected_dem})",
-                )
-    except Exception as exc:
-        _error(report, "config.dem", f"Cannot compare config DEM: {exc}")
+        _error(
+            report,
+            "config.points",
+            f"Profile points dataset is invalid: {exc}",
+        )
 
 
 def validate_scenario_data(

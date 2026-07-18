@@ -16,7 +16,7 @@ import yaml
 from .candidate_scanner import ScanRequest, grid_axes, scan_candidates
 from .config import load_experiment_config
 from .data_catalog import load_data_catalog
-from .select_sites import _selection_profile, resolve_selection_io_paths
+from .select_sites import _selection_profile
 from .selection_service import SelectionService
 
 BenchmarkMetrics = dict[str, int | float | str]
@@ -32,17 +32,7 @@ def _load_benchmark_inputs(config_path: str | Path) -> BenchmarkInputs:
         repository / "data" / "datasets.yaml",
         repo_root=repository,
     )
-    if config.get("profile_id") is not None:
-        scenario_id = config["scenario_id"]
-    else:
-        config.update(resolve_selection_io_paths(config, create_output=False))
-        scenario_id = config.get("registered_scenario_id")
-        if type(scenario_id) is not str or not scenario_id:
-            raise ValueError(
-                "Candidate benchmark requires a scenario registered in "
-                "data/datasets.yaml"
-            )
-
+    scenario_id = config["scenario_id"]
     profile = _selection_profile(config, catalog, scenario_id)
     service = SelectionService(catalog)
     preflight = service.preflight(profile, output_root=config["output_root"])
@@ -102,7 +92,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--config",
         type=Path,
         required=True,
-        help="registered experiment YAML or schema-version-2 profile",
+        help="registered experiment profile YAML",
     )
     return parser.parse_args(argv)
 

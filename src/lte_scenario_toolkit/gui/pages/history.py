@@ -18,7 +18,6 @@ from ...figure_service import FigureSpec
 from ...io import atomic_write_json
 from ...run_service import RunEntry, RunService
 
-HISTORY_INDEX_SCHEMA_VERSION = 1
 HISTORY_INDEX_RELATIVE_PATH = Path(".lte-data") / "cache" / "history-index.json"
 
 
@@ -177,49 +176,10 @@ def _mapping_field(metadata: Mapping[str, Any], name: str) -> Mapping[str, Any]:
 
 
 def _figure_source_path(path: Path, record: Mapping[str, Any]) -> Path:
-    """Resolve legacy normalized records to their one local CSV artifact."""
+    """Return the current run directory used as a Figures source."""
 
-    metadata_value = record.get("metadata", {})
-    metadata = metadata_value if isinstance(metadata_value, Mapping) else {}
-    legacy_value = metadata.get("legacy_record")
-    legacy = legacy_value if isinstance(legacy_value, Mapping) else None
-    if legacy is None:
-        return path
-    if legacy.get("source_record") == "run.json":
-        manifest = path / "run.json"
-        if manifest.is_symlink() or not manifest.is_file():
-            raise ValueError("exact modern history run is missing its authoritative run.json")
-        if manifest.resolve(strict=True) != manifest:
-            raise ValueError("exact modern history run.json must not be redirected")
-        document = json.loads(manifest.read_text(encoding="utf-8"))
-        if not isinstance(document, Mapping) or document.get("run_id") != record.get(
-            "run_id"
-        ):
-            raise ValueError("exact modern history run.json identity changed")
-        return path
-    artifacts_value = record.get("artifacts", ())
-    artifacts = (
-        tuple(item for item in artifacts_value if type(item) is str)
-        if isinstance(artifacts_value, (list, tuple))
-        else ()
-    )
-    csv_artifacts = tuple(
-        artifact for artifact in artifacts if Path(artifact).suffix.casefold() == ".csv"
-    )
-    if len(csv_artifacts) != 1:
-        raise ValueError("legacy history run must expose exactly one CSV artifact")
-    relative = Path(csv_artifacts[0])
-    if relative.is_absolute() or ".." in relative.parts:
-        raise ValueError("legacy history CSV artifact path is unsafe")
-    candidate = path / relative
-    if candidate.is_symlink() or not candidate.is_file():
-        raise ValueError("legacy history CSV artifact is not a regular file")
-    resolved = candidate.resolve(strict=True)
-    try:
-        resolved.relative_to(path)
-    except ValueError as exc:
-        raise ValueError("legacy history CSV artifact escapes its run") from exc
-    return resolved
+    del record
+    return path
 
 
 def _requested_and_missing(
@@ -606,7 +566,6 @@ def rebuild_history(
             )
         )
     payload = {
-        "schema_version": HISTORY_INDEX_SCHEMA_VERSION,
         "rebuilt_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "roots": [str(root) for root in roots],
         "rows": [_index_row(row) for row in rows],
@@ -1008,7 +967,6 @@ def render_history_page(
 
 __all__ = [
     "HISTORY_INDEX_RELATIVE_PATH",
-    "HISTORY_INDEX_SCHEMA_VERSION",
     "HistoryAction",
     "HistoryActionError",
     "HistoryDiagnostic",

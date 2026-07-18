@@ -1,4 +1,4 @@
-"""Versioned experiment-profile models and loaders."""
+"""Experiment-profile models and loaders."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ import tempfile
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
-from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -30,8 +29,6 @@ WINDOWS_RESERVED = frozenset(
     | {f"com{index}" for index in range(1, 10)}
     | {f"lpt{index}" for index in range(1, 10)}
 )
-LEGACY_SECTION_KEYS = frozenset({"experiment", "inputs", "spatial", "scan", "outputs"})
-
 DEFAULT_PROFILE_VALUES: dict[str, Any] = {
     "target_crs": "EPSG:3857",
     "rect_size": 3000,
@@ -100,37 +97,10 @@ class FigureSettings:
     title: str | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class LegacyProfileValues(Mapping[str, Any]):
-    """Immutable effective legacy values plus their discovered source revision."""
-
-    _items: tuple[tuple[str, Any], ...]
-    source_path: Path
-    source_sha256: str
-    catalog_owner_scenario_id: str | None = None
-
-    def __getitem__(self, key: str) -> Any:
-        for item_key, value in self._items:
-            if item_key == key:
-                return value
-        raise KeyError(key)
-
-    def __iter__(self):
-        return (key for key, _ in self._items)
-
-    def __len__(self) -> int:
-        return len(self._items)
-
-    @property
-    def source_revision(self) -> str:
-        return f"sha256:{self.source_sha256}"
-
-
 @dataclass(frozen=True)
 class ExperimentProfile:
-    """Validated schema-version-2 experiment settings."""
+    """Validated experiment settings."""
 
-    schema_version: int
     profile_id: str
     display_name: str
     scenario_id: str
@@ -149,15 +119,6 @@ class ExperimentProfile:
     outputs: OutputSettings = field(default_factory=OutputSettings)
     figure: FigureSettings = field(default_factory=FigureSettings)
     source_path: Path | None = None
-    legacy_source: LegacyProfileValues | None = field(
-        default=None,
-        repr=False,
-        compare=False,
-    )
-
-    @property
-    def is_legacy_preview(self) -> bool:
-        return self.legacy_source is not None
 
     def runtime_values(self) -> dict[str, Any]:
         """Return the flat mapping consumed by existing workflow services."""
@@ -297,8 +258,6 @@ def _resolve_path(value: str | Path, root: Path) -> Path:
 
 
 def _validate_profile(profile: ExperimentProfile) -> ExperimentProfile:
-    if type(profile.schema_version) is not int or profile.schema_version != 2:
-        raise ValueError("schema_version must be the integer 2")
     for path, value in (
         ("profile.id", profile.profile_id),
         ("profile.display_name", profile.display_name),
@@ -380,15 +339,6 @@ def _validate_profile(profile: ExperimentProfile) -> ExperimentProfile:
         raise ValueError("figures.dpi must be greater than zero")
     if profile.figure.vertical_exaggeration <= 0:
         raise ValueError("figures.vertical_exaggeration must be greater than zero")
-    if profile.legacy_source is not None:
-        if not isinstance(profile.legacy_source, LegacyProfileValues):
-            raise ValueError("legacy_source must be LegacyProfileValues")
-        if profile.source_path is None or (
-            Path(profile.source_path).resolve() != profile.legacy_source.source_path
-        ):
-            raise ValueError("legacy preview source path must match its provenance")
-        if re.fullmatch(r"[0-9a-f]{64}", profile.legacy_source.source_sha256) is None:
-            raise ValueError("legacy source SHA256 must be a lowercase hexadecimal digest")
     return profile
 
 
@@ -420,10 +370,7 @@ def _serialized_output_root(profile: ExperimentProfile, path: Path) -> str:
 
 def _profile_document(profile: ExperimentProfile, path: Path) -> dict[str, Any]:
     _validate_profile(profile)
-    if profile.is_legacy_preview:
-        raise ValueError("Legacy profile previews are read-only until explicit Save")
     return {
-        "schema_version": 2,
         "profile": {
             "id": profile.profile_id,
             "display_name": profile.display_name,
@@ -532,7 +479,7 @@ def _profile_text(profile: ExperimentProfile, path: str | Path) -> str:
 
 
 def dump_profile(profile: ExperimentProfile, path: str | Path) -> Path:
-    """Validate and atomically write a deterministic schema-version-2 profile."""
+    """Validate and atomically write a deterministic experiment profile."""
 
     destination = Path(path).resolve()
     text = _profile_text(profile, destination)
@@ -545,7 +492,7 @@ def load_profile(
     *,
     repo_root: str | Path | None = None,
 ) -> ExperimentProfile:
-    """Load and validate one schema-version-2 experiment profile."""
+    """Load and validate one experiment profile."""
 
     source_path = Path(path).resolve()
     root = (
@@ -556,11 +503,21 @@ def load_profile(
     document = yaml.safe_load(source_path.read_text(encoding="utf-8")) or {}
     if not isinstance(document, Mapping):
         raise ValueError("Configuration document must be a mapping")
-    if "schema_version" not in document:
-        raise ValueError("Missing required configuration value: schema_version")
-    schema_version = document["schema_version"]
-    if type(schema_version) is not int or schema_version != 2:
-        raise ValueError("schema_version must be the integer 2")
+    allowed_sections = {
+        "profile",
+        "inputs",
+        "experiment",
+        "spatial",
+        "scan",
+        "outputs",
+        "figures",
+    }
+    unexpected = sorted(set(document) - allowed_sections)
+    if unexpected:
+        raise ValueError(
+            "Configuration document has unexpected fields: "
+            + ", ".join(unexpected)
+        )
 
     profile_section = _mapping(document, "profile")
     inputs = _mapping(document, "inputs")
@@ -662,7 +619,6 @@ def load_profile(
     )
 
     profile = ExperimentProfile(
-        schema_version=2,
         profile_id=_string_value(
             profile_section,
             "id",
@@ -751,131 +707,6 @@ def load_profile(
     return _validate_profile(profile)
 
 
-def load_legacy_profile(
-    path: str | Path,
-    repo_root: str | Path,
-) -> LegacyProfileValues:
-    """Load one legacy YAML as an immutable mapping of effective values."""
-
-    source_path = Path(path).resolve()
-    source_bytes = source_path.read_bytes()
-    document = yaml.safe_load(source_bytes.decode("utf-8")) or {}
-    if not isinstance(document, Mapping):
-        raise ValueError("The legacy experiment configuration must be a YAML mapping")
-    if "schema_version" in document:
-        raise ValueError("load_legacy_profile only accepts legacy YAML without schema_version")
-
-    from .config import load_experiment_config
-
-    effective = load_experiment_config(
-        source_path,
-        repo_root=Path(repo_root).resolve(),
-    )
-    try:
-        current_bytes = source_path.read_bytes()
-    except FileNotFoundError as exc:
-        raise ConcurrentProfileUpdateError(
-            f"Legacy profile changed while it was loaded: {source_path}"
-        ) from exc
-    if current_bytes != source_bytes:
-        raise ConcurrentProfileUpdateError(
-            f"Legacy profile changed while it was loaded: {source_path}"
-        )
-    return LegacyProfileValues(
-        tuple(effective.items()),
-        source_path,
-        sha256(source_bytes).hexdigest(),
-    )
-
-
-def _legacy_profile_from_values(
-    legacy: Mapping[str, Any],
-    *,
-    profile_id: str,
-    scenario_id: str,
-    points_dataset_id: str,
-    display_name: str | None = None,
-    legacy_source: LegacyProfileValues | None = None,
-) -> ExperimentProfile:
-    if not isinstance(legacy, Mapping):
-        raise ValueError("legacy profile values must be a mapping")
-
-    def required(key: str) -> Any:
-        try:
-            return legacy[key]
-        except KeyError as exc:
-            raise ValueError(f"Missing required legacy profile value: {key}") from exc
-
-    output_defaults = OutputSettings()
-    source_path = legacy.get("config_path")
-    profile = ExperimentProfile(
-        schema_version=2,
-        profile_id=profile_id,
-        display_name=(
-            display_name
-            if display_name is not None
-            else legacy.get("experiment_name", profile_id)
-        ),
-        scenario_id=scenario_id,
-        points_dataset_id=points_dataset_id,
-        random_seed=legacy.get(
-            "random_seed",
-            DEFAULT_PROFILE_VALUES["random_seed"],
-        ),
-        target_crs=required("target_crs"),
-        rect_size=required("rect_size"),
-        target_count=required("target_count"),
-        tolerance=required("tolerance"),
-        scan_mode=legacy.get("scan_mode", DEFAULT_PROFILE_VALUES["scan_mode"]),
-        strategy=required("strategy"),
-        scan_step=required("scan_step"),
-        max_rects=required("max_rects"),
-        min_spacing=required("min_spacing"),
-        output_root=Path(required("output_root")),
-        outputs=OutputSettings(
-            save_csv=legacy.get("save_csv", output_defaults.save_csv),
-            save_preview_png=legacy.get(
-                "save_preview_png",
-                output_defaults.save_preview_png,
-            ),
-            save_terrain_png=legacy.get(
-                "save_terrain_png",
-                output_defaults.save_terrain_png,
-            ),
-            save_terrain_eps=legacy.get(
-                "save_terrain_eps",
-                output_defaults.save_terrain_eps,
-            ),
-            save_terrain_html=legacy.get(
-                "save_terrain_html",
-                output_defaults.save_terrain_html,
-            ),
-        ),
-        source_path=Path(source_path).resolve() if source_path is not None else None,
-        legacy_source=legacy_source,
-    )
-    return _validate_profile(profile)
-
-
-def convert_legacy_profile(
-    legacy: Mapping[str, Any],
-    *,
-    profile_id: str,
-    scenario_id: str,
-    points_dataset_id: str,
-    display_name: str | None = None,
-) -> ExperimentProfile:
-    """Explicitly convert immutable legacy values into a writable v2 profile."""
-
-    return _legacy_profile_from_values(
-        legacy,
-        profile_id=profile_id,
-        scenario_id=scenario_id,
-        points_dataset_id=points_dataset_id,
-        display_name=display_name,
-    )
-
-
 class ProfileStore:
     """Discover and mutate repository profiles under one shared catalog lock."""
 
@@ -934,61 +765,6 @@ class ProfileStore:
             Path(profile.scenario_id) / f"{profile.profile_id}.yaml",
             must_exist=False,
         )
-
-    def _prepare_legacy_migration(
-        self,
-        profile: ExperimentProfile,
-        catalog: DataCatalog,
-    ) -> tuple[ExperimentProfile, Path, bytes, bool] | None:
-        legacy = profile.legacy_source
-        if legacy is None:
-            return None
-        source = self._profile_path(legacy.source_path, must_exist=False)
-        owners = self._catalog_owners_for_source(catalog, source)
-        expected_owner = legacy.catalog_owner_scenario_id
-        if expected_owner is None and owners:
-            raise ConcurrentProfileUpdateError(
-                f"Legacy profile ownership changed since discovery: {source}"
-            )
-        if expected_owner is not None and owners != (expected_owner,):
-            raise ConcurrentProfileUpdateError(
-                f"Legacy profile ownership changed since discovery: {source}"
-            )
-        try:
-            matched_scenario_id, matched_points_id = self._match_legacy_catalog(
-                legacy,
-                catalog,
-                owners,
-            )
-        except ValueError as exc:
-            raise ConcurrentProfileUpdateError(
-                f"Legacy profile catalog mapping changed since discovery: {source}"
-            ) from exc
-        if (
-            matched_scenario_id != profile.scenario_id
-            or matched_points_id != profile.points_dataset_id
-        ):
-            raise ConcurrentProfileUpdateError(
-                f"Legacy profile catalog mapping changed since discovery: {source}"
-            )
-        try:
-            content = source.read_bytes()
-        except FileNotFoundError as exc:
-            raise ConcurrentProfileUpdateError(
-                f"Legacy profile changed since discovery: {source}"
-            ) from exc
-        if sha256(content).hexdigest() != legacy.source_sha256:
-            raise ConcurrentProfileUpdateError(
-                f"Legacy profile changed since discovery: {source}"
-            )
-        converted = convert_legacy_profile(
-            legacy,
-            profile_id=profile.profile_id,
-            scenario_id=profile.scenario_id,
-            points_dataset_id=profile.points_dataset_id,
-            display_name=profile.display_name,
-        )
-        return converted, source, content, expected_owner is not None
 
     def _load_catalog(self) -> DataCatalog:
         return load_data_catalog(self.catalog_path, repo_root=self.repo_root)
@@ -1116,125 +892,6 @@ class ProfileStore:
             return None
         return self._profile_path(catalog.resolve(config_path), must_exist=False)
 
-    def _catalog_owners_for_source(
-        self,
-        catalog: DataCatalog,
-        source: Path,
-    ) -> tuple[str, ...]:
-        return tuple(
-            scenario_id
-            for scenario_id in catalog.scenarios_by_id
-            if self._catalog_profile_path(catalog, scenario_id) == source
-        )
-
-    @staticmethod
-    def _legacy_input_paths(legacy: LegacyProfileValues) -> tuple[Path, Path, Path]:
-        from .spatial import resolve_io_paths
-
-        try:
-            paths = resolve_io_paths(dict(legacy), create_output=False)
-        except (FileNotFoundError, ValueError) as exc:
-            raise ValueError(
-                f"Valid legacy profile {legacy.source_path} could not resolve its "
-                f"input paths: {exc}"
-            ) from exc
-        return tuple(
-            Path(paths[key]).resolve(strict=False)
-            for key in ("points_shp", "boundary_shp", "dem_path")
-        )
-
-    def _match_legacy_catalog(
-        self,
-        legacy: LegacyProfileValues,
-        catalog: DataCatalog,
-        owners: tuple[str, ...],
-    ) -> tuple[str, str]:
-        points_path, boundary_path, dem_path = self._legacy_input_paths(legacy)
-        point_ids = tuple(
-            dataset_id
-            for dataset_id, dataset in catalog.datasets_by_id.items()
-            if dataset["role"] == "points"
-            and catalog.resolve(dataset["entrypoint"]).resolve(strict=False)
-            == points_path
-        )
-        if not point_ids:
-            raise ValueError(
-                f"Valid legacy profile {legacy.source_path} points path {points_path} "
-                "does not match any catalog points dataset"
-            )
-        if len(point_ids) != 1:
-            raise ValueError(
-                f"Valid legacy profile {legacy.source_path} points path matches "
-                f"multiple catalog datasets: {', '.join(point_ids)}"
-            )
-
-        matching_scenarios: list[str] = []
-        for scenario_id, scenario in catalog.scenarios_by_id.items():
-            boundary = catalog.dataset(scenario["boundary_dataset_id"])
-            if (
-                catalog.resolve(boundary["entrypoint"]).resolve(strict=False)
-                != boundary_path
-            ):
-                continue
-            dem_dataset_id = scenario["dem_dataset_id"]
-            if dem_dataset_id is None:
-                continue
-            dem = catalog.dataset(dem_dataset_id)
-            if catalog.resolve(dem["entrypoint"]).resolve(strict=False) == dem_path:
-                matching_scenarios.append(scenario_id)
-
-        if owners:
-            if len(owners) != 1:
-                raise ValueError(
-                    f"Legacy profile {legacy.source_path} is referenced by multiple "
-                    "scenarios"
-                )
-            owner = owners[0]
-            if owner not in matching_scenarios:
-                raise ValueError(
-                    f"catalog-owned legacy profile {legacy.source_path} does not "
-                    f"match the registered paths for scenario {owner!r}"
-                )
-            return owner, point_ids[0]
-
-        if not matching_scenarios:
-            raise ValueError(
-                f"Valid legacy profile {legacy.source_path} boundary and DEM paths "
-                "do not match any catalog scenario"
-            )
-        if len(matching_scenarios) != 1:
-            superseding = [
-                candidate
-                for candidate in matching_scenarios
-                if self._catalog_v2_supersedes_legacy(catalog, candidate, legacy)
-            ]
-            if len(superseding) == 1:
-                return superseding[0], point_ids[0]
-            raise ValueError(
-                f"Valid legacy profile {legacy.source_path} matches multiple scenarios: "
-                f"{', '.join(matching_scenarios)}"
-            )
-        return matching_scenarios[0], point_ids[0]
-
-    def _catalog_v2_supersedes_legacy(
-        self,
-        catalog: DataCatalog,
-        scenario_id: str,
-        legacy: LegacyProfileValues,
-    ) -> bool:
-        profile_path = self._catalog_profile_path(catalog, scenario_id)
-        if (
-            profile_path is None
-            or profile_path == legacy.source_path
-            or not profile_path.is_file()
-        ):
-            return False
-        profile = load_profile(profile_path, repo_root=self.repo_root)
-        return (
-            profile.scenario_id == scenario_id
-            and profile.profile_id == legacy.source_path.stem
-        )
-
     def _relative_profile_path(self, path: Path) -> str:
         return path.relative_to(self.repo_root).as_posix()
 
@@ -1301,20 +958,15 @@ class ProfileStore:
         """Recursively load profiles in stable repository-relative order."""
 
         configs_root = self._resolved_configs_root()
-        catalog = self._load_catalog() if self.catalog_path.is_file() else None
-        catalog_owners: dict[Path, list[str]] = {}
-        if catalog is not None:
-            for configured_scenario_id, scenario in catalog.scenarios_by_id.items():
-                config_path = scenario["config_path"]
-                if config_path is None:
-                    continue
-                resolved = self._profile_path(
-                    catalog.resolve(config_path),
-                    must_exist=False,
-                )
-                catalog_owners.setdefault(resolved, []).append(
-                    configured_scenario_id
-                )
+        if self.catalog_path.is_file():
+            catalog = self._load_catalog()
+            for scenario in catalog.scenarios_by_id.values():
+                config_path = scenario.get("config_path")
+                if config_path is not None:
+                    self._profile_path(
+                        catalog.resolve(config_path),
+                        must_exist=False,
+                    )
         if not configs_root.is_dir():
             return []
         paths = sorted(
@@ -1325,66 +977,13 @@ class ProfileStore:
             ),
             key=lambda path: path.relative_to(configs_root).as_posix(),
         )
-        if catalog is None:
-            profiles = [
-                load_profile(
-                    self._profile_path(path, must_exist=True),
-                    repo_root=self.repo_root,
-                )
-                for path in paths
-            ]
-            self._ensure_unique_profile_identities(profiles)
-            if scenario_id is None:
-                return profiles
-            return [
-                profile for profile in profiles if profile.scenario_id == scenario_id
-            ]
-        profiles: list[ExperimentProfile] = []
-        for path in paths:
-            resolved = self._profile_path(path, must_exist=True)
-            document = yaml.safe_load(resolved.read_text(encoding="utf-8"))
-            owners = tuple(catalog_owners.get(resolved, []))
-            if isinstance(document, Mapping) and "schema_version" in document:
-                profiles.append(load_profile(resolved, repo_root=self.repo_root))
-                continue
-            if not isinstance(document, Mapping):
-                if not owners:
-                    continue
-                raise ValueError(
-                    "The catalog-owned legacy experiment configuration must be a "
-                    "YAML mapping"
-                )
-            try:
-                legacy = load_legacy_profile(resolved, self.repo_root)
-            except ValueError as exc:
-                if not owners and not LEGACY_SECTION_KEYS.intersection(document):
-                    continue
-                raise ValueError(f"Invalid legacy profile {resolved}: {exc}") from exc
-            matched_scenario_id, matched_points_id = self._match_legacy_catalog(
-                legacy,
-                catalog,
-                owners,
+        profiles = [
+            load_profile(
+                self._profile_path(path, must_exist=True),
+                repo_root=self.repo_root,
             )
-            if not owners and self._catalog_v2_supersedes_legacy(
-                catalog,
-                matched_scenario_id,
-                legacy,
-            ):
-                continue
-            if owners:
-                legacy = replace(
-                    legacy,
-                    catalog_owner_scenario_id=matched_scenario_id,
-                )
-            profiles.append(
-                _legacy_profile_from_values(
-                    legacy,
-                    profile_id=resolved.stem,
-                    scenario_id=matched_scenario_id,
-                    points_dataset_id=matched_points_id,
-                    legacy_source=legacy,
-                )
-            )
+            for path in paths
+        ]
         self._ensure_unique_profile_identities(profiles)
         if scenario_id is None:
             return profiles
@@ -1402,25 +1001,16 @@ class ProfileStore:
         with catalog_transaction_lock(self.repo_root):
             catalog = self._load_catalog()
             self._validate_profile_catalog(profile, catalog)
-            legacy_migration = self._prepare_legacy_migration(profile, catalog)
-            persisted_profile = (
-                legacy_migration[0] if legacy_migration is not None else profile
-            )
-            self._validate_profile_catalog(persisted_profile, catalog)
-            destination = (
-                legacy_migration[1]
-                if legacy_migration is not None and not legacy_migration[3]
-                else self._destination(persisted_profile)
-            )
+            destination = self._destination(profile)
             destination_exists = os.path.lexists(destination)
             if destination_exists and not destination.is_file():
                 raise FileExistsError(destination)
             if destination_exists and not overwrite:
                 raise FileExistsError(destination)
             original = destination.read_bytes() if destination_exists else None
-            expected = _profile_text(persisted_profile, destination).encode("utf-8")
+            expected = _profile_text(profile, destination).encode("utf-8")
             try:
-                dump_profile(persisted_profile, destination)
+                dump_profile(profile, destination)
             except Exception as exc:
                 self._restore_profile_after_error(
                     destination,
@@ -1429,37 +1019,11 @@ class ProfileStore:
                     exc,
                 )
                 raise
-            update_catalog = set_default
-            if legacy_migration is not None:
-                try:
-                    _, source, source_bytes, is_catalog_default = legacy_migration
-                    try:
-                        current_source = source.read_bytes()
-                    except FileNotFoundError as exc:
-                        raise ConcurrentProfileUpdateError(
-                            f"Legacy profile changed during migration: {source}"
-                        ) from exc
-                    expected_source = expected if source == destination else source_bytes
-                    if current_source != expected_source:
-                        raise ConcurrentProfileUpdateError(
-                            f"Legacy profile changed during migration: {source}"
-                        )
-                    update_catalog = set_default or (
-                        is_catalog_default and source != destination
-                    )
-                except Exception as exc:
-                    self._restore_profile_after_error(
-                        destination,
-                        original,
-                        expected,
-                        exc,
-                    )
-                    raise
-            if not update_catalog:
+            if not set_default:
                 return destination
             document = self._default_document(
                 catalog,
-                persisted_profile.scenario_id,
+                profile.scenario_id,
                 self._relative_profile_path(destination),
             )
             try:

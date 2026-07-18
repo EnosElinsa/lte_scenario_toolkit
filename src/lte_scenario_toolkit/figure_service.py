@@ -114,7 +114,7 @@ class FigureSource:
     points: gpd.GeoDataFrame
     target_crs: str
     rectangle_size_m: float
-    source_kind: str = "csv"
+    source_kind: str = "run"
     warnings: tuple[str, ...] = ()
     dem_path: Path | None = None
     run_id: str | None = None
@@ -125,8 +125,8 @@ class FigureSource:
     csv_identity: FigureCsvIdentity | None = None
 
     def __post_init__(self) -> None:
-        if self.source_kind not in {"csv", "run", "selection"}:
-            raise ValueError("figure source kind must be csv, run, or selection")
+        if self.source_kind not in {"run", "selection"}:
+            raise ValueError("figure source kind must be run or selection")
         if self.source_kind == "selection":
             if (
                 self.selection_identity is None
@@ -147,21 +147,6 @@ class FigureSource:
             rectangle=dict(self.rectangle),
             points=self.points.copy(deep=True),
         )
-
-
-@dataclass(frozen=True)
-class FigureSourceInspection:
-    """Safe source summary used before a legacy rectangle is selected."""
-
-    path: Path
-    source_kind: str
-    rectangle_ids: tuple[Any, ...]
-    warnings: tuple[str, ...] = ()
-    run_id: str | None = None
-
-    @property
-    def requires_rectangle(self) -> bool:
-        return len(self.rectangle_ids) > 1
 
 
 @dataclass(frozen=True)
@@ -535,7 +520,6 @@ def _rectangle_ids(frame: pd.DataFrame) -> tuple[Any, ...]:
 def _read_frame(
     csv_path: Path,
     *,
-    rect_id: Any,
     empty_rectangle: Mapping[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     frame = _read_csv_frame(csv_path, allow_empty=empty_rectangle is not None)
@@ -567,23 +551,13 @@ def _read_frame(
             rectangle[name] = int(numeric) if name == "pt_count" else numeric
         if float(empty_rectangle["pt_count"]) != 0:
             raise ValueError("empty figure source snapshot must have pt_count 0")
-        if rect_id is not None and float(rect_id) != float(rectangle["rect_id"]):
-            raise ValueError(f"rect_id {rect_id!r} is not present in the scenario CSV")
         return frame.copy(), rectangle
     rectangle_ids = _rectangle_ids(frame)
-    if rect_id is None:
-        if len(rectangle_ids) != 1:
-            raise ValueError("Scenario CSV has multiple rect_id values; choose rect_id explicitly")
-        selected_id = rectangle_ids[0]
-    else:
-        try:
-            selected_numeric = float(rect_id)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"rect_id must be numeric: {rect_id!r}") from exc
-        matching_ids = [value for value in rectangle_ids if float(value) == selected_numeric]
-        if len(matching_ids) != 1:
-            raise ValueError(f"rect_id {rect_id!r} is not present in the scenario CSV")
-        selected_id = matching_ids[0]
+    if len(rectangle_ids) != 1:
+        raise ValueError(
+            "Completed run scenario CSV must contain exactly one rect_id"
+        )
+    selected_id = rectangle_ids[0]
     selected = frame.loc[frame["rect_id"] == selected_id].copy().reset_index(drop=True)
     rectangle: dict[str, Any] = {}
     for column in _RECTANGLE_COLUMNS:
@@ -670,51 +644,7 @@ def _resolve_source_context(source_path: Path) -> _SourceContext:
             warnings=(),
             source_kind="run",
         )
-    if source_path.is_file() and source_path.suffix.casefold() == ".csv":
-        if source_path.is_symlink():
-            raise ValueError(f"Scenario CSV must be a regular file: {source_path}")
-        resolved_csv = source_path.resolve(strict=True)
-        sibling_record = source_path.parent / "run.json"
-        sibling_snapshot = source_path.parent / "run-config.yaml"
-        if sibling_record.is_file() or sibling_snapshot.is_file():
-            (
-                root,
-                csv_path,
-                record,
-                target_crs,
-                rectangle_size,
-                dem_path,
-                dem_fingerprint,
-            ) = _run_source(source_path.parent)
-            if csv_path != resolved_csv:
-                raise ValueError(
-                    "Selected CSV is not the scenario CSV recorded by its sibling run.json"
-                )
-            return _SourceContext(
-                root=root,
-                csv_path=csv_path,
-                record=record,
-                target_crs=target_crs,
-                rectangle_size_m=rectangle_size,
-                dem_path=dem_path,
-                dem_fingerprint=dem_fingerprint,
-                warnings=(),
-                source_kind="run",
-            )
-        return _SourceContext(
-            root=resolved_csv,
-            csv_path=resolved_csv,
-            record={},
-            target_crs="EPSG:3857",
-            rectangle_size_m=0.0,
-            dem_path=None,
-            dem_fingerprint=None,
-            warnings=(
-                "Legacy scenario CSV has no run snapshot; assuming EPSG:3857.",
-            ),
-            source_kind="csv",
-        )
-    raise ValueError("Figure source must be a run directory, run.json, or CSV")
+    raise ValueError("Figure source must be a completed run directory or run.json")
 
 
 def _selection_run_consistency(
@@ -875,8 +805,7 @@ def _normalise_entrypoint(entrypoint: Iterable[str] | None) -> list[str]:
 def _require_dem(source: FigureSource) -> Path:
     if source.dem_path is None:
         raise ValueError(
-            "A DEM path has not been resolved for this figure source; load a selection "
-            "run with recorded DEM provenance or use the legacy config workflow"
+            "The completed run does not contain recorded DEM provenance"
         )
     return _validated_dem_path(source.dem_path, description="figure source DEM path")
 
@@ -914,60 +843,10 @@ class FigureService:
     """Load, preview, and publish figures through one reusable service."""
 
     @staticmethod
-    def inspect_source(path: str | Path) -> FigureSourceInspection:
-        """Inspect a source and enumerate rectangle IDs without choosing one."""
-
-        context = _resolve_source_context(Path(path))
-        empty_rectangle = _recorded_figure_rectangle(context.record)
-        frame = _read_csv_frame(
-            context.csv_path,
-            allow_empty=empty_rectangle is not None,
-        )
-        rectangle_ids = (
-            (empty_rectangle["rect_id"],)
-            if frame.empty and empty_rectangle is not None
-            else _rectangle_ids(frame)
-        )
-        record_run_id = context.record.get("run_id")
-        return FigureSourceInspection(
-            path=context.root,
-            source_kind=context.source_kind,
-            rectangle_ids=rectangle_ids,
-            warnings=context.warnings,
-            run_id=record_run_id if type(record_run_id) is str else None,
-        )
-
-    @staticmethod
-    def attach_dem(
-        source: FigureSource,
-        path: str | os.PathLike[str],
-        *,
-        fingerprint: str | None = None,
-    ) -> FigureSource:
-        """Return a source with one explicitly validated local DEM."""
-
-        if not isinstance(source, FigureSource):
-            raise ValueError("source must be a FigureSource")
-        if fingerprint is not None and (type(fingerprint) is not str or not fingerprint):
-            raise ValueError("DEM fingerprint must be non-empty text")
-        dem_path = _validated_dem_path(path, description="figure source DEM path")
-        return replace(
-            source,
-            dem_path=dem_path,
-            dem_fingerprint=fingerprint,
-            warnings=tuple(
-                warning
-                for warning in source.warnings
-                if "DEM path has not been resolved" not in warning
-            ),
-        )
-
-    @staticmethod
-    def load_source(path: str | Path, rect_id: Any = None) -> FigureSource:
+    def load_source(path: str | Path) -> FigureSource:
         context = _resolve_source_context(Path(path))
         frame, rectangle = _read_frame(
             context.csv_path,
-            rect_id=rect_id,
             empty_rectangle=_recorded_figure_rectangle(context.record),
         )
         _selection_run_consistency(context.record, frame, rectangle)
@@ -1086,7 +965,7 @@ class FigureService:
                 source.target_crs,
                 max_pixels=spec.max_pixels,
             )
-        scenario_id = source.scenario_id or "legacy"
+        scenario_id = source.scenario_id or "figures"
         profile_id = source.profile_id or "figures"
         run = run_service.begin(
             scenario_id,
@@ -1143,7 +1022,6 @@ class FigureService:
             if not rendered_artifacts:
                 raise ValueError("No requested figure format was rendered successfully")
             metadata = {
-                "schema_version": 1,
                 "run_kind": "figure",
                 "source": {
                     "kind": source.source_kind,
@@ -1203,7 +1081,6 @@ __all__ = [
     "FigureCsvIdentity",
     "FigureService",
     "FigureSource",
-    "FigureSourceInspection",
     "FigureSpec",
     "SelectionFigureIdentity",
     "validate_csv_identity",

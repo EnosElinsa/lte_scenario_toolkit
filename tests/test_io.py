@@ -34,7 +34,6 @@ def test_build_output_dataframe_contains_reproducible_scenario_fields():
         bottom_y=0,
         center_x=500,
         center_y=500,
-        rect_size=1000,
     )
 
     required = {
@@ -53,7 +52,7 @@ def test_build_output_dataframe_contains_reproducible_scenario_fields():
     assert frame.loc[0, "elevation"] == 12.5
 
 
-def test_build_output_dataframe_adds_optional_traceability_without_legacy_regression():
+def test_build_output_dataframe_adds_optional_traceability():
     selected = gpd.GeoDataFrame(
         {"cell": [10], "elevation": [12.5]},
         geometry=[Point(100, 200)],
@@ -66,10 +65,9 @@ def test_build_output_dataframe_adds_optional_traceability_without_legacy_regres
         "bottom_y": 0,
         "center_x": 500,
         "center_y": 500,
-        "rect_size": 1000,
     }
 
-    legacy = build_output_dataframe(selected, selected.crs, **arguments)
+    untraced = build_output_dataframe(selected, selected.crs, **arguments)
     traced = build_output_dataframe(
         selected,
         selected.crs,
@@ -80,7 +78,7 @@ def test_build_output_dataframe_adds_optional_traceability_without_legacy_regres
         candidate_id="candidate-0001",
     )
 
-    assert traced.columns.tolist() == legacy.columns.tolist() + [
+    assert traced.columns.tolist() == untraced.columns.tolist() + [
         "run_id",
         "scenario_id",
         "profile_id",
@@ -115,7 +113,6 @@ def test_build_output_dataframe_uses_authoritative_target_crs_for_xy():
         bottom_y=4_499_000,
         center_x=500_000,
         center_y=4_500_000,
-        rect_size=2000,
         target_crs="EPSG:32618",
     )
 
@@ -278,7 +275,6 @@ def test_create_data_manifest_combines_provenance_with_file_checksums(tmp_path):
     metadata = tmp_path / "datasets.yaml"
     metadata.write_text(
         """
-schema_version: 2
 datasets:
   - dataset_id: fixture
     role: points
@@ -305,7 +301,7 @@ scenarios: []
 
     payload = json.loads(output.read_text(encoding="utf-8"))
     dataset = payload["datasets"][0]
-    assert payload["schema_version"] == 2
+    assert "schema_version" not in payload
     assert payload["scenarios"] == []
     assert dataset["dataset_id"] == "fixture"
     assert dataset["source_url"] == "https://example.test/fixture"

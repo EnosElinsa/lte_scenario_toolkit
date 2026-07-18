@@ -1,5 +1,3 @@
-schema_version: 2
-
 datasets:
   - dataset_id: usa_clear_lte_base_stations
     role: points

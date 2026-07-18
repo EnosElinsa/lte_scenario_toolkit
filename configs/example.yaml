@@ -1,13 +1,13 @@
-experiment:
-  name: chicago_example
-  random_seed: 42
+profile:
+  id: chicago-default
+  display_name: Chicago default
+  scenario_id: chicago
 
 inputs:
-  points_root: points_shp
-  points_layer: USA_Clear_LTE_Base_Station
-  boundary_root: boundary_shp
-  city: Chicago
-  dem_path: dem/USGS_1M_DEM_Chicago/USGS_1M_DEM_Chicago.tif
+  points_dataset_id: usa_clear_lte_base_stations
+
+experiment:
+  random_seed: 42
 
 spatial:
   target_crs: EPSG:3857
@@ -16,15 +16,27 @@ spatial:
   count_tolerance: 0
 
 scan:
+  mode: fast
   strategy: uniform
   step_m: 10
   max_rectangles: 100
   minimum_center_spacing_m: 3000
 
 outputs:
-  root: results/chicago_example
+  root: results
   save_csv: true
   save_preview_png: true
   save_terrain_png: true
   save_terrain_eps: true
   save_terrain_html: true
+
+figures:
+  preset: publication
+  colormap: terrain
+  dpi: 300
+  azimuth_deg: -60.0
+  elevation_deg: 30.0
+  vertical_exaggeration: 1.0
+  station_color: red
+  station_marker_size: 20.0
+  title: null
