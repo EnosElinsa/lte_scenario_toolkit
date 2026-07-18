@@ -4221,6 +4221,192 @@ async def test_figure_page_invalidates_old_source_on_edit_and_failed_load(
         coordinator.shutdown()
 
 
+def test_figure_controller_rejects_style_change_while_preview_future_is_unfinished(
+    tmp_path,
+    monkeypatch,
+):
+    from dataclasses import replace
+    from threading import Event
+
+    from lte_scenario_toolkit.figure_service import FigureService
+    from lte_scenario_toolkit.gui.pages import figures
+    from lte_scenario_toolkit.gui.pages.figures import FigureController
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    entered = Event()
+    release = Event()
+
+    def delayed_preview(_source, _spec, output):
+        entered.set()
+        assert release.wait(30)
+        Path(output).parent.mkdir(parents=True, exist_ok=True)
+        Path(output).write_bytes(b"preview")
+        return Path(output)
+
+    monkeypatch.setattr(FigureService, "preview", staticmethod(delayed_preview))
+    monkeypatch.setattr(figures, "_valid_preview", lambda path: path.is_file())
+    coordinator = JobCoordinator()
+    controller = FigureController(
+        tmp_path,
+        coordinator,
+        source=_task15_figure_source(tmp_path),
+    )
+    job = None
+    try:
+        job = controller.refresh_preview()
+        assert job is not None and job.future is not None
+        assert entered.wait(2)
+        revision = controller.state.revision
+        spec = controller.state.spec
+
+        with pytest.raises(RuntimeError, match="running|unfinished"):
+            controller.update_spec(replace(spec, dpi=200))
+
+        assert controller.state.phase == "previewing"
+        assert controller.state.revision == revision
+        assert controller.state.spec == spec
+        assert not job.future.done()
+    finally:
+        release.set()
+        if job is not None and job.future is not None:
+            job.future.result(timeout=2)
+            controller.drain(job)
+        controller.close()
+        coordinator.shutdown()
+
+
+async def test_figure_page_locks_all_controls_and_restores_rejected_edits(
+    tmp_path,
+    monkeypatch,
+    user,
+):
+    from dataclasses import replace
+    from threading import Event
+
+    from lte_scenario_toolkit.figure_service import FigureService
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.gui.pages import figures
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    entered = Event()
+    release = Event()
+    completed_a = (
+        tmp_path / "source-runs" / "city" / "default" / "completed-a"
+    ).resolve()
+    rejected_b = (tmp_path / "rejected-b").resolve()
+    source = replace(
+        _task15_figure_source(tmp_path),
+        path=completed_a,
+        source_kind="run",
+        run_id="a" * 32,
+    )
+    views = []
+    actual_render = app_module.render_figures_page
+
+    def capture_render(*args, **kwargs):
+        view = actual_render(*args, **kwargs)
+        views.append(view)
+        return view
+
+    def delayed_preview(_source, _spec, output):
+        entered.set()
+        assert release.wait(30)
+        Path(output).parent.mkdir(parents=True, exist_ok=True)
+        Path(output).write_bytes(b"preview")
+        return Path(output)
+
+    monkeypatch.setattr(app_module, "render_figures_page", capture_render)
+    monkeypatch.setattr(figures, "load_figure_source", lambda _path: source)
+    monkeypatch.setattr(FigureService, "preview", staticmethod(delayed_preview))
+    monkeypatch.setattr(figures, "_valid_preview", lambda path: path.is_file())
+    coordinator = JobCoordinator()
+    try:
+        app_module.create_app(
+            catalog=SimpleNamespace(root=tmp_path.resolve()),
+            coordinator=coordinator,
+            testing=True,
+        )
+        await user.open("/figures")
+        source_interaction = user.find(marker="figure-source-path")
+        control_markers = (
+            "figure-source-path",
+            "figure-load-source",
+            "figure-preset",
+            "figure-dpi",
+            "figure-colormap",
+            "figure-azimuth",
+            "figure-elevation",
+            "figure-vertical-exaggeration",
+            "figure-station-color",
+            "figure-station-size",
+            "figure-title",
+            "figure-max-pixels",
+            "figure-format-png",
+            "figure-format-eps",
+            "figure-format-html",
+            "figure-refresh-preview",
+            "figure-export",
+        )
+        control_elements = {
+            marker: next(iter(user.find(marker=marker).elements))
+            for marker in control_markers
+        }
+        source_element = control_elements["figure-source-path"]
+        preset_element = control_elements["figure-preset"]
+        dpi_element = control_elements["figure-dpi"]
+        source_interaction.clear().type(str(completed_a))
+        user.find(marker="figure-load-source").click()
+        user.find(marker="figure-refresh-preview").click()
+        assert await asyncio.to_thread(entered.wait, 2)
+        assert len(views) == 1
+        view = views[0]
+        job = view.controller.job
+        assert job is not None and job.future is not None and not job.future.done()
+        revision = view.controller.state.revision
+        spec = view.controller.state.spec
+
+        enabled_while_blocked = {
+            marker: element.enabled for marker, element in control_elements.items()
+        }
+
+        with user.client:
+            source_element.value = str(rejected_b)
+            preset_element.value = "publication"
+            dpi_element.value = 200
+
+        await asyncio.sleep(0.2)
+        source_value_while_blocked = source_element.value
+        preset_value_while_blocked = preset_element.value
+        dpi_value_while_blocked = dpi_element.value
+        state_while_blocked = view.controller.state
+        timer_active_while_blocked = view.timer.active
+        future_done_while_blocked = job.future.done()
+
+        release.set()
+        await asyncio.to_thread(job.future.result, 2)
+
+        assert not any(enabled_while_blocked.values())
+        assert source_value_while_blocked == str(completed_a)
+        assert preset_value_while_blocked == spec.preset
+        assert dpi_value_while_blocked == spec.dpi
+        assert state_while_blocked.source is source
+        assert state_while_blocked.revision == revision
+        assert state_while_blocked.phase == "previewing"
+        assert timer_active_while_blocked is True
+        assert future_done_while_blocked is False
+
+        await user.should_see("Preview is current", retries=20)
+
+        assert view.timer.active is False
+        assert view.controller.state.phase == "ready"
+        assert all(element.enabled for element in control_elements.values())
+    finally:
+        release.set()
+        if views:
+            views[0].timer.deactivate()
+        coordinator.shutdown()
+
+
 async def test_figure_page_shows_loaded_no_dem_reason_and_no_legacy_controls(
     tmp_path,
     monkeypatch,
@@ -4475,10 +4661,10 @@ def test_stale_preview_job_cannot_replace_changed_style(tmp_path, monkeypatch):
     try:
         job = controller.refresh_preview()
         assert job is not None and entered.wait(2)
-        controller.update_spec(replace(controller.state.spec, dpi=200))
         release.set()
         assert job.future is not None
         job.future.result(timeout=2)
+        controller.update_spec(replace(controller.state.spec, dpi=200))
         state = controller.drain(job)
 
         assert state.spec.dpi == 200

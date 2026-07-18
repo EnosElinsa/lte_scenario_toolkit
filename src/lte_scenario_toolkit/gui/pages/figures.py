@@ -288,6 +288,20 @@ class FigureController:
         with self._lock:
             return self._job
 
+    def _job_unfinished_locked(self) -> bool:
+        return (
+            self._job is not None
+            and self._job.future is not None
+            and not self._job.future.done()
+        )
+
+    @property
+    def has_unfinished_job(self) -> bool:
+        """Return whether this controller still owns active background work."""
+
+        with self._lock:
+            return self._job_unfinished_locked()
+
     def _set_state(self, state: FigurePageState) -> FigurePageState:
         with self._lock:
             self._state = state
@@ -306,6 +320,8 @@ class FigureController:
         with self._lock:
             if self._closed:
                 raise RuntimeError("figure controller is closed")
+            if self._job_unfinished_locked():
+                raise RuntimeError("figure source cannot change while a job is running")
             self.output_root = (
                 None
                 if output_root is None
@@ -324,6 +340,8 @@ class FigureController:
         with self._lock:
             if self._closed:
                 raise RuntimeError("figure controller is closed")
+            if self._job_unfinished_locked():
+                raise RuntimeError("figure style cannot change while a job is running")
             self._state = self._state.with_spec(spec)
             return self._state
 
@@ -331,6 +349,8 @@ class FigureController:
         with self._lock:
             if self._closed:
                 raise RuntimeError("figure controller is closed")
+            if self._job_unfinished_locked():
+                raise RuntimeError("figure source cannot change while a job is running")
             self.output_root = None
             self.parent_run_id = None
             self.parent_run_path = None
@@ -348,7 +368,7 @@ class FigureController:
         with self._lock:
             if self._closed:
                 raise RuntimeError("figure controller is closed")
-            if self._state.phase in {"loading", "previewing", "exporting"}:
+            if self._job_unfinished_locked():
                 raise RuntimeError("figure source cannot change while a job is running")
             self.output_root = None
             self.parent_run_id = None
@@ -889,38 +909,38 @@ def render_figures_page(
                     colormap = ui.input(
                         translator.text("figures.colormap"),
                         value=form_spec.colormap,
-                    )
+                    ).mark("figure-colormap")
                     with ui.row().classes("lte-figure-style-pair full-width"):
                         azimuth = ui.number(
                             translator.text("figures.azimuth"),
                             value=form_spec.azimuth,
-                        )
+                        ).mark("figure-azimuth")
                         elevation = ui.number(
                             translator.text("figures.elevation"),
                             value=form_spec.elevation_angle,
-                        )
+                        ).mark("figure-elevation")
                     vertical = ui.number(
                         translator.text("figures.vertical_exaggeration"),
                         value=form_spec.vertical_exaggeration,
-                    )
+                    ).mark("figure-vertical-exaggeration")
                     with ui.row().classes("lte-figure-style-pair full-width"):
                         station_color = ui.input(
                             translator.text("figures.station_color"),
                             value=form_spec.station_color,
-                        )
+                        ).mark("figure-station-color")
                         station_size = ui.number(
                             translator.text("figures.station_size"),
                             value=form_spec.station_size,
-                        )
+                        ).mark("figure-station-size")
                     title = ui.input(
                         translator.text("figures.figure_title"),
                         value=form_spec.title or "",
-                    )
+                    ).mark("figure-title")
                     max_pixels = ui.number(
                         translator.text("figures.max_pixels"),
                         value=form_spec.max_pixels,
                         precision=0,
-                    )
+                    ).mark("figure-max-pixels")
 
         with ui.card().classes("lte-figure-export full-width"):
             with ui.row().classes("lte-figure-panel-header full-width"):
@@ -936,7 +956,7 @@ def render_figures_page(
                         format_boxes[token] = ui.checkbox(
                             token.upper(),
                             value=token in requested_initial_formats,
-                        )
+                        ).mark(f"figure-format-{token}")
                 ui.space()
                 export_button = ui.button(
                     translator.text("figures.export")
@@ -949,6 +969,59 @@ def render_figures_page(
             ).classes("lte-figure-path")
             result_label = ui.label("").classes("lte-figure-path")
             error_box = ui.column().classes("lte-figure-errors")
+
+    style_controls = (
+        preset,
+        dpi,
+        colormap,
+        azimuth,
+        elevation,
+        vertical,
+        station_color,
+        station_size,
+        title,
+        max_pixels,
+    )
+    restoring_source_control = False
+    restoring_spec_controls = False
+    restoring_format_controls = False
+    confirmed_formats = {
+        token: bool(format_boxes[token].value) for token in FIGURE_FORMAT_ORDER
+    }
+
+    def restore_spec_controls(spec: FigureSpec) -> None:
+        nonlocal restoring_spec_controls
+        restoring_spec_controls = True
+        try:
+            preset.value = spec.preset
+            dpi.value = spec.dpi
+            colormap.value = spec.colormap
+            azimuth.value = spec.azimuth
+            elevation.value = spec.elevation_angle
+            vertical.value = spec.vertical_exaggeration
+            station_color.value = spec.station_color
+            station_size.value = spec.station_size
+            title.value = spec.title or ""
+            max_pixels.value = spec.max_pixels
+        finally:
+            restoring_spec_controls = False
+
+    def restore_confirmed_source_input() -> None:
+        nonlocal restoring_source_control
+        state = controller.state
+        confirmed = (
+            str(state.source.path)
+            if isinstance(state.source, FigureSource)
+            and not state.source_dirty
+            and state.source.path is not None
+            else ""
+        )
+        if source_input.value != confirmed:
+            restoring_source_control = True
+            try:
+                source_input.value = confirmed
+            finally:
+                restoring_source_control = False
 
     def render_messages() -> None:
         warning_box.clear()
@@ -977,13 +1050,19 @@ def render_figures_page(
 
     def sync_controls(state: FigurePageState | None = None) -> None:
         current = controller.state if state is None else state
-        running = current.phase in {"loading", "previewing", "exporting"}
+        running = controller.has_unfinished_job
         valid_source = (
             isinstance(current.source, FigureSource) and not current.source_dirty
         )
         has_dem = valid_source and current.source.dem_path is not None
 
-        for control in (source_input, load_button, current_button):
+        for control in (
+            source_input,
+            load_button,
+            current_button,
+            *style_controls,
+            *format_boxes.values(),
+        ):
             if control is None:
                 continue
             if running:
@@ -1082,7 +1161,7 @@ def render_figures_page(
                 translator.text("figures.exported", path=str(current.run_path))
             )
 
-    def invalidate_visible_source(error: str | None = None) -> None:
+    def invalidate_visible_source(error: str | None = None) -> bool:
         detail = (
             None
             if error is None
@@ -1091,9 +1170,12 @@ def render_figures_page(
         try:
             state = controller.invalidate_source(detail)
         except RuntimeError:
-            return
+            restore_confirmed_source_input()
+            sync_controls()
+            return False
         sync_controls(state)
         render_messages()
+        return True
 
     def apply_source(
         source: FigureSource,
@@ -1117,7 +1199,8 @@ def render_figures_page(
         source_parent_run_id: str | None = None,
         source_parent_run_path: Path | None = None,
     ) -> None:
-        invalidate_visible_source()
+        if not invalidate_visible_source():
+            return
         try:
             source = load_figure_source(source_input.value)
         except Exception as exc:
@@ -1131,6 +1214,8 @@ def render_figures_page(
         )
 
     def changed_spec() -> bool:
+        if restoring_spec_controls:
+            return False
         try:
             base = FigureSpec.from_preset(str(preset.value))
             spec = replace(
@@ -1149,6 +1234,10 @@ def render_figures_page(
                 ),
             )
             controller.update_spec(spec)
+        except RuntimeError:
+            restore_spec_controls(controller.state.spec)
+            sync_controls()
+            return False
         except (TypeError, ValueError) as exc:
             ui.notify(str(exc), type="warning")
             return False
@@ -1156,22 +1245,34 @@ def render_figures_page(
         return True
 
     def apply_preset(value: Any) -> None:
+        if restoring_spec_controls:
+            return
         try:
             spec = FigureSpec.from_preset(str(value))
         except ValueError as exc:
             ui.notify(str(exc), type="warning")
             return
-        dpi.value = spec.dpi
-        colormap.value = spec.colormap
-        azimuth.value = spec.azimuth
-        elevation.value = spec.elevation_angle
-        vertical.value = spec.vertical_exaggeration
-        station_color.value = spec.station_color
-        station_size.value = spec.station_size
-        title.value = spec.title or ""
-        max_pixels.value = spec.max_pixels
-        controller.update_spec(spec)
+        restore_spec_controls(spec)
+        try:
+            controller.update_spec(spec)
+        except RuntimeError:
+            restore_spec_controls(controller.state.spec)
         sync_controls()
+
+    def changed_format(token: str) -> None:
+        nonlocal restoring_format_controls
+        if restoring_format_controls:
+            return
+        control = format_boxes[token]
+        if controller.has_unfinished_job:
+            restoring_format_controls = True
+            try:
+                control.value = confirmed_formats[token]
+            finally:
+                restoring_format_controls = False
+            sync_controls()
+            return
+        confirmed_formats[token] = bool(control.value)
 
     def refresh_preview() -> None:
         if not changed_spec():
@@ -1202,7 +1303,8 @@ def render_figures_page(
         timer.activate()
 
     def prepare_current_selection() -> None:
-        invalidate_visible_source()
+        if not invalidate_visible_source():
+            return
         try:
             controller.prepare_selection(current_session)
         except (JobBusyError, RuntimeError, ValueError) as exc:
@@ -1213,7 +1315,7 @@ def render_figures_page(
 
     def tick() -> None:
         state = controller.drain()
-        if state.phase in {"loading", "previewing", "exporting"}:
+        if controller.has_unfinished_job:
             sync_controls(state)
             return
         timer.deactivate()
@@ -1221,7 +1323,11 @@ def render_figures_page(
         render_messages()
 
     load_button.on("click", lambda: load_path())
-    source_input.on_value_change(lambda _event: invalidate_visible_source())
+    source_input.on_value_change(
+        lambda _event: (
+            None if restoring_source_control else invalidate_visible_source()
+        )
+    )
     refresh_button.on("click", refresh_preview)
     export_button.on("click", final_export)
     preset.on_value_change(lambda event: apply_preset(event.value))
@@ -1237,6 +1343,8 @@ def render_figures_page(
         max_pixels,
     ):
         field.on_value_change(lambda _event: changed_spec())
+    for token, control in format_boxes.items():
+        control.on_value_change(lambda _event, value=token: changed_format(value))
     if current_button is not None:
         current_button.on("click", prepare_current_selection)
     timer = ui.timer(0.1, tick, active=False)
