@@ -845,6 +845,8 @@ class FigureService:
     @staticmethod
     def load_source(path: str | Path) -> FigureSource:
         context = _resolve_source_context(Path(path))
+        if context.record.get("status") != "completed":
+            raise ValueError("Figure sources must be completed toolkit runs")
         frame, rectangle = _read_frame(
             context.csv_path,
             empty_rectangle=_recorded_figure_rectangle(context.record),

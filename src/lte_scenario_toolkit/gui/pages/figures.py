@@ -178,6 +178,8 @@ class FigurePageState:
     run_path: Path | None = None
     warnings: tuple[str, ...] = ()
     errors: tuple[dict[str, Any], ...] = ()
+    source_dirty: bool = False
+    source_error: str | None = None
 
     @classmethod
     def for_source(cls, source: Any) -> FigurePageState:
@@ -198,6 +200,8 @@ class FigurePageState:
             run_path=None,
             warnings=tuple(getattr(source, "warnings", ())),
             errors=(),
+            source_dirty=False,
+            source_error=None,
         )
 
     def with_spec(self, spec: FigureSpec) -> FigurePageState:
@@ -209,7 +213,13 @@ class FigurePageState:
             spec=spec,
             preview_stale=True,
             revision=self.revision + 1,
-            phase="ready" if self.source is not None else "empty",
+            phase=(
+                "ready"
+                if self.source is not None and not self.source_dirty
+                else "error"
+                if self.source_error is not None
+                else "empty"
+            ),
             errors=(),
         )
 
@@ -327,6 +337,28 @@ class FigureController:
             self._state = FigurePageState(
                 spec=self._state.spec,
                 revision=self._state.revision + 1,
+            )
+            return self._state
+
+    def invalidate_source(self, error: str | None = None) -> FigurePageState:
+        """Atomically discard every value derived from an unconfirmed source."""
+
+        if error is not None and (type(error) is not str or not error.strip()):
+            raise ValueError("source error must be non-empty text")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("figure controller is closed")
+            if self._state.phase in {"loading", "previewing", "exporting"}:
+                raise RuntimeError("figure source cannot change while a job is running")
+            self.output_root = None
+            self.parent_run_id = None
+            self.parent_run_path = None
+            self._state = FigurePageState(
+                spec=self._state.spec,
+                revision=self._state.revision + 1,
+                phase="error" if error is not None else "empty",
+                source_dirty=True,
+                source_error=error,
             )
             return self._state
 
@@ -637,6 +669,8 @@ class FigureController:
                     phase="error",
                     warnings=result.warnings,
                     errors=result.errors,
+                    source_dirty=True,
+                    source_error=result.message or "Figure source loading failed",
                 )
             else:
                 self.output_root = result.output_root
@@ -760,8 +794,14 @@ def render_figures_page(
         ui.label(translator.text("figures.title")).classes("lte-page-title")
         ui.label(translator.text("figures.subtitle")).classes("lte-page-subtitle")
         with ui.card().classes("lte-figure-source full-width"):
-            ui.label(translator.text("figures.source")).classes("lte-section-title")
-            with ui.row().classes("items-end full-width"):
+            with ui.row().classes("lte-figure-panel-header full-width"):
+                ui.label(translator.text("figures.source")).classes(
+                    "lte-section-title"
+                )
+                ui.label(translator.text("figures.source_contract")).classes(
+                    "lte-figure-section-note"
+                )
+            with ui.row().classes("lte-figure-source-actions items-end full-width"):
                 source_input = ui.input(
                     translator.text("figures.source_path"),
                     value="" if initial_source is None else str(initial_source),
@@ -775,91 +815,139 @@ def render_figures_page(
                     ).props("outline").mark("figure-current-selection")
                 else:
                     current_button = None
-            source_status = ui.label(translator.text("figures.no_source"))
+            source_status = ui.label("").classes(
+                "lte-figure-source-status"
+            ).mark("figure-source-ready")
+            source_status.set_visibility(False)
+            source_identity = ui.label("").classes(
+                "lte-figure-source-identity"
+            ).mark("figure-source-identity")
+            source_identity.set_visibility(False)
+            dirty_label = ui.label(
+                translator.text("figures.source_changed")
+            ).classes("lte-callout lte-callout--warning").mark(
+                "figure-source-dirty"
+            )
+            dirty_label.set_visibility(False)
+            source_error_label = ui.label("").classes(
+                "lte-callout lte-callout--error"
+            ).props("role=alert").mark("figure-source-error")
+            source_error_label.set_visibility(False)
+            terrain_label = ui.label(
+                translator.text("figures.terrain_unavailable")
+            ).classes("lte-callout lte-callout--warning").mark(
+                "figure-terrain-unavailable"
+            )
+            terrain_label.set_visibility(False)
+            empty_source_label = ui.label(
+                translator.text("figures.no_source")
+            ).classes("lte-figure-empty-copy").mark("figure-source-empty")
             warning_box = ui.column().classes("lte-figure-warnings")
 
-        with ui.card().classes("lte-figure-style full-width"):
-            ui.label(translator.text("figures.style")).classes("lte-section-title")
-            with ui.row().classes("full-width"):
-                preset = ui.select(
-                    {
-                        "preview": translator.text("figures.preset_preview"),
-                        "publication": translator.text(
-                            "figures.preset_publication"
-                        ),
-                    },
-                    value=form_spec.preset,
-                    label=translator.text("figures.preset"),
-                ).mark("figure-preset")
-                dpi = ui.number(
-                    translator.text("figures.dpi"),
-                    value=form_spec.dpi,
-                    precision=0,
-                ).mark("figure-dpi")
-                colormap = ui.input(
-                    translator.text("figures.colormap"),
-                    value=form_spec.colormap,
+        with ui.element("section").classes("lte-figure-workspace full-width"):
+            with ui.card().classes("lte-figure-preview-card"):
+                with ui.row().classes("lte-figure-panel-header full-width"):
+                    ui.label(translator.text("figures.preview_surface")).classes(
+                        "lte-section-title"
+                    )
+                    ui.space()
+                    stale_label = ui.label(
+                        translator.text("figures.preview_waiting")
+                    ).classes("lte-figure-preview-state")
+                with ui.element("div").classes("lte-figure-preview-surface"):
+                    preview = ui.image().classes("lte-figure-preview").mark(
+                        "figure-preview-surface"
+                    )
+                    preview.set_visibility(False)
+                    preview_empty = ui.label(
+                        translator.text("figures.preview_waiting")
+                    ).classes("lte-figure-preview-empty")
+                refresh_button = ui.button(
+                    translator.text("figures.refresh_preview")
+                ).mark("figure-refresh-preview")
+
+            with ui.card().classes("lte-figure-style"):
+                ui.label(translator.text("figures.style")).classes(
+                    "lte-section-title"
                 )
-                azimuth = ui.number(
-                    translator.text("figures.azimuth"),
-                    value=form_spec.azimuth,
-                )
-                elevation = ui.number(
-                    translator.text("figures.elevation"),
-                    value=form_spec.elevation_angle,
-                )
-            with ui.row().classes("full-width"):
-                vertical = ui.number(
-                    translator.text("figures.vertical_exaggeration"),
-                    value=form_spec.vertical_exaggeration,
-                )
-                station_color = ui.input(
-                    translator.text("figures.station_color"),
-                    value=form_spec.station_color,
-                )
-                station_size = ui.number(
-                    translator.text("figures.station_size"),
-                    value=form_spec.station_size,
-                )
-                title = ui.input(
-                    translator.text("figures.figure_title"),
-                    value=form_spec.title or "",
-                )
-                max_pixels = ui.number(
-                    translator.text("figures.max_pixels"),
-                    value=form_spec.max_pixels,
-                    precision=0,
-                )
-            refresh_button = ui.button(
-                translator.text("figures.refresh_preview")
-            ).mark("figure-refresh-preview")
-            stale_label = ui.label(translator.text("figures.preview_stale"))
-            preview = ui.image().classes("lte-figure-preview")
-            preview.set_visibility(False)
+                with ui.column().classes("lte-figure-style-grid full-width"):
+                    preset = ui.select(
+                        {
+                            "preview": translator.text("figures.preset_preview"),
+                            "publication": translator.text(
+                                "figures.preset_publication"
+                            ),
+                        },
+                        value=form_spec.preset,
+                        label=translator.text("figures.preset"),
+                    ).mark("figure-preset")
+                    dpi = ui.number(
+                        translator.text("figures.dpi"),
+                        value=form_spec.dpi,
+                        precision=0,
+                    ).mark("figure-dpi")
+                    colormap = ui.input(
+                        translator.text("figures.colormap"),
+                        value=form_spec.colormap,
+                    )
+                    with ui.row().classes("lte-figure-style-pair full-width"):
+                        azimuth = ui.number(
+                            translator.text("figures.azimuth"),
+                            value=form_spec.azimuth,
+                        )
+                        elevation = ui.number(
+                            translator.text("figures.elevation"),
+                            value=form_spec.elevation_angle,
+                        )
+                    vertical = ui.number(
+                        translator.text("figures.vertical_exaggeration"),
+                        value=form_spec.vertical_exaggeration,
+                    )
+                    with ui.row().classes("lte-figure-style-pair full-width"):
+                        station_color = ui.input(
+                            translator.text("figures.station_color"),
+                            value=form_spec.station_color,
+                        )
+                        station_size = ui.number(
+                            translator.text("figures.station_size"),
+                            value=form_spec.station_size,
+                        )
+                    title = ui.input(
+                        translator.text("figures.figure_title"),
+                        value=form_spec.title or "",
+                    )
+                    max_pixels = ui.number(
+                        translator.text("figures.max_pixels"),
+                        value=form_spec.max_pixels,
+                        precision=0,
+                    )
 
         with ui.card().classes("lte-figure-export full-width"):
-            ui.label(translator.text("figures.final_export")).classes(
-                "lte-section-title"
-            )
-            for token in FIGURE_FORMAT_ORDER:
-                format_boxes[token] = ui.checkbox(
-                    token.upper(),
-                    value=token in requested_initial_formats,
+            with ui.row().classes("lte-figure-panel-header full-width"):
+                ui.label(translator.text("figures.final_export")).classes(
+                    "lte-section-title"
                 )
-            export_button = ui.button(
-                translator.text("figures.export")
-            ).mark("figure-export")
+                ui.label(translator.text("figures.export_summary")).classes(
+                    "lte-figure-section-note"
+                )
+            with ui.row().classes("lte-figure-export-controls full-width"):
+                with ui.row().classes("lte-figure-format-list"):
+                    for token in FIGURE_FORMAT_ORDER:
+                        format_boxes[token] = ui.checkbox(
+                            token.upper(),
+                            value=token in requested_initial_formats,
+                        )
+                ui.space()
+                export_button = ui.button(
+                    translator.text("figures.export")
+                ).mark("figure-export")
             destination_label = ui.label(
                 translator.text(
                     "figures.destination",
-                    path=(
-                        str(controller.output_root)
-                        if controller.output_root is not None
-                        else translator.text("value.none")
-                    ),
+                    path=translator.text("value.none"),
                 )
-            ).classes("lte-path")
-            result_label = ui.label("")
+            ).classes("lte-figure-path")
+            result_label = ui.label("").classes("lte-figure-path")
             error_box = ui.column().classes("lte-figure-errors")
 
     def render_messages() -> None:
@@ -879,11 +967,133 @@ def render_figures_page(
                 else:
                     text = warning
                 ui.label(text).classes("lte-callout lte-callout--warning")
-        with error_box:
-            for error in state.errors:
-                ui.label(
-                    f"{error.get('code', 'figure.error')}: {error.get('message', '')}"
-                ).classes("lte-validation-result lte-validation-result--error")
+        if state.source_error is None:
+            with error_box:
+                for error in state.errors:
+                    ui.label(
+                        f"{error.get('code', 'figure.error')}: "
+                        f"{error.get('message', '')}"
+                    ).classes("lte-validation-result lte-validation-result--error")
+
+    def sync_controls(state: FigurePageState | None = None) -> None:
+        current = controller.state if state is None else state
+        running = current.phase in {"loading", "previewing", "exporting"}
+        valid_source = (
+            isinstance(current.source, FigureSource) and not current.source_dirty
+        )
+        has_dem = valid_source and current.source.dem_path is not None
+
+        for control in (source_input, load_button, current_button):
+            if control is None:
+                continue
+            if running:
+                control.disable()
+            else:
+                control.enable()
+        for control in (refresh_button, export_button):
+            if has_dem and not running:
+                control.enable()
+            else:
+                control.disable()
+
+        source_status.set_visibility(valid_source)
+        source_identity.set_visibility(valid_source)
+        dirty_label.set_visibility(current.source_dirty and current.source_error is None)
+        source_error_label.set_visibility(current.source_error is not None)
+        terrain_label.set_visibility(valid_source and not has_dem)
+        empty_source_label.set_visibility(
+            not valid_source
+            and not current.source_dirty
+            and current.source_error is None
+        )
+        if current.source_error is not None:
+            source_error_label.set_text(
+                translator.text(
+                    "figures.source_load_failed",
+                    detail=current.source_error,
+                )
+            )
+
+        if valid_source:
+            assert isinstance(current.source, FigureSource)
+            source_status.set_text(
+                translator.text(
+                    "figures.source_ready",
+                    rect_id=current.source.rectangle["rect_id"],
+                )
+            )
+            identity = (
+                translator.text("figures.current_selection_loaded")
+                if current.source.path is None
+                else translator.text(
+                    "figures.source_loaded_path",
+                    path=str(current.source.path),
+                )
+            )
+            source_identity.set_text(identity)
+            try:
+                destination, _parent = controller._target(current.source)
+            except ValueError:
+                destination_text = translator.text("value.none")
+            else:
+                destination_text = str(destination)
+            destination_label.set_text(
+                translator.text("figures.destination", path=destination_text)
+            )
+        else:
+            destination_label.set_text(
+                translator.text(
+                    "figures.destination",
+                    path=translator.text("value.none"),
+                )
+            )
+            result_label.set_text("")
+
+        if not valid_source:
+            preview.set_visibility(False)
+            preview_empty.set_visibility(True)
+            waiting_key = (
+                "figures.preview_load_to_continue"
+                if current.source_dirty or current.source_error is not None
+                else "figures.preview_waiting"
+            )
+            waiting_text = translator.text(waiting_key)
+            preview_empty.set_text(waiting_text)
+            stale_label.set_text(waiting_text)
+        elif current.preview_path is None:
+            preview.set_visibility(False)
+            preview_empty.set_visibility(True)
+            preview_empty.set_text(translator.text("figures.preview_not_generated"))
+            stale_label.set_text(translator.text("figures.preview_stale"))
+        else:
+            preview_empty.set_visibility(False)
+            if preview_url_builder is not None:
+                preview.set_source(preview_url_builder(current.preview_path))
+                preview.set_visibility(True)
+            stale_label.set_text(
+                translator.text(
+                    "figures.preview_stale"
+                    if current.preview_stale
+                    else "figures.preview_fresh"
+                )
+            )
+        if current.run_path is not None:
+            result_label.set_text(
+                translator.text("figures.exported", path=str(current.run_path))
+            )
+
+    def invalidate_visible_source(error: str | None = None) -> None:
+        detail = (
+            None
+            if error is None
+            else error.strip() or translator.text("figures.source_load_unknown")
+        )
+        try:
+            state = controller.invalidate_source(detail)
+        except RuntimeError:
+            return
+        sync_controls(state)
+        render_messages()
 
     def apply_source(
         source: FigureSource,
@@ -892,27 +1102,13 @@ def render_figures_page(
         source_parent_run_id: str | None = None,
         source_parent_run_path: Path | None = None,
     ) -> None:
-        controller.set_source(
+        state = controller.set_source(
             source,
             output_root=source_output_root,
             parent_run_id=source_parent_run_id,
             parent_run_path=source_parent_run_path,
         )
-        source_status.set_text(
-            translator.text(
-                "figures.source_ready",
-                rect_id=source.rectangle["rect_id"],
-            )
-        )
-        try:
-            destination, _parent = controller._target(source)
-        except ValueError:
-            pass
-        else:
-            destination_label.set_text(
-                translator.text("figures.destination", path=str(destination))
-            )
-        stale_label.set_text(translator.text("figures.preview_stale"))
+        sync_controls(state)
         render_messages()
 
     def load_path(
@@ -921,10 +1117,11 @@ def render_figures_page(
         source_parent_run_id: str | None = None,
         source_parent_run_path: Path | None = None,
     ) -> None:
+        invalidate_visible_source()
         try:
             source = load_figure_source(source_input.value)
         except Exception as exc:
-            ui.notify(str(exc), type="negative")
+            invalidate_visible_source(str(exc))
             return
         apply_source(
             source,
@@ -955,7 +1152,7 @@ def render_figures_page(
         except (TypeError, ValueError) as exc:
             ui.notify(str(exc), type="warning")
             return False
-        stale_label.set_text(translator.text("figures.preview_stale"))
+        sync_controls()
         return True
 
     def apply_preset(value: Any) -> None:
@@ -974,7 +1171,7 @@ def render_figures_page(
         title.value = spec.title or ""
         max_pixels.value = spec.max_pixels
         controller.update_spec(spec)
-        stale_label.set_text(translator.text("figures.preview_stale"))
+        sync_controls()
 
     def refresh_preview() -> None:
         if not changed_spec():
@@ -985,15 +1182,9 @@ def render_figures_page(
             ui.notify(str(exc), type="warning")
             return
         if job is None:
-            state = controller.state
-            if state.preview_path is not None:
-                if preview_url_builder is not None:
-                    preview.set_source(preview_url_builder(state.preview_path))
-                    preview.set_visibility(True)
-                stale_label.set_text(translator.text("figures.preview_fresh"))
+            sync_controls()
             return
-        refresh_button.disable()
-        export_button.disable()
+        sync_controls()
         timer.activate()
 
     def final_export() -> None:
@@ -1007,60 +1198,30 @@ def render_figures_page(
         except (JobBusyError, ValueError) as exc:
             ui.notify(str(exc), type="warning")
             return
-        refresh_button.disable()
-        export_button.disable()
+        sync_controls()
         timer.activate()
 
     def prepare_current_selection() -> None:
+        invalidate_visible_source()
         try:
             controller.prepare_selection(current_session)
         except (JobBusyError, RuntimeError, ValueError) as exc:
-            ui.notify(str(exc), type="warning")
+            invalidate_visible_source(str(exc))
             return
-        load_button.disable()
-        if current_button is not None:
-            current_button.disable()
-        refresh_button.disable()
-        export_button.disable()
+        sync_controls()
         timer.activate()
 
     def tick() -> None:
         state = controller.drain()
         if state.phase in {"loading", "previewing", "exporting"}:
+            sync_controls(state)
             return
         timer.deactivate()
-        load_button.enable()
-        if current_button is not None:
-            current_button.enable()
-        refresh_button.enable()
-        export_button.enable()
-        if isinstance(state.source, FigureSource):
-            source_status.set_text(
-                translator.text(
-                    "figures.source_ready",
-                    rect_id=state.source.rectangle["rect_id"],
-                )
-            )
-            try:
-                destination, _parent = controller._target(state.source)
-            except ValueError:
-                pass
-            else:
-                destination_label.set_text(
-                    translator.text("figures.destination", path=str(destination))
-                )
-        if state.preview_path is not None and not state.preview_stale:
-            if preview_url_builder is not None:
-                preview.set_source(preview_url_builder(state.preview_path))
-                preview.set_visibility(True)
-            stale_label.set_text(translator.text("figures.preview_fresh"))
-        if state.run_path is not None:
-            result_label.set_text(
-                translator.text("figures.exported", path=str(state.run_path))
-            )
+        sync_controls(state)
         render_messages()
 
     load_button.on("click", lambda: load_path())
+    source_input.on_value_change(lambda _event: invalidate_visible_source())
     refresh_button.on("click", refresh_preview)
     export_button.on("click", final_export)
     preset.on_value_change(lambda event: apply_preset(event.value))
@@ -1091,6 +1252,8 @@ def render_figures_page(
             source_parent_run_id=route_parent_run_id,
             source_parent_run_path=route_parent_run_path,
         )
+    else:
+        sync_controls()
     return FigurePageView(controller=controller, timer=timer)
 
 

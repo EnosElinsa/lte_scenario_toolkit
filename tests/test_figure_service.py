@@ -65,6 +65,7 @@ def write_figure_run(
     rectangle_size_m: int = 1000,
     artifacts: list[str] | None = None,
     dem_path: Path | None = None,
+    status: str = "completed",
 ) -> Path:
     run_dir = tmp_path / "run"
     run_dir.mkdir(parents=True)
@@ -115,6 +116,7 @@ def write_figure_run(
                 "run_id": "a" * 32,
                 "scenario_id": "city",
                 "profile_id": "fixture",
+                "status": status,
                 "artifacts": artifacts or ["scenario.csv"],
                 "metadata": metadata,
             }
@@ -238,6 +240,20 @@ def test_run_json_is_an_accepted_source_and_dem_path_is_validated(tmp_path):
     assert source.path == run_dir.resolve()
     assert source.dem_path == dem_path.resolve()
     assert source.run_id == "a" * 32
+
+
+@pytest.mark.parametrize("source_name", [None, "run.json"])
+@pytest.mark.parametrize("status", ["partial", "current"])
+def test_run_source_requires_completed_status(tmp_path, source_name, status):
+    run_dir = write_figure_run(
+        tmp_path,
+        target_crs="EPSG:3857",
+        status=status,
+    )
+    source_path = run_dir if source_name is None else run_dir / source_name
+
+    with pytest.raises(ValueError, match="completed"):
+        FigureService.load_source(source_path)
 
 
 
@@ -557,9 +573,8 @@ def test_render_publishes_partial_run_for_per_format_failure(
             "message": "RuntimeError: HTML failed",
         }
     ]
-    reloaded = FigureService.load_source(run_dir)
-    assert reloaded.rectangle == source.rectangle
-    assert reloaded.dem_path == dem_path.resolve()
+    with pytest.raises(ValueError, match="completed"):
+        FigureService.load_source(run_dir)
 
 
 def test_rendered_selection_run_contains_reloadable_validated_source_snapshot(

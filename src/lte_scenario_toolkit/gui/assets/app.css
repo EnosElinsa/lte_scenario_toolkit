@@ -387,6 +387,7 @@ h3,
 .lte-generate-summary,
 .lte-generate-artifacts,
 .lte-figure-source,
+.lte-figure-preview-card,
 .lte-figure-style,
 .lte-figure-export {
   min-width: 0;
@@ -683,6 +684,12 @@ h3,
   border-left-color: var(--lte-signal);
 }
 
+.lte-callout--error {
+  color: #7b2b2b;
+  background: #f8e5e5;
+  border-left-color: var(--lte-danger);
+}
+
 .lte-confirmation-dialog {
   width: min(460px, calc(100vw - 32px));
   gap: var(--lte-space-3);
@@ -793,6 +800,7 @@ h3,
 .lte-generate-summary,
 .lte-generate-artifacts,
 .lte-figure-source,
+.lte-figure-preview-card,
 .lte-figure-style,
 .lte-figure-export {
   gap: var(--lte-space-3);
@@ -805,13 +813,110 @@ h3,
   font-variant-numeric: tabular-nums;
 }
 
+.lte-figure-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 360px);
+  align-items: stretch;
+  gap: var(--lte-space-4);
+}
+
+.lte-figure-preview-card,
+.lte-figure-style {
+  width: 100%;
+  min-width: 0;
+}
+
+.lte-figure-panel-header {
+  align-items: baseline;
+  justify-content: space-between;
+  min-width: 0;
+  gap: var(--lte-space-2);
+}
+
+.lte-figure-section-note,
+.lte-figure-preview-state,
+.lte-figure-empty-copy {
+  color: var(--lte-ink-muted);
+  font-size: 12px;
+}
+
+.lte-figure-source-actions,
+.lte-figure-export-controls {
+  flex-wrap: wrap;
+  gap: var(--lte-space-3);
+}
+
+.lte-figure-source-actions .q-field {
+  min-width: min(480px, 100%);
+}
+
+.lte-figure-source-status {
+  color: var(--lte-success);
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.lte-figure-source-identity,
+.lte-figure-path {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  color: var(--lte-ink-muted);
+  font-family: "Cascadia Code", "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+}
+
+.lte-figure-preview-surface {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  min-height: 440px;
+  overflow: hidden;
+  background:
+    linear-gradient(rgb(11 48 50 / 3%) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(11 48 50 / 3%) 1px, transparent 1px),
+    #edf0eb;
+  background-size: 24px 24px;
+  border: 1px solid var(--lte-border);
+  border-radius: var(--lte-radius-md);
+}
+
+.lte-figure-preview-empty {
+  max-width: 320px;
+  padding: var(--lte-space-5);
+  color: var(--lte-ink-muted);
+  text-align: center;
+}
+
 .lte-figure-preview {
   width: 100%;
   max-height: 620px;
   object-fit: contain;
-  background: #edf0eb;
-  border: 1px solid var(--lte-border);
-  border-radius: var(--lte-radius-md);
+  background: transparent;
+}
+
+.lte-figure-style-grid {
+  gap: var(--lte-space-3);
+}
+
+.lte-figure-style-grid > .q-field {
+  width: 100%;
+}
+
+.lte-figure-style-pair {
+  align-items: flex-start;
+  flex-wrap: nowrap;
+  gap: var(--lte-space-2);
+}
+
+.lte-figure-style-pair > .q-field {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.lte-figure-format-list {
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--lte-space-3);
 }
 
 .lte-figure-warnings,
@@ -846,6 +951,7 @@ button:disabled,
   .lte-main { padding: 22px 18px 32px; }
   .lte-form-grid { grid-template-columns: 1fr !important; }
   .lte-candidate-workspace { grid-template-columns: 1fr !important; }
+  .lte-figure-workspace { grid-template-columns: 1fr; }
   .lte-candidate-map-card,
   .lte-candidate-inspector { height: auto; }
 }
@@ -927,6 +1033,7 @@ button:disabled,
   .lte-generate-summary,
   .lte-generate-artifacts,
   .lte-figure-source,
+  .lte-figure-preview-card,
   .lte-figure-style,
   .lte-figure-export { padding: 14px; }
 

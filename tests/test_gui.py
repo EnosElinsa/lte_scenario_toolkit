@@ -4068,6 +4068,219 @@ def test_preview_cache_is_explicit_and_style_changes_only_mark_stale(tmp_path):
     assert changed.preview_stale is True
 
 
+def test_figure_controller_invalidate_source_clears_all_exportable_state(tmp_path):
+    from dataclasses import replace
+
+    from lte_scenario_toolkit.gui.pages.figures import FigureController
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    coordinator = JobCoordinator()
+    source = _task15_figure_source(tmp_path)
+    controller = FigureController(
+        tmp_path,
+        coordinator,
+        source=source,
+        output_root=tmp_path / "outputs",
+        parent_run_id="parent-run",
+        parent_run_path=tmp_path / "parent-run",
+    )
+    preview_path = tmp_path / "preview.png"
+    run_path = tmp_path / "figure-run"
+    controller._set_state(
+        replace(
+            controller.state,
+            preview_path=preview_path,
+            preview_stale=False,
+            run_path=run_path,
+        )
+    )
+    revision = controller.state.revision
+    try:
+        state = controller.invalidate_source()
+
+        assert state.source is None
+        assert state.source_dirty is True
+        assert state.source_error is None
+        assert state.preview_path is None
+        assert state.preview_stale is True
+        assert state.run_path is None
+        assert state.revision == revision + 1
+        assert controller.output_root is None
+        assert controller.parent_run_id is None
+        assert controller.parent_run_path is None
+        with pytest.raises(ValueError, match="source"):
+            controller.refresh_preview()
+        with pytest.raises(ValueError, match="source"):
+            controller.export(("png",))
+    finally:
+        controller.close()
+        coordinator.shutdown()
+
+
+def test_failed_current_selection_preparation_remains_fail_closed(tmp_path):
+    from dataclasses import replace
+
+    from lte_scenario_toolkit.gui.pages.figures import FigureController
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    class FailingSelectionService:
+        def prepare_figure_source(self, *_args):
+            raise ValueError("selection source is unavailable")
+
+    coordinator = JobCoordinator()
+    controller = FigureController(
+        tmp_path,
+        coordinator,
+        source=_task15_figure_source(tmp_path),
+        output_root=tmp_path / "old-output",
+    )
+    session = SimpleNamespace(
+        selection_service=FailingSelectionService(),
+        preflight=SimpleNamespace(output_root=tmp_path / "new-output"),
+        scan_result=object(),
+        locked_candidate=object(),
+    )
+    try:
+        controller.invalidate_source()
+        job = controller.prepare_selection(session)
+        assert job.future is not None
+        job.future.result(timeout=2)
+
+        state = controller.drain(job)
+
+        assert state.source is None
+        assert state.source_dirty is True
+        assert state.source_error == "selection source is unavailable"
+        assert state.preview_path is None
+        assert state.run_path is None
+        assert controller.parent_run_id is None
+        assert controller.parent_run_path is None
+        restyled = controller.update_spec(replace(state.spec, dpi=200))
+        assert restyled.source_error == "selection source is unavailable"
+        assert restyled.source_dirty is True
+    finally:
+        controller.close()
+        coordinator.shutdown()
+
+
+async def test_figure_page_invalidates_old_source_on_edit_and_failed_load(
+    tmp_path,
+    monkeypatch,
+    user,
+):
+    from lte_scenario_toolkit.gui.app import create_app
+    from lte_scenario_toolkit.gui.pages import figures
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    source = _task15_figure_source(tmp_path)
+    completed_a = tmp_path / "completed-a"
+    missing_b = tmp_path / "missing-b"
+
+    def load_source(path):
+        if Path(path) == completed_a:
+            return source
+        raise FileNotFoundError(f"Figure source does not exist: {path}")
+
+    monkeypatch.setattr(figures, "load_figure_source", load_source)
+    coordinator = JobCoordinator()
+    try:
+        create_app(
+            catalog=SimpleNamespace(root=tmp_path.resolve()),
+            coordinator=coordinator,
+            testing=True,
+        )
+        await user.open("/figures")
+        source_field = user.find(marker="figure-source-path")
+        source_field.clear().type(str(completed_a))
+        user.find(marker="figure-load-source").click()
+
+        await user.should_see(marker="figure-source-ready", content="Rectangle 1")
+        assert next(iter(user.find(marker="figure-refresh-preview").elements)).enabled
+        assert next(iter(user.find(marker="figure-export").elements)).enabled
+
+        source_field.clear().type(str(missing_b))
+
+        await user.should_see(marker="figure-source-dirty", content="Load to continue")
+        await user.should_not_see(marker="figure-source-ready")
+        await user.should_not_see(marker="figure-preview-surface")
+        assert not next(
+            iter(user.find(marker="figure-refresh-preview").elements)
+        ).enabled
+        assert not next(iter(user.find(marker="figure-export").elements)).enabled
+
+        user.find(marker="figure-load-source").click()
+
+        await user.should_see(
+            marker="figure-source-error",
+            content="Figure source does not exist",
+        )
+        await user.should_not_see(marker="figure-source-ready")
+        assert not next(iter(user.find(marker="figure-export").elements)).enabled
+        assert coordinator.snapshot().active is False
+    finally:
+        coordinator.shutdown()
+
+
+async def test_figure_page_shows_loaded_no_dem_reason_and_no_legacy_controls(
+    tmp_path,
+    monkeypatch,
+    user,
+):
+    from dataclasses import replace
+
+    from lte_scenario_toolkit.gui.app import create_app
+    from lte_scenario_toolkit.gui.pages import figures
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    source = replace(_task15_figure_source(tmp_path), dem_path=None)
+    completed = tmp_path / "completed-without-dem"
+    monkeypatch.setattr(figures, "load_figure_source", lambda _path: source)
+    coordinator = JobCoordinator()
+    try:
+        create_app(
+            catalog=SimpleNamespace(root=tmp_path.resolve()),
+            coordinator=coordinator,
+            testing=True,
+        )
+        await user.open("/figures")
+        user.find(marker="figure-source-path").clear().type(str(completed))
+        user.find(marker="figure-load-source").click()
+
+        await user.should_see(marker="figure-source-ready", content="Rectangle 1")
+        await user.should_see(
+            marker="figure-terrain-unavailable",
+            content="Terrain data is unavailable",
+        )
+        assert not next(
+            iter(user.find(marker="figure-refresh-preview").elements)
+        ).enabled
+        assert not next(iter(user.find(marker="figure-export").elements)).enabled
+        await user.should_not_see(marker="figure-csv-source")
+        await user.should_not_see(marker="figure-attach-dem")
+        await user.should_not_see("Attach DEM")
+        await user.should_not_see("CSV file")
+    finally:
+        coordinator.shutdown()
+
+
+def test_figure_workspace_css_has_bounded_sidebar_and_responsive_stack():
+    css = (ROOT / "src/lte_scenario_toolkit/gui/assets/app.css").read_text(
+        encoding="utf-8"
+    )
+
+    workspace = re.search(r"\.lte-figure-workspace\s*\{(?P<body>[^}]+)\}", css)
+    assert workspace is not None
+    assert "grid-template-columns: minmax(0, 1fr) minmax(300px, 360px);" in (
+        workspace.group("body")
+    )
+    assert "overflow-wrap: anywhere;" in css
+    responsive = css[css.index("@media (max-width: 980px)") :]
+    assert re.search(
+        r"\.lte-figure-workspace\s*\{[^}]*grid-template-columns: 1fr",
+        responsive,
+    )
+
+
 def _task15_figure_source(tmp_path):
     import geopandas as gpd
     import pandas as pd
