@@ -17,6 +17,16 @@ from typing import Any
 from ...figure_service import FigureSpec
 from ...io import atomic_write_json
 from ...run_service import RunEntry, RunService
+from ..presentation import (
+    ActionSpec,
+    render_action_bar,
+    render_empty_state,
+    render_loading_state,
+    render_page_header,
+    render_status_badge,
+    render_technical_details,
+    run_state_presentation,
+)
 
 HISTORY_INDEX_RELATIVE_PATH = Path(".lte-data") / "cache" / "history-index.json"
 
@@ -178,7 +188,8 @@ def _mapping_field(metadata: Mapping[str, Any], name: str) -> Mapping[str, Any]:
 def _figure_source_path(path: Path, record: Mapping[str, Any]) -> Path:
     """Return the current run directory used as a Figures source."""
 
-    del record
+    if record.get("status") != "completed":
+        raise ValueError("figure source run must be completed")
     return path
 
 
@@ -264,7 +275,8 @@ def _row_from_entry(entry: RunEntry) -> HistoryRow:
     )
     _, missing = _requested_and_missing(metadata, artifacts)
     has_csv = any(Path(artifact).suffix.casefold() == ".csv" for artifact in artifacts)
-    source_path = _figure_source_path(path, record) if has_csv else None
+    is_completed_source = has_csv and record.get("status") == "completed"
+    source_path = _figure_source_path(path, record) if is_completed_source else None
     retry_formats = _retry_formats(metadata, missing)
     if retry_formats:
         try:
@@ -287,7 +299,7 @@ def _row_from_entry(entry: RunEntry) -> HistoryRow:
         errors=errors,
         record=_freeze(record),
         reference=reference,
-        figure_source_reference=reference if has_csv else None,
+        figure_source_reference=reference if is_completed_source else None,
         figure_source_path=source_path,
         missing_artifacts=missing,
         retry_formats=retry_formats,
@@ -701,14 +713,90 @@ def _translated(translator: Any, key: str, fallback: str, **values: Any) -> str:
         return fallback.format(**values)
 
 
-def render_history_page(
+def render_history_frame(ui: Any, translator: Any) -> Any:
+    """Render the stable History heading and return its replaceable content holder."""
+
+    with ui.column().classes("lte-page lte-history-page"):
+        render_page_header(
+            ui,
+            _translated(translator, "history.title", "Run History"),
+            _translated(
+                translator,
+                "history.subtitle",
+                "Published selection and derived figure runs from local output roots.",
+            ),
+            (
+                ActionSpec(
+                    "refresh",
+                    _translated(translator, "action.refresh", "Refresh"),
+                    ui.navigate.reload,
+                    marker="history-refresh",
+                ),
+            ),
+        )
+        return ui.column().classes("lte-history-content full-width").mark(
+            "history-content"
+        )
+
+
+def render_history_loading(ui: Any, translator: Any) -> Any:
+    """Render History immediately with a durable loading surface."""
+
+    holder = render_history_frame(ui, translator)
+    with holder:
+        render_loading_state(
+            ui,
+            _translated(translator, "history.loading", "Loading run history"),
+            marker="history-loading",
+        )
+    return holder
+
+
+def render_history_error(
     ui: Any,
     translator: Any,
-    repo_root: str | os.PathLike[str],
-    output_roots: Iterable[str | os.PathLike[str]],
+    holder: Any,
+    error: Exception,
+) -> None:
+    """Replace only History content with human recovery and collapsed diagnostics."""
+
+    holder.clear()
+    with holder:
+        with ui.column().classes("lte-history-load-error lte-callout lte-callout--error"):
+            ui.label(
+                _translated(
+                    translator,
+                    "history.load_failed",
+                    "Run history could not be loaded.",
+                )
+            ).classes("lte-section-title").mark("history-load-error")
+            ui.label(
+                _translated(
+                    translator,
+                    "history.load_failed_recovery",
+                    "Check the configured output folders, then refresh this page.",
+                )
+            ).classes("lte-page-subtitle")
+
+        def render_error_detail() -> None:
+            ui.label(f"{type(error).__name__}: {error}").classes(
+                "lte-technical-copy"
+            ).mark("history-load-error-technical-copy")
+
+        render_technical_details(
+            ui,
+            _translated(translator, "history.technical_details", "Technical details"),
+            render_error_detail,
+            marker="history-load-error-technical",
+        )
+
+
+def render_history_content(
+    ui: Any,
+    translator: Any,
+    holder: Any,
+    current_snapshot: HistorySnapshot,
     *,
-    index_path: str | os.PathLike[str] | None = None,
-    snapshot: HistorySnapshot | None = None,
     on_reveal: Callable[[Path], None] | None = None,
     on_open_figures: Callable[[Path, Path, str, Path, FigureSpec | None], None]
     | None = None,
@@ -716,22 +804,8 @@ def render_history_page(
         [Path, Path, str, Path, tuple[str, ...], FigureSpec | None], None
     ]
     | None = None,
-) -> HistorySnapshot:
-    """Synchronously rebuild and render History from live run manifests."""
-
-    if snapshot is None:
-        current_snapshot = rebuild_history(
-            repo_root,
-            output_roots,
-            index_path=index_path,
-        )
-    else:
-        repository = _canonical_root(repo_root)
-        expected_roots = history_roots(repository, output_roots)
-        expected_index = _requested_index_path(repository, index_path)
-        if snapshot.roots != expected_roots or snapshot.index_path != expected_index:
-            raise ValueError("history snapshot does not match this page request")
-        current_snapshot = snapshot
+) -> None:
+    """Replace History content with one validated snapshot."""
 
     def notify_action_error(exc: Exception) -> None:
         ui.notify(str(exc), type="negative")
@@ -758,7 +832,7 @@ def render_history_page(
             ui.code(
                 json.dumps(_thaw(target.record), ensure_ascii=False, indent=2),
                 language="json",
-            ).classes("w-full")
+            ).classes("w-full lte-technical-copy")
             ui.button(
                 _translated(translator, "action.close", "Close"),
                 on_click=dialog.close,
@@ -791,6 +865,12 @@ def render_history_page(
             target = resolve_history_action(row, HistoryAction.RETRY_MISSING)
             if on_retry_missing is None:
                 raise HistoryActionError("Artifact retry is unavailable")
+            if (
+                target.destination_root is None
+                or target.derived_parent_run_id is None
+                or target.derived_parent_path is None
+            ):
+                raise HistoryActionError("Figure destination lineage is unavailable")
             on_retry_missing(
                 target.path,
                 target.destination_root,
@@ -802,166 +882,258 @@ def render_history_page(
         except Exception as exc:
             notify_action_error(exc)
 
-    with ui.column().classes("lte-page lte-history-page"):
-        with ui.row().classes("w-full items-center justify-between"):
-            ui.label(_translated(translator, "history.title", "Run History")).classes(
-                "lte-page-title"
-            )
-            ui.button(
-                _translated(translator, "action.refresh", "Refresh"),
-                on_click=ui.navigate.reload,
-            ).props("outline").mark("history-refresh")
-        ui.label(
-            _translated(
-                translator,
-                "history.subtitle",
-                "Published selection and derived figure runs from local output roots.",
-            )
-        ).classes("lte-page-subtitle")
-
+    holder.clear()
+    with holder:
         if current_snapshot.diagnostics:
-            with ui.expansion(
+            ui.label(
+                _translated(
+                    translator,
+                    "history.diagnostic_summary",
+                    "{count} run folders need attention.",
+                    count=len(current_snapshot.diagnostics),
+                )
+            ).classes("lte-callout lte-callout--warning")
+
+            def render_diagnostics() -> None:
+                for diagnostic in current_snapshot.diagnostics:
+                    ui.label(f"{diagnostic.path}: {diagnostic.error}").classes(
+                        "lte-technical-copy"
+                    )
+
+            render_technical_details(
+                ui,
                 _translated(
                     translator,
                     "history.diagnostics",
                     "Discovery diagnostics ({count})",
                     count=len(current_snapshot.diagnostics),
-                )
-            ).classes("lte-callout lte-callout--warning w-full"):
-                for diagnostic in current_snapshot.diagnostics:
-                    ui.label(f"{diagnostic.path}: {diagnostic.error}")
+                ),
+                render_diagnostics,
+                marker="history-diagnostics-technical",
+            )
 
         if not current_snapshot.rows:
-            ui.label(
+            render_empty_state(
+                ui,
+                _translated(translator, "history.empty", "No published runs were found."),
                 _translated(
                     translator,
-                    "history.empty",
-                    "No published runs were found.",
-                )
-            ).classes("lte-callout")
+                    "history.empty_body",
+                    "Generated scenario and figure runs will appear here.",
+                ),
+                marker="history-empty",
+            )
 
-        for row in current_snapshot.rows:
-            root_digest = hashlib.sha256(
-                _path_identity(row.root).encode("utf-8")
-            ).hexdigest()[:8]
-            with ui.card().classes("w-full lte-scenario-card").mark(
-                f"history-row-{root_digest}-{row.run_id}"
-            ):
-                with ui.row().classes("w-full items-center justify-between"):
-                    ui.label(f"{row.scenario_id} / {row.profile_id}").classes(
-                        "lte-card-title"
-                    )
-                    ui.label(translator.text(f"status.{row.status}")).classes(
-                        "lte-status-chip"
-                    )
-                ui.label(row.local_created_at).classes("lte-card-id")
-                ui.label(
-                    _translated(
-                        translator,
-                        "history.run",
-                        "Run: {value}",
-                        value=row.run_id,
-                    )
-                ).classes("lte-card-id")
-                ui.label(
-                    _translated(
-                        translator,
-                        "history.parent",
-                        "Parent: {value}",
-                        value=row.parent_run_id or "-",
-                    )
-                ).classes("lte-card-id")
-                ui.label(
-                    _translated(
-                        translator,
-                        "history.artifacts",
-                        "Artifacts: {value}",
-                        value=(", ".join(row.artifacts) if row.artifacts else "-"),
-                    )
-                ).classes("lte-page-subtitle")
-                if row.parameters:
-                    ui.label(
-                        _translated(
-                            translator,
-                            "history.parameters",
-                            "Parameters: {value}",
-                            value=json.dumps(
-                                _thaw(row.parameters),
-                                ensure_ascii=False,
-                                sort_keys=True,
-                            ),
-                        )
-                    ).classes("lte-page-subtitle")
-                if row.candidate:
-                    ui.label(
-                        _translated(
-                            translator,
-                            "history.candidate",
-                            "Candidate: {value}",
-                            value=json.dumps(
-                                _thaw(row.candidate),
-                                ensure_ascii=False,
-                                sort_keys=True,
-                            ),
-                        )
-                    ).classes("lte-page-subtitle")
-                if row.missing_artifacts:
-                    ui.label(
-                        _translated(
-                            translator,
-                            "history.missing",
-                            "Missing outputs: {value}",
-                            value=", ".join(row.missing_artifacts),
-                        )
-                    ).classes("lte-page-subtitle")
-                    if any(
-                        token in {"csv", "preview_png"}
-                        for token in row.missing_artifacts
-                    ):
-                        ui.label(
-                            _translated(
+        with ui.column().classes("lte-history-list"):
+            for row in current_snapshot.rows:
+                root_digest = hashlib.sha256(
+                    _path_identity(row.root).encode("utf-8")
+                ).hexdigest()[:8]
+                with ui.card().classes("lte-history-card").mark(
+                    f"history-row-{root_digest}-{row.run_id}"
+                ):
+                    with ui.column().classes("lte-history-primary"):
+                        with ui.row().classes("lte-history-card-heading"):
+                            with ui.column().classes("lte-history-card-identity"):
+                                ui.label(
+                                    f"{row.scenario_id} / {row.profile_id}"
+                                ).classes("lte-card-title").mark(
+                                    f"history-primary-{row.run_id}"
+                                )
+                                ui.label(row.local_created_at).classes(
+                                    "lte-history-time"
+                                )
+                            render_status_badge(
+                                ui,
                                 translator,
-                                "history.selection_rerun",
-                                "CSV and 2D preview outputs require rerunning selection.",
+                                run_state_presentation(row.status),
+                                marker=f"history-status-{row.run_id}",
                             )
-                        ).classes("lte-callout lte-callout--warning")
-                if row.errors:
-                    with ui.expansion(
-                        _translated(translator, "history.errors", "Run errors")
-                    ):
-                        ui.code(
-                            json.dumps(_thaw(row.errors), ensure_ascii=False, indent=2),
-                            language="json",
+                        with ui.row().classes("lte-history-summary-grid"):
+                            count = len(row.artifacts)
+                            ui.label(
+                                _translated(
+                                    translator,
+                                    (
+                                        "history.artifact_count.one"
+                                        if count == 1
+                                        else "history.artifact_count.many"
+                                    ),
+                                    "{count} artifact" if count == 1 else "{count} artifacts",
+                                    count=count,
+                                )
+                            ).classes("lte-history-summary-item").mark(
+                                f"history-artifact-count-{row.run_id}"
+                            )
+                            ui.label(
+                                _translated(
+                                    translator,
+                                    (
+                                        "history.parent_relationship.derived"
+                                        if row.parent_run_id
+                                        else "history.parent_relationship.original"
+                                    ),
+                                    (
+                                        "Derived from an earlier run"
+                                        if row.parent_run_id
+                                        else "Original scenario run"
+                                    ),
+                                )
+                            ).classes("lte-history-summary-item").mark(
+                                f"history-lineage-{row.run_id}"
+                            )
+                            if row.errors:
+                                ui.label(
+                                    _translated(
+                                        translator,
+                                        (
+                                            "history.error_count.one"
+                                            if len(row.errors) == 1
+                                            else "history.error_count.many"
+                                        ),
+                                        (
+                                            "1 issue recorded"
+                                            if len(row.errors) == 1
+                                            else "{count} issues recorded"
+                                        ),
+                                        count=len(row.errors),
+                                    )
+                                ).classes(
+                                    "lte-history-summary-item lte-history-summary-item--warning"
+                                ).mark(f"history-error-summary-{row.run_id}")
+                        actions = [
+                            ActionSpec(
+                                "inspect",
+                                _translated(translator, "action.inspect", "Inspect"),
+                                lambda current=row: inspect(current),
+                                role="primary",
+                                marker=f"history-inspect-{row.run_id}",
+                            )
+                        ]
+                        if row.can_open_figures:
+                            actions.append(
+                                ActionSpec(
+                                    "open",
+                                    _translated(
+                                        translator,
+                                        "action.open_figures",
+                                        "Open in Figures",
+                                    ),
+                                    lambda current=row: open_figures(current),
+                                    role="primary",
+                                    marker=f"history-open-{row.run_id}",
+                                )
+                            )
+                        if row.can_retry_missing:
+                            actions.append(
+                                ActionSpec(
+                                    "retry",
+                                    _translated(
+                                        translator,
+                                        "action.retry_missing",
+                                        "Retry Missing Artifacts",
+                                    ),
+                                    lambda current=row: retry_missing(current),
+                                    role="primary",
+                                    marker=f"history-retry-{row.run_id}",
+                                )
+                            )
+                        actions.append(
+                            ActionSpec(
+                                "reveal",
+                                _translated(
+                                    translator,
+                                    "action.reveal_directory",
+                                    "Reveal Directory",
+                                ),
+                                lambda current=row: reveal(current),
+                                marker=f"history-reveal-{row.run_id}",
+                            )
                         )
-                with ui.row().classes("lte-card-actions"):
-                    ui.button(
+                        render_action_bar(
+                            ui,
+                            actions,
+                            marker=f"history-actions-{row.run_id}",
+                        )
+
+                    technical_payload = {
+                        "run_id": row.run_id,
+                        "parent_run_id": row.parent_run_id,
+                        "root": str(row.root),
+                        "path": str(row.path),
+                        "artifacts": row.artifacts,
+                        "missing_artifacts": row.missing_artifacts,
+                        "parameters": _thaw(row.parameters),
+                        "candidate": _thaw(row.candidate),
+                        "errors": _thaw(row.errors),
+                        "record": _thaw(row.record),
+                    }
+
+                    def render_row_details(
+                        payload: dict[str, Any] = technical_payload,
+                        run_id: str = row.run_id,
+                    ) -> None:
+                        ui.code(
+                            json.dumps(payload, ensure_ascii=False, indent=2),
+                            language="json",
+                        ).classes("lte-technical-copy").mark(
+                            f"history-technical-copy-{run_id}"
+                        )
+
+                    render_technical_details(
+                        ui,
                         _translated(
                             translator,
-                            "action.reveal_directory",
-                            "Reveal Directory",
+                            "history.technical_details",
+                            "Technical details",
                         ),
-                        on_click=lambda current=row: reveal(current),
-                    ).props("outline")
-                    ui.button(
-                        _translated(translator, "action.inspect", "Inspect"),
-                        on_click=lambda current=row: inspect(current),
-                    ).props("outline")
-                    ui.button(
-                        _translated(
-                            translator,
-                            "action.open_figures",
-                            "Open in Figures",
-                        ),
-                        on_click=lambda current=row: open_figures(current),
-                    ).props("outline").set_enabled(row.can_open_figures)
-                    ui.button(
-                        _translated(
-                            translator,
-                            "action.retry_missing",
-                            "Retry Missing Artifacts",
-                        ),
-                        on_click=lambda current=row: retry_missing(current),
-                    ).props("outline").set_enabled(row.can_retry_missing)
+                        render_row_details,
+                        marker=f"history-technical-{row.run_id}",
+                    )
+
+
+def render_history_page(
+    ui: Any,
+    translator: Any,
+    repo_root: str | os.PathLike[str],
+    output_roots: Iterable[str | os.PathLike[str]],
+    *,
+    index_path: str | os.PathLike[str] | None = None,
+    snapshot: HistorySnapshot | None = None,
+    on_reveal: Callable[[Path], None] | None = None,
+    on_open_figures: Callable[[Path, Path, str, Path, FigureSpec | None], None]
+    | None = None,
+    on_retry_missing: Callable[
+        [Path, Path, str, Path, tuple[str, ...], FigureSpec | None], None
+    ]
+    | None = None,
+) -> HistorySnapshot:
+    """Synchronously rebuild and render History from live run manifests."""
+
+    if snapshot is None:
+        current_snapshot = rebuild_history(
+            repo_root,
+            output_roots,
+            index_path=index_path,
+        )
+    else:
+        repository = _canonical_root(repo_root)
+        expected_roots = history_roots(repository, output_roots)
+        expected_index = _requested_index_path(repository, index_path)
+        if snapshot.roots != expected_roots or snapshot.index_path != expected_index:
+            raise ValueError("history snapshot does not match this page request")
+        current_snapshot = snapshot
+
+    holder = render_history_frame(ui, translator)
+    render_history_content(
+        ui,
+        translator,
+        holder,
+        current_snapshot,
+        on_reveal=on_reveal,
+        on_open_figures=on_open_figures,
+        on_retry_missing=on_retry_missing,
+    )
     return current_snapshot
 
 
@@ -977,6 +1149,10 @@ __all__ = [
     "history_roots",
     "history_rows",
     "rebuild_history",
+    "render_history_content",
+    "render_history_error",
+    "render_history_frame",
+    "render_history_loading",
     "render_history_page",
     "resolve_history_action",
     "resolve_history_reference",

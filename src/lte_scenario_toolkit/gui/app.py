@@ -42,7 +42,12 @@ from .pages.generate import (
     render_generate_page,
     render_generation_unavailable,
 )
-from .pages.history import rebuild_history, render_history_page
+from .pages.history import (
+    rebuild_history,
+    render_history_content,
+    render_history_error,
+    render_history_loading,
+)
 from .pages.scenarios import (
     get_job_coordinator,
     render_scenarios_page,
@@ -326,8 +331,8 @@ def create_app(
     def render_shell(
         active_route: str,
         page_context_key: str,
-        body: Callable[[Translator], None],
-    ) -> None:
+        body: Callable[[Translator], Any],
+    ) -> Any:
         settings = store.load()
         translator = Translator(settings.language)
 
@@ -348,7 +353,7 @@ def create_app(
             on_language_change=change_language,
         )
         with content:
-            body(translator)
+            return body(translator)
 
     def candidate_asset_url(path: Path) -> str:
         resolved = _resolve_allowlisted_file(
@@ -724,32 +729,51 @@ def create_app(
         from nicegui import run
 
         roots = history_output_roots()
-        snapshot = await run.io_bound(rebuild_history, repo_root, roots)
-        render_shell(
+        history_translator: Translator | None = None
+
+        def loading_body(translator: Translator) -> Any:
+            nonlocal history_translator
+            history_translator = translator
+            return render_history_loading(ui, translator)
+
+        holder = render_shell(
             "/history",
             "history.title",
-            lambda translator: render_history_page(
-                ui,
-                translator,
-                repo_root,
-                roots,
-                snapshot=snapshot,
-                on_reveal=reveal_directory,
-                on_open_figures=lambda path, root, parent, parent_path, figure_spec: open_history_source(
-                    path,
-                    root,
-                    parent,
-                    parent_path,
-                    figure_spec=figure_spec,
-                ),
-                on_retry_missing=lambda path, root, parent, parent_path, formats, figure_spec: open_history_source(
-                    path,
-                    root,
-                    parent,
-                    parent_path,
-                    formats,
-                    figure_spec,
-                ),
+            loading_body,
+        )
+        assert history_translator is not None
+        client = ui.context.client
+        await client.connected()
+        if client.is_deleted:
+            return
+        try:
+            snapshot = await run.io_bound(rebuild_history, repo_root, roots)
+        except Exception as error:
+            if not client.is_deleted:
+                render_history_error(ui, history_translator, holder, error)
+            return
+        if client.is_deleted:
+            return
+        render_history_content(
+            ui,
+            history_translator,
+            holder,
+            snapshot,
+            on_reveal=reveal_directory,
+            on_open_figures=lambda path, root, parent, parent_path, figure_spec: open_history_source(
+                path,
+                root,
+                parent,
+                parent_path,
+                figure_spec=figure_spec,
+            ),
+            on_retry_missing=lambda path, root, parent, parent_path, formats, figure_spec: open_history_source(
+                path,
+                root,
+                parent,
+                parent_path,
+                formats,
+                figure_spec,
             ),
         )
 

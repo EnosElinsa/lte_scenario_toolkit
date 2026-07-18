@@ -386,6 +386,7 @@ h3,
 .lte-candidate-filmstrip,
 .lte-generate-summary,
 .lte-generate-artifacts,
+.lte-history-card,
 .lte-figure-source,
 .lte-figure-preview-card,
 .lte-figure-style,
@@ -888,10 +889,133 @@ h3,
   padding: var(--lte-space-4);
 }
 
-.lte-artifact-status {
+.lte-generation-phase {
+  align-items: center;
+  min-height: 34px;
+  gap: var(--lte-space-2);
+}
+
+.lte-generation-artifact-list,
+.lte-history-content,
+.lte-history-list {
+  width: 100%;
+  min-width: 0;
+  gap: var(--lte-space-3);
+}
+
+.lte-generation-artifact-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  width: 100%;
+  min-width: 0;
+  gap: var(--lte-space-3);
+  padding: 13px 14px;
+  background: #f7f7f2;
+  border: 1px solid var(--lte-border);
+  border-radius: var(--lte-radius-sm);
+}
+
+.lte-generation-artifact-copy {
+  min-width: 0;
+  gap: 1px;
+}
+
+.lte-generation-artifact-name {
+  color: var(--lte-ink);
+  font-weight: 670;
+}
+
+.lte-generation-artifact-description {
+  overflow-wrap: anywhere;
   color: var(--lte-ink-muted);
   font-size: 12px;
-  font-variant-numeric: tabular-nums;
+}
+
+.lte-format-badge {
+  min-width: 44px;
+  justify-content: center;
+  color: #244745;
+  background: #e7ebe6;
+  border: 1px solid var(--lte-border);
+  border-radius: var(--lte-radius-sm);
+  font-family: "Cascadia Code", "Cascadia Mono", Consolas, monospace;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+}
+
+.lte-generation-artifact-status {
+  min-width: 92px;
+  justify-content: flex-end;
+}
+
+.lte-generation-actions {
+  width: 100%;
+  flex-wrap: wrap;
+}
+
+.lte-history-load-error { gap: var(--lte-space-2); }
+
+.lte-history-card {
+  width: 100%;
+  min-width: 0;
+  gap: var(--lte-space-3);
+  padding: 18px;
+  border-left: 3px solid var(--lte-accent);
+}
+
+.lte-history-primary {
+  width: 100%;
+  min-width: 0;
+  gap: var(--lte-space-3);
+}
+
+.lte-history-card-heading {
+  align-items: flex-start;
+  justify-content: space-between;
+  width: 100%;
+  min-width: 0;
+  gap: var(--lte-space-3);
+}
+
+.lte-history-card-identity { min-width: 0; gap: 2px; }
+
+.lte-history-time {
+  color: var(--lte-ink-muted);
+  font-family: "Cascadia Code", "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.lte-history-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, auto));
+  width: 100%;
+  min-width: 0;
+  gap: var(--lte-space-2) var(--lte-space-4);
+}
+
+.lte-history-summary-item {
+  overflow-wrap: anywhere;
+  color: var(--lte-ink-muted);
+  font-size: 12px;
+}
+
+.lte-history-summary-item--warning {
+  color: #7a4818;
+  font-weight: 650;
+}
+
+.lte-history-card .lte-technical-details {
+  width: 100%;
+  box-shadow: none;
+}
+
+.lte-history-card .lte-technical-copy,
+.lte-history-load-error + .lte-technical-details .lte-technical-copy {
+  max-width: 100%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .lte-figure-workspace {
@@ -1033,6 +1157,7 @@ button:disabled,
   .lte-form-grid { grid-template-columns: 1fr !important; }
   .lte-candidate-workspace { grid-template-columns: 1fr; }
   .lte-figure-workspace { grid-template-columns: 1fr; }
+  .lte-history-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .lte-candidate-map-card { height: min(70vh, 700px); }
   .lte-candidate-inspector { max-height: none; }
 }
@@ -1112,6 +1237,7 @@ button:disabled,
   .lte-candidate-filmstrip,
   .lte-generate-summary,
   .lte-generate-artifacts,
+  .lte-history-card,
   .lte-figure-source,
   .lte-figure-preview-card,
   .lte-figure-style,
@@ -1128,6 +1254,18 @@ button:disabled,
   .lte-action-bar .q-btn { flex: 1 1 auto; }
   .lte-profile-management .lte-action-bar .q-btn { flex: 1 1 44%; }
   .lte-output-row .q-btn { flex: 1 1 100%; }
+
+  .lte-generation-artifact-row {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+  }
+
+  .lte-generation-artifact-status {
+    grid-column: 2 / -1;
+    min-width: 0;
+    justify-content: flex-start;
+  }
+
+  .lte-history-summary-grid { grid-template-columns: minmax(0, 1fr); }
 
   .lte-candidate-map-wrap,
   .lte-candidate-map { min-height: 420px; }
@@ -1148,6 +1286,27 @@ button:disabled,
 }
 
 @media (max-width: 390px) {
+  .lte-generate-page,
+  .lte-history-page,
+  .lte-generation-artifact-row,
+  .lte-history-card,
+  .lte-history-primary,
+  .lte-history-content,
+  .lte-history-list {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    overflow-x: clip;
+  }
+
+  .lte-generation-artifact-row {
+    grid-template-columns: auto minmax(0, 1fr);
+    padding: 12px;
+  }
+
+  .lte-format-badge,
+  .lte-generation-artifact-status { grid-column: 2; }
+
   .lte-web-selector-frame,
   .lte-candidate-page {
     width: 100%;

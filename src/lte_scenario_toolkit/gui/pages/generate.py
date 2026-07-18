@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
@@ -11,6 +12,13 @@ from typing import Any
 
 from ...jobs import Job, JobBusyError, JobCoordinator
 from ...run_service import RunService
+from ..presentation import (
+    PresentationSpec,
+    artifact_label_presentation,
+    artifact_state_presentation,
+    render_status_badge,
+    render_technical_details,
+)
 
 ARTIFACT_ORDER = (
     "csv",
@@ -20,6 +28,20 @@ ARTIFACT_ORDER = (
     "terrain_html",
 )
 _ARTIFACT_SET = frozenset(ARTIFACT_ORDER)
+_ARTIFACT_FORMATS = {
+    "csv": "CSV",
+    "preview_png": "PNG",
+    "terrain_png": "PNG",
+    "terrain_eps": "EPS",
+    "terrain_html": "HTML",
+}
+_GENERATION_PHASES = {
+    "ready": PresentationSpec("generate.phase.ready"),
+    "running": PresentationSpec("generate.phase.running", "active"),
+    "completed": PresentationSpec("generate.phase.completed", "success"),
+    "partial": PresentationSpec("generate.phase.partial", "warning"),
+    "error": PresentationSpec("generate.phase.error", "danger"),
+}
 
 
 def _ordered_artifacts(values: Iterable[str]) -> tuple[str, ...]:
@@ -388,7 +410,7 @@ def render_generate_page(
     )
     model = controller.model
     checkboxes: dict[str, Any] = {}
-    artifact_labels: dict[str, Any] = {}
+    artifact_status_holders: dict[str, Any] = {}
     navigated = False
 
     with ui.column().classes("lte-page lte-generate-page"):
@@ -407,79 +429,144 @@ def render_generate_page(
             ui.label(
                 translator.text("generate.destination", path=str(model.output_root))
             ).classes("lte-path")
+        phase_holder = ui.row().classes("lte-generation-phase")
         with ui.card().classes("lte-generate-artifacts full-width"):
             ui.label(translator.text("generate.artifacts")).classes("lte-section-title")
-            for token in ARTIFACT_ORDER:
-                checkboxes[token] = ui.checkbox(
-                    translator.text(f"generate.artifact.{token}"),
-                    value=True,
-                )
-                artifact_labels[token] = ui.label(
-                    translator.text(
-                        "generate.artifact_status",
-                        artifact=token,
-                        status=translator.text("status.pending"),
-                    )
-                ).classes("lte-artifact-status")
-        message = ui.label("").classes("lte-validation-result")
+            with ui.column().classes("lte-generation-artifact-list"):
+                for token in ARTIFACT_ORDER:
+                    presentation = artifact_label_presentation(token)
+                    with ui.row().classes("lte-generation-artifact-row").mark(
+                        f"generation-artifact-{token}"
+                    ):
+                        checkboxes[token] = (
+                            ui.checkbox(value=True)
+                            .props(
+                                'aria-label="'
+                                + translator.text(presentation.label_key)
+                                + '"'
+                            )
+                            .mark(f"generation-artifact-select-{token}")
+                        )
+                        with ui.column().classes("lte-generation-artifact-copy"):
+                            ui.label(translator.text(presentation.label_key)).classes(
+                                "lte-generation-artifact-name"
+                            )
+                            assert presentation.description_key is not None
+                            ui.label(
+                                translator.text(presentation.description_key)
+                            ).classes("lte-generation-artifact-description")
+                        ui.badge(_ARTIFACT_FORMATS[token]).classes(
+                            "lte-format-badge"
+                        )
+                        holder = ui.row().classes(
+                            "lte-generation-artifact-status"
+                        )
+                        artifact_status_holders[token] = holder
+                        with holder:
+                            render_status_badge(
+                                ui,
+                                translator,
+                                artifact_state_presentation("pending"),
+                                marker=f"generation-artifact-status-{token}",
+                            )
         warning_box = ui.column().classes("lte-generate-warnings")
         error_box = ui.column().classes("lte-generate-errors")
-        submit = ui.button(translator.text("generate.action")).mark(
-            "generation-submit"
+        with ui.row().classes("lte-card-actions lte-generation-actions"):
+            submit = ui.button(translator.text("generate.action")).classes(
+                "lte-action lte-action--primary"
+            ).props("unelevated").mark("generation-submit")
+            if on_open_figures is not None:
+                ui.button(
+                    translator.text("action.open_figures"),
+                    on_click=on_open_figures,
+                ).props("outline").mark("generation-open-figures")
+
+    def render_phase(phase: str) -> None:
+        presentation = _GENERATION_PHASES.get(
+            phase,
+            PresentationSpec("status.unknown"),
         )
-        if on_open_figures is not None:
-            ui.button(
-                translator.text("action.open_figures"),
-                on_click=on_open_figures,
-            ).props("outline").mark("generation-open-figures")
+        phase_holder.clear()
+        with phase_holder:
+            if phase == "running":
+                ui.spinner(size="sm")
+            render_status_badge(
+                ui,
+                translator,
+                presentation,
+                marker="generation-phase",
+            )
+
+    def render_artifact_status(token: str, raw_status: str) -> None:
+        holder = artifact_status_holders[token]
+        holder.clear()
+        with holder:
+            render_status_badge(
+                ui,
+                translator,
+                artifact_state_presentation(raw_status),
+                marker=f"generation-artifact-status-{token}",
+            )
+
+    def render_outcome_details(state: GenerationState) -> None:
+        warning_box.clear()
+        error_box.clear()
+        with warning_box:
+            if state.warnings:
+                ui.label(translator.text("generate.warning.summary")).classes(
+                    "lte-callout lte-callout--warning"
+                )
+        with error_box:
+            if state.phase == "partial":
+                ui.label(translator.text("generate.error.partial")).classes(
+                    "lte-callout lte-callout--error"
+                ).mark("generation-primary-error")
+            elif state.phase == "error":
+                ui.label(translator.text("generate.error.failed")).classes(
+                    "lte-callout lte-callout--error"
+                ).mark("generation-primary-error")
+            if state.errors or state.warnings or state.message:
+                details = {
+                    "run_path": None if state.run_path is None else str(state.run_path),
+                    "message": state.message,
+                    "errors": state.errors,
+                    "warnings": state.warnings,
+                    "artifact_states": state.artifact_states,
+                }
+
+                def render_details() -> None:
+                    ui.code(
+                        json.dumps(details, ensure_ascii=False, indent=2),
+                        language="json",
+                    ).classes("lte-technical-copy").mark(
+                        "generation-technical-copy"
+                    )
+
+                render_technical_details(
+                    ui,
+                    translator.text("generate.technical_details"),
+                    render_details,
+                    marker="generation-technical-details",
+                )
+
+    render_phase("ready")
 
     def tick() -> None:
         nonlocal navigated
         state = controller.drain()
-        for token, label in artifact_labels.items():
-            raw_status = state.artifact_status(token)
-            label.set_text(
-                translator.text(
-                    "generate.artifact_status",
-                    artifact=token,
-                    status=translator.text(
-                        f"status.{raw_status.replace('-', '_')}"
-                    ),
-                )
-            )
+        render_phase(state.phase)
+        for token in artifact_status_holders:
+            render_artifact_status(token, state.artifact_status(token))
         if state.phase == "running":
             return
         timer.deactivate()
         submit.disable()
-        warning_box.clear()
-        error_box.clear()
-        with warning_box:
-            for warning in state.warnings:
-                if warning.get("code") == "generation.settings_failed":
-                    text = translator.text(
-                        "generate.warning.settings_failed",
-                        detail=warning.get("message", ""),
-                    )
-                else:
-                    text = (
-                        f"{warning.get('code', 'generation.warning')}: "
-                        f"{warning.get('message', '')}"
-                    )
-                ui.label(text).classes("lte-callout lte-callout--warning")
-        with error_box:
-            for error in state.errors:
-                ui.label(
-                    f"{error.get('code', 'generation.error')}: "
-                    f"{error.get('message', '')}"
-                ).classes("lte-validation-result lte-validation-result--error")
-        if state.phase in {"completed", "partial"}:
-            message.set_text(translator.text(f"generate.status.{state.phase}"))
+        render_outcome_details(state)
+        if state.phase == "completed":
             if not navigated and on_complete is not None:
                 navigated = True
                 on_complete(state)
             return
-        if state.phase == "error":
-            message.set_text(state.message or translator.text("operation.failed"))
 
     def start() -> None:
         selected = tuple(
@@ -494,7 +581,11 @@ def render_generate_page(
             ui.notify(str(exc), type="warning")
             return
         submit.disable()
-        message.set_text(translator.text("generate.status.running"))
+        for checkbox in checkboxes.values():
+            checkbox.disable()
+        render_phase("running")
+        for token in artifact_status_holders:
+            render_artifact_status(token, controller.state.artifact_status(token))
         timer.activate()
 
     submit.on("click", start)

@@ -4426,6 +4426,140 @@ def test_generation_controller_publishes_partial_record_and_remembers_root(tmp_p
         coordinator.shutdown()
 
 
+async def test_generation_page_uses_semantic_artifact_rows_and_live_partial_state(
+    user,
+    tmp_path,
+):
+    from lte_scenario_toolkit.gui.app import create_app
+    from lte_scenario_toolkit.gui.pages.candidates import CandidateSessionRegistry
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.run_service import RunService
+
+    entered = Event()
+    release = Event()
+
+    class Service:
+        def export(
+            self,
+            preflight,
+            scan_result,
+            candidate,
+            *,
+            output_root,
+            artifacts,
+            entrypoint,
+        ):
+            del scan_result, entrypoint
+            entered.set()
+            assert release.wait(3)
+            service = RunService(output_root)
+            run = service.begin(
+                preflight.profile.scenario_id,
+                preflight.profile.profile_id,
+            )
+            artifact_paths = {
+                "csv": "scenario.csv",
+                "preview_png": "preview.png",
+                "terrain_eps": "terrain.eps",
+                "terrain_html": "terrain.html",
+            }
+            for token, name in artifact_paths.items():
+                (run.path / name).write_bytes(f"{token}\n".encode("ascii"))
+            return service.publish(
+                run,
+                status="partial",
+                artifacts=list(artifact_paths.values()),
+                metadata={
+                    "run_kind": "selection",
+                    "requested_artifacts": list(artifacts),
+                    "artifact_paths": artifact_paths,
+                    "candidate": {
+                        "flat_grid_id": candidate.flat_grid_id,
+                        "point_count": candidate.point_count,
+                        "center_x": candidate.center_x,
+                        "center_y": candidate.center_y,
+                    },
+                },
+                errors=[
+                    {
+                        "artifact": "terrain_png",
+                        "code": "terrain.renderer_failed",
+                        "message": "renderer traceback terrain_png",
+                    }
+                ],
+            )
+
+    coordinator = JobCoordinator()
+    registry = CandidateSessionRegistry()
+    registry.add(_task15_locked_session(tmp_path, Service(), session_id="semantic-run"))
+    create_app(
+        catalog=_Task13Catalog(tmp_path),
+        profile_store=object(),
+        candidate_registry=registry,
+        coordinator=coordinator,
+        testing=True,
+    )
+
+    try:
+        await user.open("/generate/semantic-run")
+        expected = {
+            "csv": ("Scenario CSV", "Station records", "CSV"),
+            "preview_png": ("2D preview", "plan-view image", "PNG"),
+            "terrain_png": ("3D terrain", "raster terrain", "PNG"),
+            "terrain_eps": ("3D terrain", "vector terrain", "EPS"),
+            "terrain_html": ("Interactive terrain", "interactive terrain", "HTML"),
+        }
+        await user.should_see(marker="generation-phase", content="Ready to generate")
+        for token, phrases in expected.items():
+            await user.should_see(marker=f"generation-artifact-{token}")
+            await user.should_see(marker=f"generation-artifact-status-{token}")
+            for phrase in phrases:
+                await user.should_see(phrase)
+            await user.should_not_see(token)
+
+        user.find(marker="generation-submit").click()
+        assert await asyncio.to_thread(entered.wait, 2)
+        await user.should_see(marker="generation-phase", content="Generating artifacts")
+        await user.should_see(
+            marker="shell-job-indicator",
+            content="Scenario generation",
+            retries=12,
+        )
+        assert all(
+            not next(
+                iter(user.find(marker=f"generation-artifact-select-{token}").elements)
+            ).enabled
+            for token in expected
+        )
+        assert not next(iter(user.find(marker="generation-submit").elements)).enabled
+
+        release.set()
+        await user.should_see(marker="generation-phase", content="Some artifacts failed", retries=30)
+        await user.should_see(
+            marker="generation-artifact-status-csv",
+            content="Published",
+        )
+        await user.should_see(
+            marker="generation-artifact-status-terrain_png",
+            content="Failed",
+        )
+        assert user.back_history[-1] != "/history"
+        await user.should_see(
+            marker="generation-primary-error",
+            content="Some artifacts could not be generated",
+        )
+        technical = next(iter(user.find(marker="generation-technical-copy").elements))
+        assert "terrain.renderer_failed" in technical.content
+        assert "terrain_png" in technical.content
+        assert "traceback" in technical.content
+        primary = next(iter(user.find(marker="generation-primary-error").elements))
+        assert "terrain.renderer_failed" not in primary.text
+        assert "terrain_png" not in primary.text
+    finally:
+        release.set()
+        coordinator.shutdown()
+
+
 @pytest.mark.parametrize("result_kind", ["malformed", "escaped"])
 def test_generation_controller_rejects_untrusted_publish_result(tmp_path, result_kind):
     from lte_scenario_toolkit.gui.pages.generate import GenerationController
@@ -4633,6 +4767,85 @@ def test_history_model_includes_partial_and_parent_runs(tmp_path):
     assert derived.figure_source_path == next(
         row.path for row in rows if row.run_id == parent.run_id
     )
+
+
+def test_history_partial_csv_never_becomes_its_own_figure_source(tmp_path):
+    from lte_scenario_toolkit.figure_service import FigureSpec
+    from lte_scenario_toolkit.gui.pages.history import (
+        HistoryAction,
+        HistoryActionError,
+        _figure_source_path,
+        history_rows,
+        resolve_history_action,
+    )
+    from lte_scenario_toolkit.run_service import RunService
+
+    service = RunService(tmp_path / "results")
+    parent = service.begin("city", "default", created_at="2026-07-16T10:00:00Z")
+    (parent.path / "source.csv").write_text("X,Y\n1,2\n", encoding="utf-8")
+    parent_path = service.publish(
+        parent,
+        status="completed",
+        artifacts=["source.csv"],
+        metadata={"run_kind": "selection"},
+    )
+    child = service.begin(
+        "city",
+        "default",
+        created_at="2026-07-16T10:00:01Z",
+        parent_run_id=parent.run_id,
+    )
+    (child.path / "source.csv").write_text("X,Y\n1,2\n", encoding="utf-8")
+    (child.path / "terrain.png").write_bytes(b"png")
+    service.publish(
+        child,
+        status="partial",
+        artifacts=["source.csv", "terrain.png"],
+        metadata={
+            "run_kind": "figure",
+            "source": {"path": str(parent_path), "run_id": parent.run_id},
+            "requested_formats": ["png", "html"],
+            "artifact_paths": {"png": "terrain.png"},
+            "figure_spec": FigureSpec.from_preset("publication").as_dict(),
+        },
+        errors=[{"artifact": "html", "code": "figure.html.failed"}],
+    )
+    orphan = service.begin("city", "default", created_at="2026-07-16T10:00:02Z")
+    (orphan.path / "source.csv").write_text("X,Y\n1,2\n", encoding="utf-8")
+    service.publish(
+        orphan,
+        status="partial",
+        artifacts=["source.csv"],
+        metadata={
+            "run_kind": "selection",
+            "requested_artifacts": ["csv", "terrain_png"],
+            "artifact_paths": {"csv": "source.csv"},
+        },
+        errors=[{"artifact": "terrain_png", "code": "terrain.failed"}],
+    )
+
+    rows = history_rows(service)
+    child_row = next(row for row in rows if row.run_id == child.run_id)
+    orphan_row = next(row for row in rows if row.run_id == orphan.run_id)
+    parent_row = next(row for row in rows if row.run_id == parent.run_id)
+
+    assert child_row.figure_source_path == parent_path.resolve()
+    assert child_row.figure_source_reference is not None
+    assert child_row.figure_source_reference.run_id == parent.run_id
+    assert resolve_history_action(child_row, HistoryAction.RETRY_MISSING).path == parent_path
+    assert resolve_history_action(child_row, HistoryAction.OPEN_FIGURES).path == parent_path
+    assert orphan_row.can_open_figures is False
+    with pytest.raises(HistoryActionError, match="compatible figure source"):
+        resolve_history_action(orphan_row, HistoryAction.OPEN_FIGURES)
+    with pytest.raises(ValueError, match="completed"):
+        _figure_source_path(orphan_row.path, orphan_row.record)
+
+    manifest_path = parent_path / "run.json"
+    downgraded = json.loads(manifest_path.read_text(encoding="utf-8"))
+    downgraded["status"] = "partial"
+    manifest_path.write_text(json.dumps(downgraded), encoding="utf-8")
+    with pytest.raises(HistoryActionError, match="compatible figure source"):
+        resolve_history_action(parent_row, HistoryAction.OPEN_FIGURES)
 
 
 
@@ -5627,6 +5840,194 @@ async def test_task15_output_routes_render_offline(user, tmp_path, monkeypatch):
     await user.should_see("Run History")
     await user.should_see("city", retries=15)
     await user.should_not_see("Delete")
+
+
+async def test_history_route_renders_loading_shell_before_discovery_finishes(
+    user,
+    tmp_path,
+    monkeypatch,
+):
+    import lte_scenario_toolkit.gui.app as app_module
+    from lte_scenario_toolkit.gui.app import create_app
+
+    entered = Event()
+    release = Event()
+    original = app_module.rebuild_history
+
+    def delayed_rebuild(*args, **kwargs):
+        entered.set()
+        assert release.wait(3)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(app_module, "rebuild_history", delayed_rebuild)
+    create_app(
+        catalog=_Task13Catalog(tmp_path),
+        profile_store=object(),
+        testing=True,
+    )
+
+    open_task = asyncio.create_task(user.open("/history"))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        await user.should_see(marker="shell-navigation")
+        await user.should_see("Run History")
+        await user.should_see(marker="history-loading")
+        await user.should_see("Loading run history")
+    finally:
+        release.set()
+        await asyncio.wait_for(open_task, timeout=4)
+
+    await user.should_not_see(marker="history-loading")
+    await user.should_see("No published runs were found")
+
+
+async def test_history_route_replaces_failed_loader_with_durable_recovery(
+    user,
+    tmp_path,
+    monkeypatch,
+):
+    import lte_scenario_toolkit.gui.app as app_module
+    from lte_scenario_toolkit.gui.app import create_app
+
+    entered = Event()
+    release = Event()
+
+    def failed_rebuild(*_args, **_kwargs):
+        entered.set()
+        assert release.wait(3)
+        raise RuntimeError("history index traceback SECRET-PATH")
+
+    monkeypatch.setattr(app_module, "rebuild_history", failed_rebuild)
+    create_app(
+        catalog=_Task13Catalog(tmp_path),
+        profile_store=object(),
+        testing=True,
+    )
+
+    open_task = asyncio.create_task(user.open("/history"))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        await user.should_see(marker="history-loading")
+    finally:
+        release.set()
+        await asyncio.wait_for(open_task, timeout=4)
+
+    await user.should_not_see(marker="history-loading")
+    await user.should_see(
+        marker="history-load-error",
+        content="Run history could not be loaded",
+    )
+    primary = next(iter(user.find(marker="history-load-error").elements))
+    assert "SECRET-PATH" not in primary.text
+    technical = next(
+        iter(user.find(marker="history-load-error-technical-copy").elements)
+    )
+    assert "RuntimeError" in technical.text
+    assert "SECRET-PATH" in technical.text
+    await user.should_see(marker="history-refresh")
+    await user.should_see(marker="shell-menu")
+
+
+async def test_history_cards_prioritize_human_summary_and_gate_retry_action(
+    user,
+    tmp_path,
+):
+    from lte_scenario_toolkit.figure_service import FigureSpec
+    from lte_scenario_toolkit.gui.app import create_app
+    from lte_scenario_toolkit.gui.settings import GuiSettingsStore
+    from lte_scenario_toolkit.run_service import RunService
+
+    run_root = tmp_path / "external-runs"
+    service = RunService(run_root)
+    parent = service.begin("city", "default", created_at="2026-07-16T10:00:00Z")
+    (parent.path / "scenario.csv").write_text("ok\n", encoding="utf-8")
+    parent_path = service.publish(
+        parent,
+        status="completed",
+        artifacts=["scenario.csv"],
+        metadata={
+            "run_kind": "selection",
+            "parameters": {"rectangle_size_m": 2000},
+            "candidate": {"flat_grid_id": 42},
+        },
+    )
+    child = service.begin(
+        "city",
+        "default",
+        created_at="2026-07-16T10:01:00Z",
+        parent_run_id=parent.run_id,
+    )
+    (child.path / "terrain.png").write_bytes(b"png")
+    service.publish(
+        child,
+        status="partial",
+        artifacts=["terrain.png"],
+        metadata={
+            "run_kind": "figure",
+            "source": {"path": str(parent_path), "run_id": parent.run_id},
+            "requested_formats": ["png", "html"],
+            "artifact_paths": {"png": "terrain.png"},
+            "figure_spec": FigureSpec.from_preset("publication").as_dict(),
+        },
+        errors=[
+            {
+                "artifact": "html",
+                "code": "figure.html.failed",
+                "message": "plotly traceback",
+            }
+        ],
+    )
+    GuiSettingsStore(tmp_path).save(language="en", output_roots=[run_root])
+    create_app(
+        catalog=_Task13Catalog(tmp_path),
+        profile_store=object(),
+        testing=True,
+    )
+
+    await user.open("/history")
+    await user.should_see(marker=f"history-primary-{child.run_id}", retries=20)
+    child_primary = next(
+        iter(user.find(marker=f"history-primary-{child.run_id}").elements)
+    )
+    assert "city / default" in child_primary.text
+    status = next(iter(user.find(marker=f"history-status-{child.run_id}").elements))
+    artifact_count = next(
+        iter(user.find(marker=f"history-artifact-count-{child.run_id}").elements)
+    )
+    lineage = next(iter(user.find(marker=f"history-lineage-{child.run_id}").elements))
+    assert status.text == "Partial"
+    assert artifact_count.text == "1 artifact"
+    assert lineage.text == "Derived from an earlier run"
+    primary_copy = " ".join(
+        (child_primary.text, status.text, artifact_count.text, lineage.text)
+    )
+    for machine_detail in (
+        child.run_id,
+        parent.run_id,
+        "terrain.png",
+        "figure.html.failed",
+        "plotly traceback",
+    ):
+        assert machine_detail not in primary_copy
+
+    technical = next(
+        iter(user.find(marker=f"history-technical-copy-{child.run_id}").elements)
+    )
+    assert child.run_id in technical.content
+    assert parent.run_id in technical.content
+    assert "terrain.png" in technical.content
+    assert "figure.html.failed" in technical.content
+    await user.should_see(marker=f"history-inspect-{child.run_id}")
+    await user.should_see(marker=f"history-open-{child.run_id}")
+    await user.should_see(marker=f"history-reveal-{child.run_id}")
+    await user.should_see(marker=f"history-retry-{child.run_id}")
+    await user.should_not_see(marker=f"history-retry-{parent.run_id}")
+    inspect = next(iter(user.find(marker=f"history-inspect-{child.run_id}").elements))
+    open_figures = next(iter(user.find(marker=f"history-open-{child.run_id}").elements))
+    reveal = next(iter(user.find(marker=f"history-reveal-{child.run_id}").elements))
+    assert "outline" not in inspect.props
+    assert "outline" not in open_figures.props
+    assert "outline" in reveal.props
 
 
 async def test_offline_candidate_to_history_flow(user, tmp_path, monkeypatch):
