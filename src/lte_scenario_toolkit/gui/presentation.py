@@ -53,6 +53,7 @@ _CACHE: Final = {
     "none": PresentationSpec("cache.none"),
     "hit": PresentationSpec("cache.hit", "success"),
     "miss": PresentationSpec("cache.miss", "info"),
+    "forced": PresentationSpec("cache.forced", "info"),
 }
 
 _SCAN_MODES: Final = {

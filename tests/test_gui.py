@@ -135,11 +135,13 @@ def test_presentation_mappings_cover_current_gui_machine_values():
         ),
     }
     assert {
-        value: module.cache_presentation(value) for value in ("none", "hit", "miss")
+        value: module.cache_presentation(value)
+        for value in ("none", "hit", "miss", "forced")
     } == {
         "none": spec("cache.none"),
         "hit": spec("cache.hit", "success"),
         "miss": spec("cache.miss", "info"),
+        "forced": spec("cache.forced", "info"),
     }
     assert {
         value: module.scan_mode_presentation(value)
@@ -246,7 +248,7 @@ def test_presentation_translation_keys_are_complete_and_localized():
             "dem-pending",
             "invalid",
         ),
-        presentation.cache_presentation: ("none", "hit", "miss"),
+        presentation.cache_presentation: ("none", "hit", "miss", "forced"),
         presentation.scan_mode_presentation: ("fast", "complete"),
         presentation.artifact_label_presentation: (
             "csv",
@@ -287,6 +289,8 @@ def test_presentation_translation_keys_are_complete_and_localized():
     assert i18n.Translator("zh-CN").text("status.boundary_ready") == "\u8fb9\u754c\u6570\u636e\u53ef\u7528"
     assert i18n.Translator("en").text("cache.hit") == "Cached scan"
     assert i18n.Translator("zh-CN").text("cache.hit") == "\u5df2\u590d\u7528\u7f13\u5b58\u626b\u63cf"
+    assert i18n.Translator("en").text("cache.forced") == "Forced fresh scan"
+    assert i18n.Translator("zh-CN").text("cache.forced") == "\u5f3a\u5236\u5168\u65b0\u626b\u63cf"
     assert i18n.Translator("en").text("scan.complete") == "Complete scan"
     assert i18n.Translator("zh-CN").text("scan.complete") == "\u5b8c\u6574\u626b\u63cf"
     assert i18n.Translator("en").text("job.kind.figure_export") == "Figure export"
