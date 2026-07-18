@@ -604,7 +604,9 @@ def render_configure_page(
         )
     except Exception as exc:
         with ui.column().classes("lte-page"):
-            ui.label(translator.text("configure.unavailable")).classes("lte-page-title")
+            ui.label(translator.text("configure.unavailable")).classes(
+                "lte-page-title"
+            ).props("role=heading aria-level=1")
             ui.label(translator.text("operation.failed")).classes(
                 "lte-validation-result--error"
             )

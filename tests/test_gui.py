@@ -156,8 +156,55 @@ def test_gui_css_defines_field_atlas_shell_and_mobile_touch_contract():
     ):
         assert selector in action_rule.group("selectors")
     assert "min-height: 44px;" in action_rule.group("body")
+
+    mobile_rules = tuple(
+        (match.group("selectors"), match.group("body"))
+        for match in re.finditer(
+            r"(?P<selectors>[^{}]+)\{(?P<body>[^{}]+)\}",
+            mobile_block,
+        )
+    )
+    for selector in (
+        ".lte-candidate-page .q-btn",
+        ".lte-web-selector-actions .q-btn",
+        ".lte-segmented-control .q-btn",
+    ):
+        matching_bodies = [
+            body
+            for selectors, body in mobile_rules
+            if selector in {item.strip() for item in selectors.split(",")}
+        ]
+        assert matching_bodies, f"missing 391-760px touch rule for {selector}"
+        assert any(
+            "min-height: 44px;" in body and "min-width: 44px;" in body
+            for body in matching_bodies
+        ), f"incomplete 44px touch target for {selector}"
     assert ":focus-visible" in css
     assert "@media (prefers-reduced-motion: reduce)" in css
+
+
+def test_every_page_title_declares_level_one_heading_semantics():
+    paths = (
+        ROOT / "src/lte_scenario_toolkit/gui/presentation.py",
+        ROOT / "src/lte_scenario_toolkit/gui/pages/candidates.py",
+        ROOT / "src/lte_scenario_toolkit/gui/pages/configure.py",
+        ROOT / "src/lte_scenario_toolkit/gui/pages/figures.py",
+        ROOT / "src/lte_scenario_toolkit/gui/pages/generate.py",
+    )
+    missing = []
+
+    for path in paths:
+        source = path.read_text(encoding="utf-8")
+        for match in re.finditer(r'\.classes\("lte-page-title"\)', source):
+            suffix = source[match.end() : match.end() + 80]
+            if re.search(
+                r'\.props\(\s*"role=heading aria-level=1"\s*\)',
+                suffix,
+            ) is None:
+                line = source.count("\n", 0, match.start()) + 1
+                missing.append(f"{path.name}:{line}")
+
+    assert missing == []
 
 
 def test_station_dot_resource_is_local_and_registered_once():
@@ -3975,6 +4022,112 @@ async def test_candidate_workbench_presents_progress_and_technical_details(
     assert tuple(id(layer) for layer in map_element.layers) == layer_identities
 
 
+@pytest.mark.parametrize(
+    ("language", "map_name", "selected_name", "filmstrip_name", "figure_name"),
+    (
+        (
+            "en",
+            "Candidate selection map",
+            "Terrain preview for Candidate 1",
+            "Map preview for Candidate 1",
+            "Terrain figure preview",
+        ),
+        (
+            "zh-CN",
+            "候选区域选择地图",
+            "候选区域 1 的地形预览",
+            "候选区域 1 的地图预览",
+            "地形图表预览",
+        ),
+    ),
+)
+async def test_candidate_and_figure_visual_surfaces_have_localized_accessible_names(
+    user,
+    tmp_path,
+    language,
+    map_name,
+    selected_name,
+    filmstrip_name,
+    figure_name,
+):
+    from dataclasses import replace
+
+    from nicegui import ElementFilter, ui
+
+    from lte_scenario_toolkit.gui.i18n import Translator
+    from lte_scenario_toolkit.gui.pages.candidates import render_candidate_page
+    from lte_scenario_toolkit.gui.pages.figures import render_figures_page
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.selection_service import DemStatistics
+
+    class Service:
+        @staticmethod
+        def candidate_statistics(*_args, **_kwargs):
+            return DemStatistics(1.0, 5.0, 3.0, 4.0, 10)
+
+    coordinator = JobCoordinator()
+    session = replace(
+        _task14_session(
+            tmp_path,
+            Service(),
+            map_bundle=_task14_map_bundle(tmp_path),
+        ),
+        scan_result=_task14_scan_result(),
+    )
+
+    @ui.page(f"/accessible-visuals-{language}")
+    def accessible_visuals():
+        translator = Translator(language)
+        render_candidate_page(
+            ui,
+            translator,
+            session,
+            coordinator,
+            station_layer_resource="/_lte_gui/assets/station-dots.js",
+            allow_rescan=False,
+            auto_start=False,
+        )
+        render_figures_page(ui, translator, tmp_path, coordinator)
+
+    try:
+        await user.open(f"/accessible-visuals-{language}")
+        candidate_map = next(iter(user.find(kind=ui.leaflet).elements))
+        assert candidate_map.props["role"] == "region"
+        assert candidate_map.props["aria-label"] == map_name
+
+        user.find(marker="candidate-next").click()
+        with user.client:
+            selected_preview = next(
+                iter(
+                    ElementFilter(
+                        marker="candidate-selected-preview",
+                        only_visible=False,
+                    )
+                )
+            )
+        assert selected_preview.props["alt"] == selected_name
+
+        user.find(marker="candidate-view-filmstrip").click()
+        filmstrip_preview = next(
+            iter(user.find(marker="candidate-thumbnail-0").elements)
+        )
+        assert filmstrip_preview.props["role"] == "img"
+        assert filmstrip_preview.props["aria-label"] == filmstrip_name
+
+        with user.client:
+            figure_preview = next(
+                iter(
+                    ElementFilter(
+                        marker="figure-preview-surface",
+                        only_visible=False,
+                    )
+                )
+            )
+        assert figure_preview.props["alt"] == figure_name
+    finally:
+        coordinator.shutdown()
+
+
 def test_candidate_workbench_css_is_bounded_and_mobile_safe():
     css = (
         ROOT / "src/lte_scenario_toolkit/gui/assets/app.css"
@@ -5222,11 +5375,140 @@ async def test_figure_page_invalidates_old_source_on_edit_and_failed_load(
 
         await user.should_see(
             marker="figure-source-error",
-            content="Figure source does not exist",
+            content="The figure source could not be loaded",
         )
+        technical = next(
+            iter(user.find(marker="figure-technical-copy").elements)
+        )
+        assert f"Figure source does not exist: {missing_b}" in technical.text
         await user.should_not_see(marker="figure-source-ready")
         assert not next(iter(user.find(marker="figure-export").elements)).enabled
         assert coordinator.snapshot().active is False
+    finally:
+        coordinator.shutdown()
+
+
+async def test_figure_primary_source_error_is_localized_and_raw_detail_is_collapsed(
+    tmp_path,
+    monkeypatch,
+    user,
+):
+    from nicegui import ui
+
+    from lte_scenario_toolkit.gui.i18n import Translator
+    from lte_scenario_toolkit.gui.pages import figures
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    raw_detail = "figure.html.failed: traceback exception"
+    monkeypatch.setattr(
+        figures,
+        "load_figure_source",
+        lambda _path: (_ for _ in ()).throw(RuntimeError(raw_detail)),
+    )
+    coordinator = JobCoordinator()
+
+    @ui.page("/figures-human-errors")
+    def figures_human_errors():
+        figures.render_figures_page(
+            ui,
+            Translator("zh-CN"),
+            tmp_path,
+            coordinator,
+        )
+
+    try:
+        await user.open("/figures-human-errors")
+        source = user.find(marker="figure-source-path")
+        source.clear().type(str(tmp_path / "missing-run"))
+        user.find(marker="figure-load-source").click()
+
+        await user.should_see(
+            marker="figure-source-error",
+            content="无法加载该图表来源。请检查路径以及运行是否已完成，然后重试。",
+        )
+        primary = next(iter(user.find(marker="figure-source-error").elements))
+        assert raw_detail not in primary.text
+        technical = next(
+            iter(user.find(marker="figure-technical-copy").elements)
+        )
+        assert raw_detail in technical.text
+        expansion = next(
+            iter(user.find(marker="figure-technical-details").elements)
+        )
+        assert expansion.value is False
+    finally:
+        coordinator.shutdown()
+
+
+async def test_figure_warning_error_and_invalid_style_keep_raw_detail_technical(
+    tmp_path,
+    user,
+):
+    from dataclasses import replace
+
+    from nicegui import ui
+
+    from lte_scenario_toolkit.gui.i18n import Translator
+    from lte_scenario_toolkit.gui.pages import figures
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    coordinator = JobCoordinator()
+    views = []
+
+    @ui.page("/figures-technical-demotion")
+    def figures_technical_demotion():
+        views.append(
+            figures.render_figures_page(
+                ui,
+                Translator("zh-CN"),
+                tmp_path,
+                coordinator,
+            )
+        )
+
+    raw_warning = "figure.html.failed: traceback warning"
+    raw_error = "traceback export exception"
+    try:
+        await user.open("/figures-technical-demotion")
+        view = views[0]
+        view.controller._set_state(
+            replace(
+                view.controller.state,
+                warnings=(raw_warning,),
+                errors=(
+                    {
+                        "code": "figure.export.failed",
+                        "message": raw_error,
+                    },
+                ),
+            )
+        )
+        view.timer.activate()
+
+        await user.should_see(
+            marker="figure-warning-summary-0",
+            content="图表操作已完成，但出现了警告",
+        )
+        await user.should_see(
+            marker="figure-error-summary",
+            content="图表操作未能完成",
+        )
+        warning = next(
+            iter(user.find(marker="figure-warning-summary-0").elements)
+        )
+        error = next(iter(user.find(marker="figure-error-summary").elements))
+        assert raw_warning not in warning.text
+        assert raw_error not in error.text
+        technical = next(
+            iter(user.find(marker="figure-technical-copy").elements)
+        )
+        assert raw_warning in technical.text
+        assert raw_error in technical.text
+
+        user.find(marker="figure-dpi").clear().type("0")
+        await user.should_see("请检查图表样式设置")
+        assert "DPI must be a positive integer" in technical.text
+        assert not user.notify.contains("DPI must be a positive integer")
     finally:
         coordinator.shutdown()
 

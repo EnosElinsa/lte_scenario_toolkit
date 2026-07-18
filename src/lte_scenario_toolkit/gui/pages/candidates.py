@@ -639,7 +639,7 @@ def _thumbnail_background_style(
     image_url: str,
     map_bounds: tuple[float, float, float, float],
     candidate_bounds: tuple[float, float, float, float],
-) -> str:
+) -> dict[str, str]:
     map_left, map_bottom, map_right, map_top = map_bounds
     left, bottom, right, top = candidate_bounds
     map_width = map_right - map_left
@@ -650,12 +650,12 @@ def _thumbnail_background_style(
     height = min(1.0, max(1e-6, (top - bottom) / map_height))
     position_x = 0.0 if width >= 1.0 else 100.0 * x / (1.0 - width)
     position_y = 0.0 if height >= 1.0 else 100.0 * y / (1.0 - height)
-    return (
-        f'background-image:url("{image_url}");'
-        f"background-size:{100.0 / width:.4f}% {100.0 / height:.4f}%;"
-        f"background-position:{position_x:.4f}% {position_y:.4f}%;"
-        "background-repeat:no-repeat;"
-    )
+    return {
+        "background-image": f'url("{image_url}")',
+        "background-size": f"{100.0 / width:.4f}% {100.0 / height:.4f}%",
+        "background-position": f"{position_x:.4f}% {position_y:.4f}%",
+        "background-repeat": "no-repeat",
+    }
 
 
 @lru_cache(maxsize=512)
@@ -1551,7 +1551,9 @@ def render_candidate_unavailable(ui: Any, translator: Any, message: str | None =
     """Render a safe local failure page without creating map assets or jobs."""
 
     with ui.column().classes("lte-page lte-candidate-page"):
-        ui.label(translator.text("candidates.unavailable")).classes("lte-page-title")
+        ui.label(translator.text("candidates.unavailable")).classes(
+            "lte-page-title"
+        ).props("role=heading aria-level=1")
         ui.label(message or translator.text("candidates.unavailable_body")).classes(
             "lte-callout lte-callout--warning"
         )
@@ -1634,7 +1636,9 @@ def render_candidate_page(
             "lte-candidate-heading items-end justify-between full-width"
         ):
             with ui.column().classes("gap-1"):
-                ui.label(translator.text("candidates.title")).classes("lte-page-title")
+                ui.label(translator.text("candidates.title")).classes(
+                    "lte-page-title"
+                ).props("role=heading aria-level=1")
                 ui.label(
                     translator.text(
                         "candidates.subtitle",
@@ -1777,7 +1781,10 @@ def render_candidate_page(
                         zoom=10,
                         options={"zoomControl": True, "preferCanvas": True},
                         additional_resources=[station_layer_resource],
-                    ).classes("lte-candidate-map full-width").mark("candidate-map")
+                    ).classes("lte-candidate-map full-width").props(
+                        "role=region "
+                        f'aria-label="{translator.text("candidates.map_accessible_name")}"'
+                    ).mark("candidate-map")
                     map_element.clear_layers()
                     dem_layer = map_element.image_overlay(
                         url=image_url,
@@ -1824,9 +1831,9 @@ def render_candidate_page(
                 selected_details = ui.label(
                     translator.text("candidates.select_hint")
                 ).classes("lte-page-subtitle").mark("candidate-primary-summary")
-                selected_preview = ui.image().classes("lte-selected-dem-preview").mark(
-                    "candidate-selected-preview"
-                )
+                selected_preview = ui.image().classes("lte-selected-dem-preview").props(
+                    'alt=""'
+                ).mark("candidate-selected-preview")
                 selected_preview.set_visibility(False)
                 stats_title = ui.label(
                     translator.text("candidates.terrain_statistics")
@@ -1999,6 +2006,10 @@ def render_candidate_page(
             with ui.grid().classes("lte-filmstrip-grid full-width"):
                 for index, candidate in enumerate(state.candidates):
                     display = bounds_by_id[candidate.flat_grid_id]
+                    preview_name = translator.text(
+                        "candidates.filmstrip_preview_accessible_name",
+                        index=index + 1,
+                    )
                     card = ui.card().classes(
                         "lte-filmstrip-card"
                         + (
@@ -2042,15 +2053,21 @@ def render_candidate_page(
                         ):
                             ui.image(
                                 asset_url(state.candidate_preview_asset.path)
-                            ).classes("lte-filmstrip-thumbnail").mark(
+                            ).classes("lte-filmstrip-thumbnail").props(
+                                f'role=img aria-label="{preview_name}" '
+                                f'alt="{preview_name}"'
+                            ).mark(
                                 f"candidate-thumbnail-{candidate.flat_grid_id}"
                             )
                         else:
-                            ui.element("div").classes(
+                            thumbnail = ui.element("div").classes(
                                 "lte-filmstrip-thumbnail"
+                            ).props(
+                                f'role=img aria-label="{preview_name}"'
                             ).mark(
                                 f"candidate-thumbnail-{candidate.flat_grid_id}"
-                            ).style(
+                            )
+                            thumbnail.style.update(
                                 _thumbnail_background_style(
                                     current_overview_url,
                                     bundle.map_bounds,
@@ -2193,14 +2210,19 @@ def render_candidate_page(
             selected_title.set_text(translator.text("candidates.none_selected"))
             selected_details.set_text(translator.text("candidates.select_hint"))
             selected_preview.set_visibility(False)
+            selected_preview.props('alt=""')
             stats_title.set_visibility(False)
             stats_details.set_visibility(False)
         else:
+            selected_index = (state.selected_index or 0) + 1
             selected_title.set_text(
                 translator.text(
                     "candidates.selected_title",
-                    index=(state.selected_index or 0) + 1,
+                    index=selected_index,
                 )
+            )
+            selected_preview.props(
+                f'alt="{translator.text("candidates.preview_accessible_name", index=selected_index)}"'
             )
             selected_details.set_text(
                 station_count_text(selected.point_count)

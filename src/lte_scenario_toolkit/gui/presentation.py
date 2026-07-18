@@ -239,7 +239,9 @@ def render_page_header(
 
     with ui.row().classes("lte-page-header") as header:
         with ui.column().classes("lte-page-header__copy"):
-            ui.label(title).classes("lte-page-title")
+            ui.label(title).classes("lte-page-title").props(
+                "role=heading aria-level=1"
+            )
             if description:
                 ui.label(description).classes("lte-page-subtitle")
         action_items = tuple(actions)

@@ -381,7 +381,9 @@ def render_generation_unavailable(ui: Any, translator: Any) -> None:
     """Render a fail-closed route when no locked opaque session is present."""
 
     with ui.column().classes("lte-page lte-generate-page"):
-        ui.label(translator.text("generate.unavailable")).classes("lte-page-title")
+        ui.label(translator.text("generate.unavailable")).classes(
+            "lte-page-title"
+        ).props("role=heading aria-level=1")
         ui.label(translator.text("generate.unavailable_body")).classes(
             "lte-callout lte-callout--warning"
         )
@@ -416,7 +418,9 @@ def render_generate_page(
     locked_selection = ARTIFACT_ORDER
 
     with ui.column().classes("lte-page lte-generate-page"):
-        ui.label(translator.text("generate.title")).classes("lte-page-title")
+        ui.label(translator.text("generate.title")).classes("lte-page-title").props(
+            "role=heading aria-level=1"
+        )
         ui.label(translator.text("generate.subtitle")).classes("lte-page-subtitle")
         with ui.card().classes("lte-generate-summary full-width"):
             ui.label(translator.text("generate.summary")).classes("lte-section-title")

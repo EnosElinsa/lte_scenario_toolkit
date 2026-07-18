@@ -1221,6 +1221,13 @@ button:disabled,
     min-height: 44px;
   }
 
+  .lte-candidate-page .q-btn,
+  .lte-web-selector-actions .q-btn,
+  .lte-segmented-control .q-btn {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
   .lte-main {
     min-height: calc(100vh - 64px);
     padding: 18px 12px 28px;
@@ -1350,7 +1357,7 @@ button:disabled,
 
   .lte-segmented-control .q-btn {
     flex: 1 1 0;
-    min-width: 0;
+    min-width: 44px;
     min-height: 44px;
     padding-right: 8px;
     padding-left: 8px;
@@ -1368,7 +1375,12 @@ button:disabled,
     flex-direction: column;
   }
 
-  .lte-candidate-toolbar-group .q-btn,
+  .lte-candidate-toolbar-group .q-btn {
+    width: 100%;
+    max-width: 100%;
+    min-width: 44px;
+  }
+
   .lte-candidate-id-input {
     width: 100%;
     max-width: 100%;

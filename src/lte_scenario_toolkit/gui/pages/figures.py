@@ -21,6 +21,7 @@ from ...figure_service import (
 )
 from ...jobs import Job, JobBusyError, JobCoordinator
 from ...run_service import RunService
+from ..presentation import render_technical_details
 
 PREVIEW_CACHE_VERSION = "figure-preview-v1"
 PREVIEW_DPI_LIMIT = 120
@@ -762,7 +763,9 @@ def render_figures_unavailable(ui: Any, translator: Any) -> None:
     """Render an invalid opaque handoff without exposing filesystem details."""
 
     with ui.column().classes("lte-page lte-figures-page"):
-        ui.label(translator.text("figures.unavailable")).classes("lte-page-title")
+        ui.label(translator.text("figures.unavailable")).classes(
+            "lte-page-title"
+        ).props("role=heading aria-level=1")
         ui.label(translator.text("figures.unavailable_body")).classes(
             "lte-callout lte-callout--warning"
         )
@@ -811,7 +814,9 @@ def render_figures_page(
     )
 
     with ui.column().classes("lte-page lte-figures-page"):
-        ui.label(translator.text("figures.title")).classes("lte-page-title")
+        ui.label(translator.text("figures.title")).classes("lte-page-title").props(
+            "role=heading aria-level=1"
+        )
         ui.label(translator.text("figures.subtitle")).classes("lte-page-subtitle")
         with ui.card().classes("lte-figure-source full-width"):
             with ui.row().classes("lte-figure-panel-header full-width"):
@@ -875,7 +880,9 @@ def render_figures_page(
                         translator.text("figures.preview_waiting")
                     ).classes("lte-figure-preview-state")
                 with ui.element("div").classes("lte-figure-preview-surface"):
-                    preview = ui.image().classes("lte-figure-preview").mark(
+                    preview = ui.image().classes("lte-figure-preview").props(
+                        f'alt="{translator.text("figures.preview_accessible_name")}"'
+                    ).mark(
                         "figure-preview-surface"
                     )
                     preview.set_visibility(False)
@@ -970,6 +977,22 @@ def render_figures_page(
             result_label = ui.label("").classes("lte-figure-path")
             error_box = ui.column().classes("lte-figure-errors")
 
+        technical_refs: dict[str, Any] = {}
+
+        def render_figure_technical_copy() -> None:
+            technical_refs["copy"] = ui.label("").classes(
+                "lte-technical-copy"
+            ).mark("figure-technical-copy")
+
+        technical_expansion = render_technical_details(
+            ui,
+            translator.text("figures.technical_details"),
+            render_figure_technical_copy,
+            marker="figure-technical-details",
+        )
+        technical_expansion.set_visibility(False)
+        technical_copy = technical_refs["copy"]
+
     style_controls = (
         preset,
         dpi,
@@ -988,6 +1011,7 @@ def render_figures_page(
     confirmed_formats = {
         token: bool(format_boxes[token].value) for token in FIGURE_FORMAT_ORDER
     }
+    ui_validation_diagnostic: str | None = None
 
     def restore_spec_controls(spec: FigureSpec) -> None:
         nonlocal restoring_spec_controls
@@ -1028,25 +1052,41 @@ def render_figures_page(
         error_box.clear()
         state = controller.state
         with warning_box:
-            for warning in state.warnings:
+            for index, warning in enumerate(state.warnings):
                 if warning == "figure.stale_published":
                     text = translator.text("figures.warning.stale_published")
                 elif warning.startswith("figure.settings_failed:"):
-                    detail = warning.partition(":")[2]
-                    text = translator.text(
-                        "figures.warning.settings_failed",
-                        detail=detail,
-                    )
+                    text = translator.text("figures.warning.settings_failed")
                 else:
-                    text = warning
-                ui.label(text).classes("lte-callout lte-callout--warning")
-        if state.source_error is None:
+                    text = translator.text("figures.warning.unknown")
+                ui.label(text).classes("lte-callout lte-callout--warning").mark(
+                    f"figure-warning-summary-{index}"
+                )
+        if state.source_error is None and state.errors:
             with error_box:
-                for error in state.errors:
-                    ui.label(
-                        f"{error.get('code', 'figure.error')}: "
-                        f"{error.get('message', '')}"
-                    ).classes("lte-validation-result lte-validation-result--error")
+                ui.label(translator.text("figures.error.summary")).classes(
+                    "lte-callout lte-callout--error"
+                ).props("role=alert").mark("figure-error-summary")
+
+        diagnostics: list[str] = []
+        if state.source_error is not None:
+            diagnostics.append(state.source_error)
+        diagnostics.extend(state.warnings)
+        diagnostics.extend(
+            json.dumps(_jsonable(error), ensure_ascii=False, sort_keys=True)
+            for error in state.errors
+        )
+        if ui_validation_diagnostic is not None:
+            diagnostics.append(ui_validation_diagnostic)
+        technical_copy.set_text("\n".join(diagnostics))
+        technical_expansion.set_visibility(bool(diagnostics))
+
+    def set_ui_diagnostic(detail: str | None) -> None:
+        nonlocal ui_validation_diagnostic
+        ui_validation_diagnostic = (
+            None if detail is None else detail.strip() or type(detail).__name__
+        )
+        render_messages()
 
     def sync_controls(state: FigurePageState | None = None) -> None:
         current = controller.state if state is None else state
@@ -1086,12 +1126,7 @@ def render_figures_page(
             and current.source_error is None
         )
         if current.source_error is not None:
-            source_error_label.set_text(
-                translator.text(
-                    "figures.source_load_failed",
-                    detail=current.source_error,
-                )
-            )
+            source_error_label.set_text(translator.text("figures.source_load_failed"))
 
         if valid_source:
             assert isinstance(current.source, FigureSource)
@@ -1169,9 +1204,11 @@ def render_figures_page(
         )
         try:
             state = controller.invalidate_source(detail)
-        except RuntimeError:
+        except RuntimeError as exc:
             restore_confirmed_source_input()
             sync_controls()
+            set_ui_diagnostic(str(exc))
+            ui.notify(translator.text("error.job_busy"), type="warning")
             return False
         sync_controls(state)
         render_messages()
@@ -1184,6 +1221,7 @@ def render_figures_page(
         source_parent_run_id: str | None = None,
         source_parent_run_path: Path | None = None,
     ) -> None:
+        set_ui_diagnostic(None)
         state = controller.set_source(
             source,
             output_root=source_output_root,
@@ -1234,14 +1272,18 @@ def render_figures_page(
                 ),
             )
             controller.update_spec(spec)
-        except RuntimeError:
+        except RuntimeError as exc:
             restore_spec_controls(controller.state.spec)
             sync_controls()
+            set_ui_diagnostic(str(exc))
+            ui.notify(translator.text("error.job_busy"), type="warning")
             return False
         except (TypeError, ValueError) as exc:
-            ui.notify(str(exc), type="warning")
+            set_ui_diagnostic(str(exc))
+            ui.notify(translator.text("figures.style_invalid"), type="warning")
             return False
         sync_controls()
+        set_ui_diagnostic(None)
         return True
 
     def apply_preset(value: Any) -> None:
@@ -1250,13 +1292,18 @@ def render_figures_page(
         try:
             spec = FigureSpec.from_preset(str(value))
         except ValueError as exc:
-            ui.notify(str(exc), type="warning")
+            set_ui_diagnostic(str(exc))
+            ui.notify(translator.text("figures.style_invalid"), type="warning")
             return
         restore_spec_controls(spec)
         try:
             controller.update_spec(spec)
-        except RuntimeError:
+        except RuntimeError as exc:
             restore_spec_controls(controller.state.spec)
+            set_ui_diagnostic(str(exc))
+            ui.notify(translator.text("error.job_busy"), type="warning")
+        else:
+            set_ui_diagnostic(None)
         sync_controls()
 
     def changed_format(token: str) -> None:
@@ -1279,8 +1326,13 @@ def render_figures_page(
             return
         try:
             job = controller.refresh_preview()
-        except (JobBusyError, ValueError) as exc:
-            ui.notify(str(exc), type="warning")
+        except JobBusyError as exc:
+            set_ui_diagnostic(str(exc))
+            ui.notify(translator.text("error.job_busy"), type="warning")
+            return
+        except ValueError as exc:
+            set_ui_diagnostic(str(exc))
+            ui.notify(translator.text("figures.preview_failed"), type="warning")
             return
         if job is None:
             sync_controls()
@@ -1296,8 +1348,13 @@ def render_figures_page(
         )
         try:
             controller.export(formats)
-        except (JobBusyError, ValueError) as exc:
-            ui.notify(str(exc), type="warning")
+        except JobBusyError as exc:
+            set_ui_diagnostic(str(exc))
+            ui.notify(translator.text("error.job_busy"), type="warning")
+            return
+        except ValueError as exc:
+            set_ui_diagnostic(str(exc))
+            ui.notify(translator.text("figures.export_failed"), type="warning")
             return
         sync_controls()
         timer.activate()
@@ -1307,8 +1364,16 @@ def render_figures_page(
             return
         try:
             controller.prepare_selection(current_session)
-        except (JobBusyError, RuntimeError, ValueError) as exc:
+        except JobBusyError as exc:
+            set_ui_diagnostic(str(exc))
+            ui.notify(translator.text("error.job_busy"), type="warning")
+            return
+        except (RuntimeError, ValueError) as exc:
             invalidate_visible_source(str(exc))
+            ui.notify(
+                translator.text("figures.current_selection_failed"),
+                type="warning",
+            )
             return
         sync_controls()
         timer.activate()
