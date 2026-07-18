@@ -9,6 +9,14 @@ from typing import Any
 
 from ...data_validation import validate_scenario_data
 from ...jobs import Job, JobBusyError, JobCoordinator
+from ..presentation import (
+    ActionSpec,
+    readiness_presentation,
+    render_action_bar,
+    render_page_header,
+    render_status_badge,
+    render_technical_details,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,9 +212,17 @@ def _render_validation_result(ui: Any, translator: Any, result: ValidationResult
         if result.ok
         else "lte-validation-result lte-validation-result--error"
     )
-    for message in result.messages:
-        ui.label(f"{message.level.upper()} {message.code}: {message.message}").classes(
-            "lte-validation-message"
+    if result.messages:
+        def render_messages() -> None:
+            for message in result.messages:
+                ui.label(
+                    f"{message.level.upper()} {message.code}: {message.message}"
+                ).classes("lte-validation-message")
+
+        render_technical_details(
+            ui,
+            translator.text("validation.details"),
+            render_messages,
         )
 
 
@@ -222,11 +238,44 @@ def render_scenarios_page(
     active_coordinator = (
         get_job_coordinator() if coordinator is None else coordinator
     )
+    cards = scenario_cards(catalog)
+    ready_count = sum(card.can_run for card in cards)
+    preparation_count = len(cards) - ready_count
     with ui.column().classes("lte-page lte-scenarios-page"):
-        ui.label(translator.text("scenarios.title")).classes("lte-page-title")
-        ui.label(translator.text("scenarios.subtitle")).classes("lte-page-subtitle")
+        render_page_header(
+            ui,
+            translator.text("scenarios.title"),
+            translator.text("scenarios.subtitle"),
+        )
+        with ui.card().classes("lte-summary-strip").mark("scenarios-summary"):
+            ui.label(translator.text("scenarios.summary")).classes(
+                "lte-summary-strip__title"
+            )
+            with ui.row().classes("lte-summary-metrics"):
+                for marker, value, label in (
+                    (
+                        "scenarios-count-total",
+                        len(cards),
+                        translator.text("scenarios.count.total"),
+                    ),
+                    (
+                        "scenarios-count-ready",
+                        ready_count,
+                        translator.text("scenarios.count.ready"),
+                    ),
+                    (
+                        "scenarios-count-preparation",
+                        preparation_count,
+                        translator.text("scenarios.count.preparation"),
+                    ),
+                ):
+                    with ui.column().classes("lte-summary-metric"):
+                        ui.label(str(value)).classes("lte-summary-metric__value").mark(
+                            marker
+                        )
+                        ui.label(label).classes("lte-summary-metric__label")
         with ui.row().classes("lte-card-grid"):
-            for card in scenario_cards(catalog):
+            for card in cards:
                 _render_scenario_card(ui, translator, catalog, card, active_coordinator)
 
         with ui.card().classes("lte-guidance-card"):
@@ -251,14 +300,26 @@ def _render_scenario_card(
     card: ScenarioCard,
     coordinator: JobCoordinator,
 ) -> None:
-    with ui.card().classes("lte-scenario-card"):
+    status = readiness_presentation(card.status)
+    with ui.card().classes("lte-scenario-card").mark(
+        f"scenario-card-{card.scenario_id}"
+    ):
         with ui.row().classes("items-center justify-between no-wrap full-width"):
             ui.label(card.display_name).classes("lte-card-title")
-            ui.chip(card.status).classes(f"lte-status-chip lte-status-chip--{card.status}")
-        ui.label(card.scenario_id).classes("lte-card-id")
-        with ui.expansion(translator.text("dataset.details")).classes(
-            "lte-dataset-details full-width"
-        ):
+            render_status_badge(
+                ui,
+                translator,
+                status,
+                marker=f"scenario-status-{card.scenario_id}",
+            )
+        if status.description_key is not None:
+            ui.label(translator.text(status.description_key)).classes(
+                "lte-scenario-card__description"
+            )
+
+        def render_dataset_details() -> None:
+            ui.label(card.scenario_id).classes("lte-card-id")
+            ui.label(f"Status: {card.status}").classes("lte-card-id")
             ui.label(
                 translator.text(
                     "dataset.boundary",
@@ -279,6 +340,13 @@ def _render_scenario_card(
                     path=card.default_profile_path or translator.text("value.none"),
                 )
             )
+
+        render_technical_details(
+            ui,
+            translator.text("dataset.details"),
+            render_dataset_details,
+            marker=f"scenario-technical-{card.scenario_id}",
+        )
         validation_area = ui.column().classes("lte-validation-area full-width")
         validation_generation = {"value": 0}
         active_timer: dict[str, Any | None] = {"value": None}
@@ -367,28 +435,12 @@ def _render_scenario_card(
             active_timer["value"] = timer
             timer.activate()
 
-        with ui.row().classes("lte-card-actions"):
-            fast_button = ui.button(
-                translator.text("action.validate"),
-                on_click=validate_fast,
-            ).props("outline").mark(f"scenario-validate-{card.scenario_id}")
-            full_button = ui.button(
-                translator.text("action.full_checksum"),
-                on_click=validate_full,
-            ).props("outline").mark(f"scenario-checksum-{card.scenario_id}")
-            configure = ui.button(
-                translator.text("action.configure"),
-                on_click=lambda: ui.navigate.to(f"/configure/{card.scenario_id}"),
-            ).mark(f"scenario-configure-{card.scenario_id}")
-            configure.set_enabled(card.can_run)
-            run = ui.button(
-                translator.text("action.run"),
-                on_click=lambda: ui.navigate.to(f"/configure/{card.scenario_id}"),
-            ).mark(f"scenario-run-{card.scenario_id}")
-            run.set_enabled(card.can_run)
         with ui.expansion(translator.text("guidance.commands")).classes(
             "lte-cli-commands full-width"
-        ):
+        ).mark(f"scenario-setup-{card.scenario_id}") as setup_expansion:
+            ui.label(translator.text("guidance.replace_path")).classes(
+                "lte-setup-guidance"
+            )
             ui.code(
                 f"lte-data validate {card.scenario_id}", language="powershell"
             ).classes(
@@ -406,6 +458,44 @@ def _render_scenario_card(
                 f"lte-data dem ingest {card.scenario_id} --tiles-dir '<path>'",
                 language="powershell",
             ).classes("lte-cli-guidance")
+
+        workflow_action = (
+            ActionSpec(
+                "workflow",
+                translator.text("action.configure_and_scan"),
+                lambda: ui.navigate.to(f"/configure/{card.scenario_id}"),
+                role="primary",
+                marker=f"scenario-configure-{card.scenario_id}",
+            )
+            if card.can_run
+            else ActionSpec(
+                "workflow",
+                translator.text("action.view_setup"),
+                setup_expansion.open,
+                role="primary",
+                marker=f"scenario-guidance-{card.scenario_id}",
+            )
+        )
+        buttons = render_action_bar(
+            ui,
+            (
+                ActionSpec(
+                    "fast",
+                    translator.text("action.validate"),
+                    validate_fast,
+                    marker=f"scenario-validate-{card.scenario_id}",
+                ),
+                ActionSpec(
+                    "full",
+                    translator.text("action.full_checksum"),
+                    validate_full,
+                    marker=f"scenario-checksum-{card.scenario_id}",
+                ),
+                workflow_action,
+            ),
+        )
+        fast_button = buttons["fast"]
+        full_button = buttons["full"]
 
 
 __all__ = [

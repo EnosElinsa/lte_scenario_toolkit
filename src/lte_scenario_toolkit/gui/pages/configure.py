@@ -17,6 +17,13 @@ from ...profiles import (
     validate_profile,
 )
 from ...selection_service import SelectionError
+from ..presentation import (
+    ActionSpec,
+    readiness_presentation,
+    render_action_bar,
+    render_page_header,
+    render_status_badge,
+)
 
 PROFILE_SELECTION_MESSAGE = (
     "The requested or configured default profile cannot be resolved safely."
@@ -497,22 +504,52 @@ def render_configure_picker(ui: Any, translator: Any, catalog: Any) -> None:
     """Render a valid `/configure` route instead of leaving a dead navigation link."""
 
     with ui.column().classes("lte-page lte-configure-picker"):
-        ui.label(translator.text("configure.choose_title")).classes("lte-page-title")
-        ui.label(translator.text("configure.choose_subtitle")).classes("lte-page-subtitle")
+        render_page_header(
+            ui,
+            translator.text("configure.choose_title"),
+            translator.text("configure.choose_subtitle"),
+        )
         with ui.row().classes("lte-card-grid"):
             for scenario_id in catalog.scenarios_by_id:
                 scenario = catalog.scenario(scenario_id)
                 status = catalog.scenario_status(scenario_id)
                 with ui.card().classes("lte-scenario-card"):
-                    ui.label(str(scenario["display_name"])).classes("lte-card-title")
-                    ui.chip(status).classes("lte-status-chip")
-                    button = ui.button(
-                        translator.text("action.configure"),
-                        on_click=lambda scenario_id=scenario_id: ui.navigate.to(
-                            f"/configure/{scenario_id}"
-                        ),
-                    ).mark(f"picker-configure-{scenario_id}")
-                    button.set_enabled(status == "ready")
+                    presentation = readiness_presentation(status)
+                    with ui.row().classes(
+                        "items-center justify-between no-wrap full-width"
+                    ):
+                        ui.label(str(scenario["display_name"])).classes(
+                            "lte-card-title"
+                        )
+                        render_status_badge(
+                            ui,
+                            translator,
+                            presentation,
+                            marker=f"picker-status-{scenario_id}",
+                        )
+                    if presentation.description_key is not None:
+                        ui.label(
+                            translator.text(presentation.description_key)
+                        ).classes("lte-scenario-card__description")
+                    if status == "ready":
+                        action = ActionSpec(
+                            "workflow",
+                            translator.text("action.configure_and_scan"),
+                            lambda scenario_id=scenario_id: ui.navigate.to(
+                                f"/configure/{scenario_id}"
+                            ),
+                            role="primary",
+                            marker=f"picker-configure-{scenario_id}",
+                        )
+                    else:
+                        action = ActionSpec(
+                            "workflow",
+                            translator.text("action.view_setup"),
+                            lambda: ui.navigate.to("/scenarios"),
+                            role="primary",
+                            marker=f"picker-guidance-{scenario_id}",
+                        )
+                    render_action_bar(ui, (action,))
 
 
 def _confirmation_dialog(
@@ -520,15 +557,19 @@ def _confirmation_dialog(
     translator: Any,
     *,
     title_key: str,
+    consequence: str,
+    marker_name: str,
     on_confirm: Callable[[], None],
 ) -> Any:
     with ui.dialog() as dialog, ui.card().classes("lte-confirmation-dialog"):
         ui.label(translator.text(title_key)).classes("lte-section-title")
-        ui.label(translator.text("confirmation.explanation"))
+        ui.label(consequence).classes("lte-confirmation-consequence").mark(
+            f"confirmation-{marker_name}-consequence"
+        )
         with ui.row().classes("justify-end full-width"):
             ui.button(translator.text("action.cancel"), on_click=dialog.close).props(
                 "flat"
-            )
+            ).mark(f"confirmation-{marker_name}-cancel")
 
             def confirm() -> None:
                 dialog.close()
@@ -574,22 +615,20 @@ def render_configure_page(
     actions = ProfileActions(store, on_profile_mutation)
     profile = model.profile
     with ui.column().classes("lte-page lte-configure-page"):
-        with ui.row().classes("items-end justify-between full-width"):
-            with ui.column().classes("gap-1"):
-                ui.label(
-                    translator.text("configure.title", name=model.display_name)
-                ).classes("lte-page-title")
-                ui.label(model.scenario_id).classes("lte-page-subtitle")
-            dirty_label = ui.label(
-                translator.text(
-                    "configure.saved" if model.is_persisted else "configure.unsaved"
-                )
-            ).classes("lte-dirty-indicator")
+        render_page_header(
+            ui,
+            translator.text("configure.title", name=model.display_name),
+            model.scenario_id,
+        )
 
         if model.status != "ready":
-            ui.label(
-                translator.text("configure.not_ready", status=model.status)
-            ).classes("lte-callout lte-callout--warning")
+            readiness = readiness_presentation(model.status)
+            with ui.card().classes("lte-callout lte-callout--warning"):
+                render_status_badge(ui, translator, readiness)
+                readiness_key = readiness.description_key or "status.unknown"
+                ui.label(translator.text(readiness_key)).mark(
+                    "configure-readiness"
+                )
         if model.selection_error is not None:
             with ui.card().classes("lte-callout lte-callout--warning"):
                 ui.label(translator.text("configure.selection_title")).classes(
@@ -605,12 +644,30 @@ def render_configure_page(
         options = dict(model.profile_choices)
         options["__new__"] = translator.text("configure.new_profile")
         selected_option = profile.profile_id if model.is_persisted else "__new__"
-        profile_select = ui.select(
-            options,
-            value=selected_option,
-            label=translator.text("label.profile"),
-        ).classes("lte-profile-select").mark("profile-select")
-        profile_select.set_enabled(True)
+        profile_state = translator.text(
+            "configure.saved" if model.is_persisted else "configure.unsaved"
+        )
+        if model.is_default:
+            profile_state = (
+                f"{profile_state} / "
+                f"{translator.text('configure.profile_state.default')}"
+            )
+        with ui.card().classes("lte-profile-header").mark(
+            "configure-profile-header"
+        ):
+            with ui.row().classes("lte-profile-header__main"):
+                profile_select = ui.select(
+                    options,
+                    value=selected_option,
+                    label=translator.text("label.profile"),
+                ).classes("lte-profile-select").mark("profile-select")
+                profile_select.set_enabled(True)
+                dirty_label = ui.label(profile_state).classes(
+                    "lte-dirty-indicator"
+                ).mark("configure-profile-state")
+            management_area = ui.column().classes(
+                "lte-profile-management full-width"
+            )
 
         def navigate_to_profile(selected_id: str) -> None:
             ui.navigate.to(_profile_route(scenario_id, selected_id))
@@ -627,7 +684,15 @@ def render_configure_page(
             ui.label(translator.text("confirmation.discard_switch")).classes(
                 "lte-section-title"
             )
-            ui.label(translator.text("confirmation.explanation"))
+            switch_consequence = ui.label(
+                translator.text(
+                    "confirmation.consequence.switch",
+                    current_name=profile.display_name,
+                    target_name=profile.display_name,
+                )
+            ).classes("lte-confirmation-consequence").mark(
+                "confirmation-switch-consequence"
+            )
             with ui.row().classes("justify-end full-width"):
                 ui.button(
                     translator.text("action.cancel"), on_click=switch_dialog.close
@@ -644,6 +709,13 @@ def render_configure_page(
             if form_values:
                 switch_target["value"] = selected_id
                 profile_select.value = selected_option
+                switch_consequence.set_text(
+                    translator.text(
+                        "confirmation.consequence.switch",
+                        current_name=profile.display_name,
+                        target_name=str(options.get(selected_id, selected_id)),
+                    )
+                )
                 switch_dialog.open()
                 return
             navigate_to_profile(selected_id)
@@ -740,7 +812,11 @@ def render_configure_page(
                         lambda event: changed(event, "scan_mode")
                     )
 
-            with ui.row().classes("items-end full-width no-wrap"):
+        with ui.card().classes("lte-output-card").mark("configure-output"):
+            ui.label(translator.text("configure.output")).classes(
+                "lte-section-title"
+            )
+            with ui.row().classes("lte-output-row"):
                 output_root = ui.input(
                     translator.text("field.output_root"),
                     value=str(profile.output_root),
@@ -863,8 +939,15 @@ def render_configure_page(
             ui,
             translator,
             title_key="confirmation.overwrite",
+            consequence=translator.text(
+                "confirmation.consequence.overwrite",
+                profile_name=profile.display_name,
+                profile_id=profile.profile_id,
+            ),
+            marker_name="overwrite",
             on_confirm=lambda: perform_save(confirmed=True),
         )
+
         def request_save() -> None:
             if model.is_persisted:
                 save_dialog.open()
@@ -963,7 +1046,9 @@ def render_configure_page(
 
         with ui.dialog() as copy_dialog, ui.card().classes("lte-confirmation-dialog"):
             ui.label(translator.text("confirmation.copy")).classes("lte-section-title")
-            ui.label(translator.text("confirmation.explanation"))
+            copy_consequence = ui.label().classes(
+                "lte-confirmation-consequence"
+            ).mark("confirmation-copy-consequence")
             copy_id = ui.input(
                 translator.text("field.profile_id"),
                 value=f"{profile.profile_id}-copy",
@@ -972,6 +1057,21 @@ def render_configure_page(
                 translator.text("field.display_name"),
                 value=f"{profile.display_name} Copy",
             ).mark("profile-copy-name")
+
+            def update_copy_consequence() -> None:
+                copy_consequence.set_text(
+                    translator.text(
+                        "confirmation.consequence.copy",
+                        profile_name=profile.display_name,
+                        profile_id=profile.profile_id,
+                        target_name=str(copy_name.value or ""),
+                        target_id=str(copy_id.value or ""),
+                    )
+                )
+
+            copy_id.on_value_change(lambda _event: update_copy_consequence())
+            copy_name.on_value_change(lambda _event: update_copy_consequence())
+            update_copy_consequence()
             with ui.row().classes("justify-end full-width"):
                 ui.button(
                     translator.text("action.cancel"), on_click=copy_dialog.close
@@ -987,7 +1087,9 @@ def render_configure_page(
 
         with ui.dialog() as rename_dialog, ui.card().classes("lte-confirmation-dialog"):
             ui.label(translator.text("confirmation.rename")).classes("lte-section-title")
-            ui.label(translator.text("confirmation.explanation"))
+            rename_consequence = ui.label().classes(
+                "lte-confirmation-consequence"
+            ).mark("confirmation-rename-consequence")
             rename_id = ui.input(
                 translator.text("field.profile_id"),
                 value=profile.profile_id,
@@ -996,6 +1098,26 @@ def render_configure_page(
                 translator.text("field.display_name"),
                 value=profile.display_name,
             ).mark("profile-rename-name")
+
+            def update_rename_consequence() -> None:
+                consequence_key = (
+                    "confirmation.consequence.rename_default"
+                    if model.is_default
+                    else "confirmation.consequence.rename"
+                )
+                rename_consequence.set_text(
+                    translator.text(
+                        consequence_key,
+                        profile_name=profile.display_name,
+                        profile_id=profile.profile_id,
+                        target_name=str(rename_name.value or ""),
+                        target_id=str(rename_id.value or ""),
+                    )
+                )
+
+            rename_id.on_value_change(lambda _event: update_rename_consequence())
+            rename_name.on_value_change(lambda _event: update_rename_consequence())
+            update_rename_consequence()
             with ui.row().classes("justify-end full-width"):
                 ui.button(
                     translator.text("action.cancel"), on_click=rename_dialog.close
@@ -1013,11 +1135,33 @@ def render_configure_page(
             ui,
             translator,
             title_key="confirmation.default",
+            consequence=translator.text(
+                "confirmation.consequence.default",
+                scenario_name=model.display_name,
+                profile_name=profile.display_name,
+                profile_id=profile.profile_id,
+            ),
+            marker_name="default",
             on_confirm=default_confirmed,
         )
         with ui.dialog() as delete_dialog, ui.card().classes("lte-confirmation-dialog"):
             ui.label(translator.text("confirmation.delete")).classes("lte-section-title")
-            ui.label(translator.text("confirmation.explanation"))
+            if deleting_default and alternatives:
+                delete_text = translator.text(
+                    "confirmation.consequence.delete_default_pending",
+                    scenario_name=model.display_name,
+                    profile_name=profile.display_name,
+                    profile_id=profile.profile_id,
+                )
+            else:
+                delete_text = translator.text(
+                    "confirmation.consequence.delete",
+                    profile_name=profile.display_name,
+                    profile_id=profile.profile_id,
+                )
+            delete_consequence = ui.label(delete_text).classes(
+                "lte-confirmation-consequence"
+            ).mark("confirmation-delete-consequence")
             replacement_select = ui.select(
                 {
                     str(item.source_path): item.display_name
@@ -1025,8 +1169,31 @@ def render_configure_page(
                 },
                 value=None,
                 label=translator.text("delete.replacement"),
-            )
+            ).mark("profile-delete-replacement")
             replacement_select.set_visibility(bool(deleting_default))
+
+            def update_delete_consequence(event) -> None:
+                selected = next(
+                    (
+                        item
+                        for item in alternatives
+                        if str(item.source_path) == str(event.value)
+                    ),
+                    None,
+                )
+                if selected is None:
+                    return
+                delete_consequence.set_text(
+                    translator.text(
+                        "confirmation.consequence.delete_default",
+                        replacement_name=selected.display_name,
+                        scenario_name=model.display_name,
+                        profile_name=profile.display_name,
+                        profile_id=profile.profile_id,
+                    )
+                )
+
+            replacement_select.on_value_change(update_delete_consequence)
             with ui.row().classes("justify-end full-width"):
                 ui.button(
                     translator.text("action.cancel"), on_click=delete_dialog.close
@@ -1059,53 +1226,92 @@ def render_configure_page(
             except Exception as exc:
                 report_error(exc)
 
-        with ui.row().classes("lte-profile-actions full-width"):
-            copy_button = ui.button(
-                translator.text("action.copy"), on_click=copy_dialog.open
-            ).mark("profile-copy")
-            rename_button = ui.button(
-                translator.text("action.rename"), on_click=rename_dialog.open
-            ).mark("profile-rename")
-            default_button = ui.button(
-                translator.text("action.set_default"), on_click=default_dialog.open
-            ).mark("profile-set-default")
-            delete_button = ui.button(
-                translator.text("action.delete"), on_click=delete_dialog.open
-            ).mark("profile-delete")
-            for button in (copy_button, rename_button, default_button, delete_button):
-                button.set_enabled(persisted_actions_enabled)
-            if model.is_default:
-                default_button.set_enabled(False)
-            if deleting_default and not alternatives:
-                delete_button.set_enabled(False)
-
-            ui.space()
-            discard = ui.button(
-                translator.text("action.discard"), on_click=ui.navigate.reload
-            ).props("outline").mark("profile-discard")
-            save = ui.button(
-                translator.text("action.save"), on_click=request_save
-            ).mark("profile-save")
-            start = ui.button(
-                translator.text("action.start_scan"), on_click=run_preflight
-            ).mark("profile-start-scan")
-            safety_controls.extend(
+        with management_area:
+            management_buttons = render_action_bar(
+                ui,
                 (
-                    copy_button,
-                    rename_button,
-                    default_button,
-                    delete_button,
-                    save,
-                    start,
-                )
+                    ActionSpec(
+                        "copy",
+                        translator.text("action.copy"),
+                        copy_dialog.open,
+                        enabled=persisted_actions_enabled,
+                        marker="profile-copy",
+                    ),
+                    ActionSpec(
+                        "rename",
+                        translator.text("action.rename"),
+                        rename_dialog.open,
+                        enabled=persisted_actions_enabled,
+                        marker="profile-rename",
+                    ),
+                    ActionSpec(
+                        "default",
+                        translator.text("action.set_default"),
+                        default_dialog.open,
+                        enabled=persisted_actions_enabled and not model.is_default,
+                        marker="profile-set-default",
+                    ),
+                    ActionSpec(
+                        "delete",
+                        translator.text("action.delete"),
+                        delete_dialog.open,
+                        role="danger",
+                        enabled=(
+                            persisted_actions_enabled
+                            and (not deleting_default or bool(alternatives))
+                        ),
+                        marker="profile-delete",
+                    ),
+                ),
+                marker="profile-management-actions",
             )
-            writes_enabled = (
-                model.selection_error is None
-                and model.status == "ready"
+        copy_button = management_buttons["copy"]
+        rename_button = management_buttons["rename"]
+        default_button = management_buttons["default"]
+        delete_button = management_buttons["delete"]
+
+        writes_enabled = model.selection_error is None and model.status == "ready"
+        workflow_buttons = render_action_bar(
+            ui,
+            (
+                ActionSpec(
+                    "discard",
+                    translator.text("action.discard"),
+                    ui.navigate.reload,
+                    marker="profile-discard",
+                ),
+                ActionSpec(
+                    "save",
+                    translator.text("action.save"),
+                    request_save,
+                    enabled=writes_enabled,
+                    marker="profile-save",
+                ),
+                ActionSpec(
+                    "start",
+                    translator.text("action.start_scan"),
+                    run_preflight,
+                    role="primary",
+                    enabled=model.can_start,
+                    marker="profile-start-scan",
+                ),
+            ),
+            sticky=True,
+            marker="configure-action-bar",
+        )
+        _discard = workflow_buttons["discard"]
+        save = workflow_buttons["save"]
+        start = workflow_buttons["start"]
+        safety_controls.extend(
+            (
+                copy_button,
+                rename_button,
+                default_button,
+                delete_button,
+                save,
+                start,
             )
-            save.set_enabled(writes_enabled)
-            discard.set_enabled(True)
-            start.set_enabled(model.can_start)
+        )
 
 
 __all__ = [

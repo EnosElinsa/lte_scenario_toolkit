@@ -211,6 +211,22 @@ def test_presentation_spec_is_an_immutable_compact_value():
         spec.tone = "info"
 
 
+def test_presentation_action_spec_is_immutable_and_defaults_to_secondary():
+    module = _gui_module("presentation")
+
+    action = module.ActionSpec("save", "Save", lambda: None)
+
+    assert action.name == "save"
+    assert action.label == "Save"
+    assert callable(action.on_click)
+    assert action.role == "secondary"
+    assert action.enabled is True
+    assert action.marker is None
+    assert not hasattr(action, "__dict__")
+    with pytest.raises(FrozenInstanceError):
+        action.enabled = False
+
+
 def test_presentation_mappings_cover_current_gui_machine_values():
     module = _gui_module("presentation")
     spec = module.PresentationSpec
@@ -1821,35 +1837,62 @@ async def test_scenario_routes_share_content_and_disable_nonready_actions(
     catalog = _Task13Catalog(tmp_path)
     create_app(catalog=catalog, profile_store=EmptyStore(), testing=True)
 
-    await user.open("/")
-    await user.should_see("Ready City")
-    await user.should_see("Pending City")
-    await user.should_see("dem-pending")
-    assert all(
-        element.enabled
-        for element in user.find(marker="scenario-configure-ready-city").elements
+    scenario_ids = tuple(catalog.scenarios_by_id)
+    expected_ready = sum(
+        catalog.scenario_status(scenario_id) == "ready"
+        for scenario_id in scenario_ids
     )
-    assert all(
-        not element.enabled
-        for element in user.find(marker="scenario-configure-pending-city").elements
-    )
-    assert all(
-        element.enabled
-        for element in user.find(marker="scenario-run-ready-city").elements
-    )
-    assert all(
-        not element.enabled
-        for element in user.find(marker="scenario-run-pending-city").elements
-    )
+    expected_preparation = len(scenario_ids) - expected_ready
 
-    await user.open("/scenarios")
-    await user.should_see("Ready City")
-    await user.should_see("Pending City")
+    for route in ("/", "/scenarios"):
+        await user.open(route)
+        await user.should_see(marker="scenarios-summary")
+        assert next(
+            iter(user.find(marker="scenarios-count-total").elements)
+        ).text == str(len(scenario_ids))
+        assert next(
+            iter(user.find(marker="scenarios-count-ready").elements)
+        ).text == str(expected_ready)
+        assert next(
+            iter(user.find(marker="scenarios-count-preparation").elements)
+        ).text == str(expected_preparation)
+        for scenario_id in scenario_ids:
+            await user.should_see(marker=f"scenario-card-{scenario_id}")
+            await user.should_see(marker=f"scenario-status-{scenario_id}")
+            await user.should_see(marker=f"scenario-technical-{scenario_id}")
+            await user.should_see(marker=f"scenario-setup-{scenario_id}")
+            await user.should_not_see(marker=f"scenario-run-{scenario_id}")
+
+        assert len(user.find(marker="scenario-configure-ready-city").elements) == 1
+        assert next(
+            iter(user.find(marker="scenario-configure-ready-city").elements)
+        ).enabled
+        await user.should_not_see(marker="scenario-guidance-ready-city")
+        await user.should_not_see(marker="scenario-configure-pending-city")
+        assert len(user.find(marker="scenario-guidance-pending-city").elements) == 1
+        await user.should_see("Terrain data required")
+        assert (
+            next(
+                iter(user.find(marker="scenario-status-pending-city").elements)
+            ).text
+            == "Terrain data required"
+        )
+
+    user.find(marker="scenario-guidance-pending-city").click()
+    await user.should_see(
+        "Replace <path> with the directory containing the downloaded DEM tiles"
+    )
     await user.should_see("Register a scenario with the CLI")
     assert not (tmp_path / ".lte-data").exists()
 
     await user.open("/configure")
     await user.should_see("Choose a scenario")
+    assert (
+        next(iter(user.find(marker="picker-status-pending-city").elements)).text
+        == "Terrain data required"
+    )
+    await user.should_not_see(marker="picker-configure-pending-city")
+    assert len(user.find(marker="picker-guidance-pending-city").elements) == 1
 
 
 
@@ -1880,6 +1923,14 @@ async def test_configure_route_renders_complete_form_and_blocks_nonready_direct_
     )
 
     await user.open("/configure/without-default")
+    for marker in (
+        "configure-profile-header",
+        "configure-profile-state",
+        "profile-management-actions",
+        "configure-output",
+        "configure-action-bar",
+    ):
+        await user.should_see(marker=marker)
     for text in (
         "Basic parameters",
         "Advanced",
@@ -1907,7 +1958,10 @@ async def test_configure_route_renders_complete_form_and_blocks_nonready_direct_
         assert all(not element.enabled for element in user.find(marker=marker).elements)
 
     await user.open("/configure/pending-city")
-    await user.should_see("Scenario is not ready")
+    await user.should_see("Terrain data required")
+    assert "dem-pending" not in next(
+        iter(user.find(marker="configure-readiness").elements)
+    ).text
     assert all(
         not element.enabled
         for element in user.find(marker="profile-start-scan").elements
@@ -2013,6 +2067,10 @@ async def test_profile_copy_ui_requires_confirm_before_store_call(user, tmp_path
 
     user.find(marker="profile-copy").click()
     assert calls == []
+    await user.should_see(marker="confirmation-copy-consequence")
+    await user.should_see(
+        "Copying Default (default) creates Default Copy (default-copy); the original stays unchanged."
+    )
     user.find(marker="profile-copy-cancel").click()
     assert calls == []
 
@@ -2021,6 +2079,104 @@ async def test_profile_copy_ui_requires_confirm_before_store_call(user, tmp_path
     assert calls == [
         (profile.source_path, "default-copy", "Default Copy")
     ]
+
+
+async def test_profile_confirmation_dialogs_name_targets_and_do_not_mutate_early(
+    user, tmp_path
+):
+    from dataclasses import replace
+
+    from lte_scenario_toolkit.gui.app import create_app
+
+    default = _task13_profile(tmp_path)
+    alternate = replace(
+        default,
+        profile_id="alternate",
+        display_name="Alternate",
+        source_path=tmp_path / "configs/alternate.yaml",
+    )
+    calls: list[tuple[object, ...]] = []
+
+    class RecordingStore:
+        def discover(self, scenario_id):
+            return [default, alternate]
+
+        def save(self, *args, **kwargs):
+            calls.append(("save", args, kwargs))
+
+        def rename(self, *args):
+            calls.append(("rename", *args))
+
+        def set_default(self, *args):
+            calls.append(("default", *args))
+
+        def delete(self, *args, **kwargs):
+            calls.append(("delete", args, kwargs))
+
+    create_app(
+        catalog=_Task13Catalog(tmp_path),
+        profile_store=RecordingStore(),
+        testing=True,
+    )
+    await user.open("/configure/ready-city")
+
+    user.find(marker="profile-save").click()
+    await user.should_see(marker="confirmation-overwrite-consequence")
+    await user.should_see(
+        "Saving replaces the stored values for Default (default)."
+    )
+    assert calls == []
+    user.find(marker="confirmation-overwrite-cancel").click()
+
+    user.find(marker="profile-rename").click()
+    user.find(marker="profile-rename-id").clear().type("renamed")
+    user.find(marker="profile-rename-name").clear().type("Renamed")
+    await user.should_see(marker="confirmation-rename-consequence")
+    await user.should_see(
+        "Default (default) moves to Renamed (renamed); its default reference follows."
+    )
+    assert calls == []
+    user.find(marker="profile-rename-cancel").click()
+
+    user.find(marker="profile-delete").click()
+    await user.should_see(marker="confirmation-delete-consequence")
+    await user.should_see(
+        "Choose a replacement for Ready City; it becomes the default before Default (default) is permanently deleted."
+    )
+    user.find(marker="profile-delete-replacement").click()
+    user.find("Alternate").click()
+    await user.should_see(
+        "Alternate becomes the default for Ready City before Default (default) is permanently deleted."
+    )
+    assert calls == []
+    user.find(marker="profile-delete-cancel").click()
+
+    user.find(marker="profile-display-name").clear().type("Changed")
+    user.find(marker="profile-select").click()
+    user.find("Alternate").click()
+    await user.should_see(marker="confirmation-switch-consequence")
+    await user.should_see(
+        "Switching from Default to Alternate discards the unsaved changes in Default."
+    )
+    assert calls == []
+    user.find(marker="profile-switch-cancel").click()
+
+    await user.open("/configure/ready-city?profile=alternate")
+    user.find(marker="profile-set-default").click()
+    await user.should_see(marker="confirmation-default-consequence")
+    await user.should_see(
+        "Future configuration for Ready City opens Alternate (alternate); no profiles are deleted."
+    )
+    assert calls == []
+    user.find(marker="confirmation-default-cancel").click()
+
+    user.find(marker="profile-delete").click()
+    await user.should_see(marker="confirmation-delete-consequence")
+    await user.should_see(
+        "Alternate (alternate) is permanently deleted, then you return to Scenarios."
+    )
+    assert calls == []
+    user.find(marker="profile-delete-cancel").click()
 
 
 async def test_committed_refresh_failure_locks_stale_profile_page(user, tmp_path):

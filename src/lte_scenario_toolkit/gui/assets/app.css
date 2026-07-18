@@ -327,6 +327,20 @@ h3,
   gap: var(--lte-space-4);
 }
 
+.lte-page-header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  width: 100%;
+  min-width: 0;
+  gap: var(--lte-space-4);
+}
+
+.lte-page-header__copy {
+  min-width: 0;
+  gap: var(--lte-space-1);
+}
+
 .lte-page-title {
   color: var(--lte-ink);
   font-size: clamp(25px, 2vw, 32px);
@@ -360,6 +374,12 @@ h3,
 .lte-scenario-card,
 .lte-guidance-card,
 .lte-form-card,
+.lte-summary-strip,
+.lte-profile-header,
+.lte-output-card,
+.lte-technical-details,
+.lte-empty-state,
+.lte-loading-state,
 .lte-candidate-progress,
 .lte-candidate-map-card,
 .lte-candidate-inspector,
@@ -378,8 +398,53 @@ h3,
 
 .lte-scenario-card,
 .lte-guidance-card,
-.lte-form-card {
+.lte-form-card,
+.lte-profile-header,
+.lte-output-card {
   padding: 18px;
+}
+
+.lte-summary-strip {
+  display: grid;
+  grid-template-columns: minmax(140px, 0.7fr) minmax(0, 2fr);
+  align-items: center;
+  width: 100%;
+  padding: 14px 18px;
+  border-left: 3px solid var(--lte-accent);
+}
+
+.lte-summary-strip__title {
+  color: var(--lte-ink);
+  font-family: Bahnschrift, "Aptos Display", Aptos, sans-serif;
+  font-weight: 650;
+}
+
+.lte-summary-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  width: 100%;
+  gap: var(--lte-space-3);
+}
+
+.lte-summary-metric {
+  min-width: 0;
+  gap: 0;
+  padding-left: var(--lte-space-3);
+  border-left: 1px solid var(--lte-border);
+}
+
+.lte-summary-metric__value {
+  color: var(--lte-frame);
+  font-family: Bahnschrift, "Aptos Display", Aptos, sans-serif;
+  font-size: 24px;
+  font-weight: 680;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.lte-summary-metric__label {
+  color: var(--lte-ink-muted);
+  font-size: 11px;
 }
 
 .lte-scenario-card {
@@ -421,6 +486,84 @@ h3,
   background: #f6dddd;
 }
 
+.lte-status-badge {
+  min-height: 24px;
+  padding: 4px 9px;
+  color: var(--lte-ink);
+  background: #edf0eb;
+  border: 1px solid var(--lte-border);
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.025em;
+  line-height: 14px;
+  white-space: nowrap;
+}
+
+.lte-status-badge--info,
+.lte-status-badge--active {
+  color: #075c53;
+  background: var(--lte-accent-soft);
+  border-color: #abd7cc;
+}
+
+.lte-status-badge--success {
+  color: #075c53;
+  background: #dcefe9;
+  border-color: #abd7cc;
+}
+
+.lte-status-badge--warning {
+  color: #704312;
+  background: #f5e3d1;
+  border-color: #e1bd98;
+}
+
+.lte-status-badge--danger {
+  color: #8d2929;
+  background: #f6dddd;
+  border-color: #ddb1b1;
+}
+
+.lte-scenario-card__description,
+.lte-setup-guidance,
+.lte-confirmation-consequence {
+  color: var(--lte-ink-muted);
+  font-size: 12px;
+}
+
+.lte-action-bar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  width: 100%;
+  min-width: 0;
+  gap: var(--lte-space-2);
+  flex-wrap: wrap;
+}
+
+.lte-action-bar--sticky {
+  position: sticky;
+  z-index: 4;
+  bottom: 0;
+  padding: 12px 0;
+  background: linear-gradient(to top, var(--lte-canvas) 72%, transparent);
+}
+
+.lte-action {
+  min-height: 36px;
+  border-radius: var(--lte-radius-sm);
+  box-shadow: none;
+}
+
+.lte-action--primary {
+  color: #fff !important;
+  background: var(--lte-accent) !important;
+}
+
+.lte-action--primary:hover { background: #0f7d70 !important; }
+.lte-action--danger { color: var(--lte-danger) !important; }
+
 .lte-card-actions,
 .lte-profile-actions,
 .lte-candidate-toolbar {
@@ -445,6 +588,28 @@ h3,
   font-size: 12px;
 }
 
+.lte-technical-details {
+  overflow: hidden;
+  background: #f5f5f0;
+  border-radius: var(--lte-radius-sm);
+  box-shadow: none;
+}
+
+.lte-empty-state,
+.lte-loading-state {
+  width: 100%;
+  padding: var(--lte-space-5);
+  color: var(--lte-ink-muted);
+}
+
+.lte-empty-state {
+  align-items: center;
+  text-align: center;
+}
+
+.lte-empty-state__icon { color: var(--lte-accent); font-size: 30px; }
+.lte-loading-state { align-items: center; justify-content: center; }
+
 .lte-validation-result {
   font-size: 12px;
   font-weight: 650;
@@ -460,6 +625,31 @@ h3,
 
 .lte-configure-page { max-width: 1040px; }
 .lte-profile-select { width: min(420px, 100%); }
+
+.lte-profile-header,
+.lte-output-card {
+  width: 100%;
+  gap: var(--lte-space-3);
+}
+
+.lte-profile-header {
+  border-top: 3px solid var(--lte-frame);
+}
+
+.lte-profile-header__main,
+.lte-output-row {
+  display: flex;
+  align-items: flex-end;
+  width: 100%;
+  min-width: 0;
+  gap: var(--lte-space-3);
+  flex-wrap: wrap;
+}
+
+.lte-profile-header__main { justify-content: space-between; }
+.lte-profile-management { gap: var(--lte-space-2); }
+.lte-profile-management .lte-action-bar { justify-content: flex-start; }
+.lte-output-row > .q-field { min-width: 0; flex: 1 1 320px; }
 
 .lte-dirty-indicator {
   color: var(--lte-ink-muted);
@@ -497,6 +687,14 @@ h3,
   width: min(460px, calc(100vw - 32px));
   gap: var(--lte-space-3);
   border-radius: var(--lte-radius-md);
+}
+
+.lte-confirmation-consequence {
+  padding: var(--lte-space-3);
+  color: var(--lte-ink);
+  background: #eef3ef;
+  border-left: 3px solid var(--lte-signal);
+  border-radius: var(--lte-radius-sm);
 }
 
 .lte-candidate-page { max-width: 1540px; }
@@ -673,6 +871,8 @@ button:disabled,
   .lte-command-bar .q-btn,
   .lte-card-actions .q-btn,
   .lte-profile-actions .q-btn,
+  .lte-action-bar .q-btn,
+  .lte-output-row .q-btn,
   .lte-candidate-toolbar .q-btn,
   .lte-generate-page .q-btn,
   .lte-figures-page .q-btn,
@@ -711,6 +911,11 @@ button:disabled,
   .lte-card-grid,
   .lte-filmstrip-grid { grid-template-columns: minmax(0, 1fr); }
 
+  .lte-page-header { align-items: flex-start; flex-direction: column; }
+
+  .lte-summary-strip { grid-template-columns: minmax(0, 1fr); gap: 10px; }
+  .lte-summary-metric { padding-left: 8px; }
+
   .lte-scenario-card,
   .lte-guidance-card,
   .lte-form-card,
@@ -726,10 +931,15 @@ button:disabled,
 
   .lte-card-actions,
   .lte-profile-actions,
+  .lte-action-bar,
   .lte-candidate-toolbar {
     width: 100%;
     flex-wrap: wrap;
   }
+
+  .lte-action-bar .q-btn { flex: 1 1 auto; }
+  .lte-profile-management .lte-action-bar .q-btn { flex: 1 1 44%; }
+  .lte-output-row .q-btn { flex: 1 1 100%; }
 
   .lte-candidate-map-wrap,
   .lte-candidate-map { min-height: 360px; }
