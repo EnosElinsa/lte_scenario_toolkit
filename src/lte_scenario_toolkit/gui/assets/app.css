@@ -1221,6 +1221,26 @@ button:disabled,
     min-height: 44px;
   }
 
+  .nicegui-code-copy {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  .q-toggle {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  .q-checkbox {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  .q-dialog .q-btn {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
   .lte-candidate-page .q-btn,
   .lte-web-selector-actions .q-btn,
   .lte-segmented-control .q-btn {

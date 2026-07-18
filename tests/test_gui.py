@@ -121,7 +121,7 @@ def test_gui_css_defines_field_atlas_shell_and_mobile_touch_contract():
 
     def declarations(selector: str) -> str:
         match = re.search(
-            rf"{re.escape(selector)}\s*\{{(?P<body>[^}}]+)\}}",
+            rf"(?m)^\s*{re.escape(selector)}\s*\{{(?P<body>[^}}]+)\}}",
             mobile_block,
         )
         assert match is not None, f"missing mobile rule for {selector}"
@@ -138,6 +138,18 @@ def test_gui_css_defines_field_atlas_shell_and_mobile_touch_contract():
     artifact_checkbox = declarations(".lte-generation-artifact-row .q-checkbox")
     assert "min-width: 44px;" in artifact_checkbox
     assert "min-height: 44px;" in artifact_checkbox
+    code_copy = declarations(".nicegui-code-copy")
+    assert "min-width: 44px;" in code_copy
+    assert "min-height: 44px;" in code_copy
+    toggle = declarations(".q-toggle")
+    assert "min-width: 44px;" in toggle
+    assert "min-height: 44px;" in toggle
+    checkbox = declarations(".q-checkbox")
+    assert "min-width: 44px;" in checkbox
+    assert "min-height: 44px;" in checkbox
+    dialog_button = declarations(".q-dialog .q-btn")
+    assert "min-width: 44px;" in dialog_button
+    assert "min-height: 44px;" in dialog_button
 
     action_rule = re.search(
         r"\.lte-command-bar \.q-btn,(?P<selectors>[^\{]+)"
