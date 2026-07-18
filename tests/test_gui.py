@@ -145,6 +145,7 @@ def test_gui_css_defines_field_atlas_shell_and_mobile_touch_contract():
     for selector in (
         ".lte-card-actions .q-btn",
         ".lte-profile-actions .q-btn",
+        ".lte-confirmation-dialog .q-btn",
         ".lte-candidate-toolbar .q-btn",
         ".lte-generate-page .q-btn",
         ".lte-figures-page .q-btn",
@@ -195,6 +196,16 @@ def test_translation_dictionaries_have_identical_keys_and_format_values():
     assert (
         module.Translator("zh-CN").text("action.open_navigation")
         == "\u6253\u5f00\u5bfc\u822a\u83dc\u5355"
+    )
+    assert (
+        module.Translator("en").text("technical.machine_status", status="ready")
+        == "Machine status: ready"
+    )
+    assert (
+        module.Translator("zh-CN").text(
+            "technical.machine_status", status="ready"
+        )
+        == "\u5185\u90e8\u72b6\u6001\uff1aready"
     )
 
 

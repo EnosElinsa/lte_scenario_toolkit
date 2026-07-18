@@ -319,7 +319,9 @@ def _render_scenario_card(
 
         def render_dataset_details() -> None:
             ui.label(card.scenario_id).classes("lte-card-id")
-            ui.label(f"Status: {card.status}").classes("lte-card-id")
+            ui.label(
+                translator.text("technical.machine_status", status=card.status)
+            ).classes("lte-card-id")
             ui.label(
                 translator.text(
                     "dataset.boundary",
