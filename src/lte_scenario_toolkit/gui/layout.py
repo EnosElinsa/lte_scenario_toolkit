@@ -38,7 +38,7 @@ def render_app_shell(
     """
 
     drawer = (
-        ui.left_drawer(value=None, fixed=True, bordered=False)
+        ui.left_drawer(value=False, fixed=True, bordered=False)
         .props("width=224 breakpoint=980 show-if-above")
         .classes("lte-navigation-rail")
         .mark("shell-navigation")
@@ -116,5 +116,23 @@ def render_app_shell(
         )
 
     refresh_job()
-    ui.timer(0.5, refresh_job, immediate=False)
+    client = ui.context.client
+    refresh_timer: Any | None = None
+
+    def stop_job_refresh() -> None:
+        nonlocal refresh_timer
+        if refresh_timer is not None:
+            refresh_timer.cancel(with_current_invocation=True)
+            refresh_timer = None
+
+    def start_job_refresh() -> None:
+        nonlocal refresh_timer
+        stop_job_refresh()
+        if client.is_deleted:
+            return
+        refresh_timer = ui.timer(0.5, refresh_job, immediate=False)
+
+    client.on_connect(start_job_refresh)
+    client.on_disconnect(stop_job_refresh)
+    client.on_delete(stop_job_refresh)
     return ui.element("main").classes("lte-main").props("id=app-content")

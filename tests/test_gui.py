@@ -1212,6 +1212,62 @@ async def test_gui_shell_renders_and_switches_language_offline(
     )["language"] == "zh-CN"
 
 
+async def test_gui_shell_does_not_query_drawer_state_from_browser_on_connect(
+    tmp_path, monkeypatch, user
+):
+    from nicegui.client import Client
+
+    module = _gui_module("app")
+    catalog = SimpleNamespace(root=tmp_path.resolve())
+    monkeypatch.setattr(
+        module,
+        "load_data_catalog",
+        lambda *args, **kwargs: pytest.fail("injected catalog must avoid file loading"),
+    )
+    drawer_queries: list[str] = []
+    original_run_javascript = Client.run_javascript
+
+    def record_run_javascript(self, code: str, *, timeout: float = 1.0):
+        if "__IS_DRAWER_OPEN__" in code:
+            drawer_queries.append(code)
+        return original_run_javascript(self, code, timeout=timeout)
+
+    monkeypatch.setattr(Client, "run_javascript", record_run_javascript)
+
+    module.create_app(catalog=catalog, testing=True)
+    await user.open("/")
+    await user.should_see(marker="shell-navigation")
+    await asyncio.sleep(0.05)
+
+    assert drawer_queries == []
+
+
+async def test_gui_shell_defers_refresh_timer_until_client_connect(
+    tmp_path, monkeypatch, user
+):
+    from nicegui import ui
+
+    module = _gui_module("app")
+    catalog = SimpleNamespace(root=tmp_path.resolve())
+    monkeypatch.setattr(
+        module,
+        "load_data_catalog",
+        lambda *args, **kwargs: pytest.fail("injected catalog must avoid file loading"),
+    )
+    timer_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    monkeypatch.setattr(
+        ui,
+        "timer",
+        lambda *args, **kwargs: timer_calls.append((args, kwargs)),
+    )
+
+    module.create_app(catalog=catalog, testing=True)
+    response = await user.http_client.get("/")
+
+    assert response.status_code == 200
+    assert timer_calls == []
+
+
 async def test_gui_shell_job_indicator_tracks_coordinator_without_navigation(
     tmp_path, user
 ):
