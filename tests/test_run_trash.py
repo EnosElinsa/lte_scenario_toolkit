@@ -240,6 +240,71 @@ def test_lease_acquired_after_plan_blocks_move_before_mutation(tmp_path):
     assert not (root / ".trash" / plan.transaction_id).exists()
 
 
+def test_move_holds_mutation_reservation_before_preflight(tmp_path, monkeypatch):
+    root = tmp_path / "results"
+    parent = publish_selection(root, run_id="a" * 32)
+    child = publish_figure(root, run_id="b" * 32, parent=parent)
+    leases = RunUsageLeaseRegistry()
+    manager = run_trash_module.TrashManager(lambda: (root,), leases)
+    plan = manager.plan(RunIdentity.from_entry(parent))
+    real_preflight = manager._preflight
+
+    def attempt_late_lease(current):
+        with pytest.raises(RunLeaseConflictError):
+            leases.acquire((RunIdentity.from_entry(child),), "Late Figures")
+        return real_preflight(current)
+
+    monkeypatch.setattr(manager, "_preflight", attempt_late_lease)
+
+    transaction = manager.move(plan)
+
+    lease_id = leases.acquire((transaction.members[0].identity,), "After move")
+    leases.release(lease_id)
+
+
+def test_move_losing_reservation_race_fails_before_mutation(tmp_path, monkeypatch):
+    root = tmp_path / "results"
+    parent = publish_selection(root, run_id="a" * 32)
+    child = publish_figure(root, run_id="b" * 32, parent=parent)
+    leases = RunUsageLeaseRegistry()
+    manager = run_trash_module.TrashManager(lambda: (root,), leases)
+    plan = manager.plan(RunIdentity.from_entry(parent))
+    real_reserve = leases.reserve_mutation
+
+    def lease_wins(identities):
+        leases.acquire((RunIdentity.from_entry(child),), "Late Figures")
+        return real_reserve(identities)
+
+    monkeypatch.setattr(leases, "reserve_mutation", lease_wins)
+
+    with pytest.raises(RunLeaseConflictError):
+        manager.move(plan)
+
+    assert parent.run_dir.is_dir()
+    assert child.run_dir.is_dir()
+    assert not (root / ".trash" / plan.transaction_id).exists()
+
+
+def test_move_releases_mutation_reservation_after_rollback(tmp_path, monkeypatch):
+    root = tmp_path / "results"
+    parent = publish_selection(root, run_id="a" * 32)
+    publish_figure(root, run_id="b" * 32, parent=parent)
+    leases = RunUsageLeaseRegistry()
+    manager = run_trash_module.TrashManager(lambda: (root,), leases)
+    plan = manager.plan(RunIdentity.from_entry(parent))
+    monkeypatch.setattr(
+        manager,
+        "_move_member",
+        lambda member, portions: (_ for _ in ()).throw(OSError("simulated failure")),
+    )
+
+    with pytest.raises(run_trash_module.TrashTransactionError, match="rolled back"):
+        manager.move(plan)
+
+    lease_id = leases.acquire((RunIdentity.from_entry(parent),), "After rollback")
+    leases.release(lease_id)
+
+
 def test_second_root_preparation_failure_leaves_cross_root_family_live(
     tmp_path,
     monkeypatch,
@@ -1440,6 +1505,38 @@ def test_usage_registry_release_is_idempotent(tmp_path):
     registry.release(lease_id)
 
     assert registry.conflicts((identity,)) == ()
+
+
+def test_usage_registry_mutation_reservation_blocks_intersection_only(tmp_path):
+    reserved = _identity(tmp_path, "reserved")
+    unrelated = _identity(tmp_path, "unrelated")
+    registry = RunUsageLeaseRegistry()
+
+    token = registry.reserve_mutation((reserved,))
+
+    with pytest.raises(RunLeaseConflictError):
+        registry.acquire((reserved,), "Figures")
+    lease_id = registry.acquire((unrelated,), "Other Figures")
+    registry.release(lease_id)
+    registry.release_mutation(token)
+    registry.release_mutation(token)
+    lease_id = registry.acquire((reserved,), "Figures after release")
+    registry.release(lease_id)
+
+
+def test_usage_registry_reservation_rejects_existing_lease_or_reservation(tmp_path):
+    identity = _identity(tmp_path)
+    registry = RunUsageLeaseRegistry()
+    lease_id = registry.acquire((identity,), "Figures")
+
+    with pytest.raises(RunLeaseConflictError, match="Figures"):
+        registry.reserve_mutation((identity,))
+
+    registry.release(lease_id)
+    token = registry.reserve_mutation((identity,))
+    with pytest.raises(RunLeaseConflictError):
+        registry.reserve_mutation((identity,))
+    registry.release_mutation(token)
 
 
 @pytest.mark.parametrize("owner", ["", "   ", 1, None])

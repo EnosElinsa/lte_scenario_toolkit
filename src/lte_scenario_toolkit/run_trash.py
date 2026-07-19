@@ -1601,15 +1601,20 @@ class TrashManager:
             total_size_bytes=current.total_size_bytes,
         )
         self._assert_unleased(current)
-        self._preflight(current)
-
-        self._operation_entries = {
-            member.identity: graph.entry(member.identity) for member in current.members
-        }
-        deleted_at = _utc_now()
-        portions: dict[Path, Path] = {}
-        completed: list[TrashMember] = []
-        restored: list[TrashMember] = []
+        reservation = self._leases.reserve_mutation(self._member_identities(current))
+        try:
+            self._preflight(current)
+            self._operation_entries = {
+                member.identity: graph.entry(member.identity) for member in current.members
+            }
+            deleted_at = _utc_now()
+            portions: dict[Path, Path] = {}
+            completed: list[TrashMember] = []
+            restored: list[TrashMember] = []
+        except BaseException:
+            self._operation_entries = {}
+            self._leases.release_mutation(reservation)
+            raise
         try:
             try:
                 for root in current.roots:
@@ -1718,6 +1723,7 @@ class TrashManager:
             )
         finally:
             self._operation_entries = {}
+            self._leases.release_mutation(reservation)
 
     def _load_transaction_portions(
         self,
@@ -2224,19 +2230,44 @@ class RunUsageLeaseRegistry:
     def __init__(self) -> None:
         self._lock = Lock()
         self._leases: dict[str, tuple[str, frozenset[RunIdentity]]] = {}
+        self._mutations: dict[str, frozenset[RunIdentity]] = {}
 
     def acquire(self, identities: Iterable[RunIdentity], owner: str) -> str:
         members = frozenset(identities)
         if not members or type(owner) is not str or not owner.strip():
             raise ValueError("run usage lease requires identities and an owner")
-        lease_id = uuid4().hex
         with self._lock:
+            if any(members.intersection(reserved) for reserved in self._mutations.values()):
+                raise RunLeaseConflictError("run family is reserved for mutation")
+            lease_id = uuid4().hex
             self._leases[lease_id] = (owner, members)
         return lease_id
 
     def release(self, lease_id: str) -> None:
         with self._lock:
             self._leases.pop(lease_id, None)
+
+    def reserve_mutation(self, identities: Iterable[RunIdentity]) -> str:
+        members = frozenset(identities)
+        if not members:
+            raise ValueError("run mutation reservation requires identities")
+        with self._lock:
+            owners = tuple(
+                sorted(
+                    owner for owner, leased in self._leases.values() if members.intersection(leased)
+                )
+            )
+            if owners:
+                raise RunLeaseConflictError("run family is in use by " + ", ".join(owners))
+            if any(members.intersection(reserved) for reserved in self._mutations.values()):
+                raise RunLeaseConflictError("run family already has a mutation reservation")
+            token = uuid4().hex
+            self._mutations[token] = members
+            return token
+
+    def release_mutation(self, token: str) -> None:
+        with self._lock:
+            self._mutations.pop(token, None)
 
     def conflicts(self, identities: Iterable[RunIdentity]) -> tuple[str, ...]:
         requested = frozenset(identities)
