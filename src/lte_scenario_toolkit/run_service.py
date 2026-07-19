@@ -483,9 +483,16 @@ class RunService:
             raise ValueError(f"{description} must be a real directory")
         return transaction, candidate
 
-    def _assert_real_tree(self, root: Path, *, description: str) -> None:
+    def _assert_real_tree(
+        self,
+        root: Path,
+        *,
+        description: str,
+        expected_device: int | None = None,
+        reject_root_mount: bool = False,
+    ) -> None:
         pending = [(root, True)]
-        expected_device: int | None = None
+        tree_device = expected_device
         while pending:
             current, is_root = pending.pop()
             try:
@@ -493,13 +500,13 @@ class RunService:
                 if _is_redirected_path(current):
                     raise ValueError(f"{description} contains a redirected path")
                 details, is_mount = _path_safety_observation(current)
-                if expected_device is None:
-                    expected_device = details.st_dev
-                elif details.st_dev != expected_device:
+                if tree_device is None:
+                    tree_device = details.st_dev
+                elif details.st_dev != tree_device:
                     raise ValueError(
                         f"{description} crosses a filesystem device boundary"
                     )
-                if not is_root and is_mount:
+                if is_mount and (not is_root or reject_root_mount):
                     raise ValueError(f"{description} contains a mounted path")
                 if stat.S_ISDIR(details.st_mode):
                     pending.extend((child, False) for child in current.iterdir())
@@ -509,6 +516,51 @@ class RunService:
                     )
             except (AttributeError, OSError, RuntimeError) as exc:
                 raise ValueError(f"{description} could not be safely validated") from exc
+
+    def _real_directory_device(
+        self,
+        path: Path,
+        *,
+        description: str,
+        expected_device: int | None = None,
+        allow_mount: bool = False,
+    ) -> int:
+        try:
+            self._assert_contained(path, description=description)
+            if _is_redirected_path(path):
+                raise ValueError(f"{description} is redirected")
+            details, is_mount = _path_safety_observation(path)
+            if not stat.S_ISDIR(details.st_mode):
+                raise ValueError(f"{description} must be a real directory")
+            if expected_device is not None and details.st_dev != expected_device:
+                raise ValueError(f"{description} crosses a filesystem device boundary")
+            if is_mount and not allow_mount:
+                raise ValueError(f"{description} must not be a mount point")
+            return details.st_dev
+        except (AttributeError, OSError, RuntimeError) as exc:
+            raise ValueError(f"{description} could not be safely validated") from exc
+
+    def _assert_purge_tree(self, transaction: Path) -> None:
+        description = "trash transaction purge target"
+        output_device = self._real_directory_device(
+            self.output_root,
+            description="run output root",
+            allow_mount=True,
+        )
+        trash_root = self.output_root / ".trash"
+        self._real_directory_device(
+            trash_root,
+            description="run trash root",
+            expected_device=output_device,
+        )
+        if transaction.parent != trash_root:
+            raise ValueError(f"{description} is outside the exact trash root")
+        self._assert_real_tree(
+            transaction,
+            description=description,
+            expected_device=output_device,
+            reject_root_mount=True,
+        )
 
     def _prepare_trash_payload_parent(
         self,
@@ -634,11 +686,11 @@ class RunService:
             or transaction in {self.output_root, trash_root}
         ):
             raise ValueError("trash transaction purge target is not exact")
-        self._assert_real_tree(transaction, description="trash transaction purge target")
+        self._assert_purge_tree(transaction)
         transaction = self._existing_trash_transaction(validated_id)
         if transaction != expected:
             raise ValueError("trash transaction purge target changed")
-        self._assert_real_tree(transaction, description="trash transaction purge target")
+        self._assert_purge_tree(transaction)
         shutil.rmtree(transaction)
 
     def _expected_paths(

@@ -1148,6 +1148,69 @@ def test_purge_rejects_descendant_mount_before_recursive_delete(
     assert transaction.is_dir()
 
 
+@pytest.mark.parametrize("boundary_name", ["trash", "transaction"])
+def test_purge_rejects_mounted_storage_boundary_anchored_below_output_root(
+    tmp_path,
+    monkeypatch,
+    boundary_name,
+):
+    service = RunService(tmp_path / "results")
+    transaction = service.prepare_trash_transaction("f" * 32)
+    trash_root = service.output_root / ".trash"
+    boundary = trash_root if boundary_name == "trash" else transaction
+    sentinel = transaction / "keep.txt"
+    sentinel.write_text("keep\n", encoding="utf-8")
+    calls = []
+
+    def observation(path):
+        candidate = Path(path)
+        return candidate.lstat(), candidate == boundary
+
+    monkeypatch.setattr(run_module, "_path_safety_observation", observation)
+    monkeypatch.setattr(shutil, "rmtree", lambda path: calls.append(Path(path)))
+
+    with pytest.raises(ValueError, match="mount|filesystem|device"):
+        service.remove_trash_transaction("f" * 32)
+
+    assert calls == []
+    assert sentinel.read_text(encoding="utf-8") == "keep\n"
+
+
+@pytest.mark.parametrize("boundary_name", ["trash", "transaction"])
+def test_purge_rejects_storage_device_boundary_anchored_at_output_root(
+    tmp_path,
+    monkeypatch,
+    boundary_name,
+):
+    service = RunService(tmp_path / "results")
+    transaction = service.prepare_trash_transaction("f" * 32)
+    trash_root = service.output_root / ".trash"
+    boundary = trash_root if boundary_name == "trash" else transaction
+    sentinel = transaction / "keep.txt"
+    sentinel.write_text("keep\n", encoding="utf-8")
+    output_device = service.output_root.lstat().st_dev
+    calls = []
+
+    def observation(path):
+        candidate = Path(path)
+        details = candidate.lstat()
+        if candidate == boundary or boundary in candidate.parents:
+            details = SimpleNamespace(
+                st_mode=details.st_mode,
+                st_dev=output_device + 1,
+            )
+        return details, False
+
+    monkeypatch.setattr(run_module, "_path_safety_observation", observation)
+    monkeypatch.setattr(shutil, "rmtree", lambda path: calls.append(Path(path)))
+
+    with pytest.raises(ValueError, match="filesystem|device"):
+        service.remove_trash_transaction("f" * 32)
+
+    assert calls == []
+    assert sentinel.read_text(encoding="utf-8") == "keep\n"
+
+
 def test_purge_rejects_descendant_device_crossing_before_recursive_delete(
     tmp_path,
     monkeypatch,
