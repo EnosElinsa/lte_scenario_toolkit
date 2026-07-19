@@ -120,6 +120,15 @@ class TrashTransaction:
 
 
 @dataclass(frozen=True, slots=True)
+class TrashMutationReceipt:
+    transaction_id: str
+    restored: bool = False
+    purged: bool = False
+    run_count: int = 0
+    size_bytes: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class TrashDiagnostic:
     root_digest: str
     transaction_id: str | None
@@ -1360,6 +1369,26 @@ def _transaction_from_plan(
     )
 
 
+def _transaction_with_state(
+    transaction: TrashTransaction,
+    state: TrashState,
+    *,
+    errors: Iterable[str] | None = None,
+) -> TrashTransaction:
+    return TrashTransaction(
+        transaction_id=transaction.transaction_id,
+        selected=transaction.selected,
+        members=transaction.members,
+        roots=transaction.roots,
+        state=state,
+        deleted_at=transaction.deleted_at,
+        completed_move_ids=transaction.completed_move_ids,
+        completed_restore_ids=transaction.completed_restore_ids,
+        total_size_bytes=transaction.total_size_bytes,
+        errors=transaction.errors if errors is None else tuple(errors),
+    )
+
+
 class TrashManager:
     """Coordinate journaled whole-family moves across configured roots."""
 
@@ -1512,7 +1541,7 @@ class TrashManager:
         moved = tuple(completed_move_ids)
         restored = tuple(completed_restore_ids)
         failure_details = tuple(errors)
-        for root in plan.roots:
+        for root in sorted(portions, key=_canonical_path_key):
             transaction = portions[root]
             atomic_write_json(
                 transaction / "trash.json",
@@ -1725,10 +1754,10 @@ class TrashManager:
             self._operation_entries = {}
             self._leases.release_mutation(reservation)
 
-    def _load_transaction_portions(
+    def _read_transaction_portions(
         self,
         transaction_id: str,
-    ) -> tuple[tuple[_TrashPortion, ...], TrashTransaction]:
+    ) -> tuple[tuple[Path, ...], tuple[_TrashPortion, ...]]:
         if (
             type(transaction_id) is not str
             or _TRANSACTION_ID_PATTERN.fullmatch(transaction_id) is None
@@ -1768,6 +1797,13 @@ class TrashManager:
                 )
             except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise TrashTransactionError("trash recovery journal is non-actionable") from exc
+        return roots, tuple(portions)
+
+    def _load_transaction_portions(
+        self,
+        transaction_id: str,
+    ) -> tuple[tuple[_TrashPortion, ...], TrashTransaction]:
+        _, portions = self._read_transaction_portions(transaction_id)
         if not portions:
             try:
                 return (), self._recovered_transactions[transaction_id]
@@ -1779,7 +1815,7 @@ class TrashManager:
             raise TrashTransactionError(
                 "trash recovery transaction portions are incomplete or inconsistent"
             ) from exc
-        return tuple(portions), transaction
+        return portions, transaction
 
     @staticmethod
     def _entry_proxy(
@@ -1858,6 +1894,541 @@ class TrashManager:
             raise TrashTransactionError(
                 "trash recovery payload failed manifest validation"
             ) from exc
+
+    @staticmethod
+    def _portion_paths(portions: Iterable[_TrashPortion]) -> dict[Path, Path]:
+        return {portion.root: portion.transaction_path for portion in portions}
+
+    def _transaction_payloads_intact(
+        self,
+        transaction: TrashTransaction,
+        portions: Mapping[Path, Path],
+    ) -> bool:
+        if set(portions) != set(transaction.roots):
+            return False
+        seen: set[tuple[Any, ...]] = set()
+        try:
+            for root in transaction.roots:
+                transaction_path = portions[root]
+                if (
+                    not os.path.lexists(transaction_path)
+                    or _is_redirected_path(transaction_path)
+                    or not transaction_path.is_dir()
+                    or transaction_path != root / ".trash" / transaction.transaction_id
+                ):
+                    return False
+            for member in transaction.members:
+                if os.path.lexists(member.identity.expected_path):
+                    return False
+                payload = portions[member.identity.root].joinpath(*member.trash_relative_path.parts)
+                if not os.path.lexists(payload):
+                    return False
+                self._entry_from_physical_copy(member, payload, live=False)
+                if _validated_tree_size(payload, seen) != member.size_bytes:
+                    return False
+        except (OSError, RuntimeError, TrashTransactionError, ValueError):
+            return False
+        return True
+
+    @staticmethod
+    def _partial_purge_transaction(
+        portions: tuple[_TrashPortion, ...],
+        roots: tuple[Path, ...],
+    ) -> TrashTransaction:
+        if not portions:
+            raise ValueError("trash transaction has no surviving portions")
+        first = portions[0]
+        if any(
+            portion.immutable_contract() != first.immutable_contract() for portion in portions[1:]
+        ):
+            raise ValueError("trash transaction portions disagree")
+        roots_by_digest = {_root_digest(root): root for root in roots}
+        if set(first.expected_root_digests) != set(roots_by_digest):
+            raise ValueError("trash transaction expected roots are unavailable")
+        present_by_digest = {_root_digest(portion.root): portion for portion in portions}
+        if len(present_by_digest) != len(portions):
+            raise ValueError("trash transaction contains duplicate portions")
+        if not set(present_by_digest) < set(first.expected_root_digests):
+            raise ValueError("trash transaction is not a partial purge")
+        expected_roots = tuple(roots_by_digest[digest] for digest in first.expected_root_digests)
+        for root in expected_roots:
+            if (
+                not os.path.lexists(root)
+                or _is_redirected_path(root)
+                or not root.is_dir()
+                or root.resolve(strict=True) != root
+            ):
+                raise ValueError("trash transaction expected root is unavailable")
+        if any(
+            portion.state not in {TrashState.PURGING, TrashState.PURGE_FAILED}
+            for portion in portions
+        ):
+            raise ValueError("missing trash portions do not belong to a purge")
+        move_ids = first.completed_move_ids
+        if not move_ids or any(portion.completed_move_ids != move_ids for portion in portions):
+            raise ValueError("partial purge move progress disagrees")
+        if any(portion.completed_restore_ids for portion in portions):
+            raise ValueError("partial purge contains restore progress")
+        members = tuple(member for portion in portions for member in portion.members)
+        member_ids = tuple(member.identity.run_id for member in members)
+        if len(set(member_ids)) != len(member_ids) or not set(member_ids).issubset(move_ids):
+            raise ValueError("partial purge members disagree with move progress")
+        positions = {run_id: index for index, run_id in enumerate(move_ids)}
+        members = tuple(sorted(members, key=lambda member: positions[member.identity.run_id]))
+        for portion in portions:
+            expected_local = tuple(
+                member for member in members if member.identity.root == portion.root
+            )
+            if portion.members != expected_local:
+                raise ValueError("partial purge root-local members are unordered")
+        if sum(member.size_bytes for member in members) > first.total_size_bytes:
+            raise ValueError("partial purge member sizes exceed the transaction total")
+        return TrashTransaction(
+            transaction_id=first.transaction_id,
+            selected=first.selected,
+            members=members,
+            roots=tuple(sorted(expected_roots, key=_canonical_path_key)),
+            state=TrashState.PURGE_FAILED,
+            deleted_at=first.deleted_at,
+            completed_move_ids=move_ids,
+            completed_restore_ids=(),
+            total_size_bytes=first.total_size_bytes,
+            errors=tuple(sorted({error for portion in portions for error in portion.errors})),
+        )
+
+    def _merge_actionable_portions(
+        self,
+        portions: tuple[_TrashPortion, ...],
+        roots: tuple[Path, ...],
+    ) -> TrashTransaction:
+        try:
+            transaction = _merge_portions(portions)
+        except (OSError, RuntimeError, TypeError, ValueError) as strict_error:
+            try:
+                return self._partial_purge_transaction(portions, roots)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                raise strict_error from None
+        if transaction.state is TrashState.PURGING:
+            state = (
+                TrashState.TRASHED
+                if self._transaction_payloads_intact(
+                    transaction,
+                    self._portion_paths(portions),
+                )
+                else TrashState.PURGE_FAILED
+            )
+            return _transaction_with_state(transaction, state)
+        return transaction
+
+    def _load_actionable_transaction(
+        self,
+        transaction_id: str,
+    ) -> tuple[tuple[_TrashPortion, ...], TrashTransaction]:
+        roots, portions = self._read_transaction_portions(transaction_id)
+        if not portions:
+            raise TrashTransactionError("trash transaction was not found")
+        try:
+            transaction = self._merge_actionable_portions(portions, roots)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise TrashTransactionError(
+                "trash transaction portions are incomplete or inconsistent"
+            ) from exc
+        return portions, transaction
+
+    def transaction(self, transaction_id: str) -> TrashTransaction:
+        _, transaction = self._load_actionable_transaction(transaction_id)
+        return transaction
+
+    def _trash_entries_for_restore(
+        self,
+        transaction: TrashTransaction,
+        portions: Mapping[Path, Path],
+    ) -> dict[RunIdentity, RunEntry]:
+        entries: dict[RunIdentity, RunEntry] = {}
+        seen: set[tuple[Any, ...]] = set()
+        for member in transaction.members:
+            try:
+                transaction_path = portions[member.identity.root]
+            except KeyError as exc:
+                raise TrashTransactionError(
+                    "trash restore journal is missing an expected root portion"
+                ) from exc
+            payload = transaction_path.joinpath(*member.trash_relative_path.parts)
+            entries[member.identity] = self._entry_from_physical_copy(
+                member,
+                payload,
+                live=False,
+            )
+            try:
+                size = _validated_tree_size(payload, seen)
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise TrashTransactionError("trash restore payload failed size validation") from exc
+            if size != member.size_bytes:
+                raise TrashTransactionError("trash restore payload size changed from its snapshot")
+        return entries
+
+    @staticmethod
+    def _restore_root_available(root: Path) -> bool:
+        try:
+            return (
+                os.path.lexists(root)
+                and not _is_redirected_path(root)
+                and root.is_dir()
+                and root.resolve(strict=True) == root
+                and os.access(root, os.W_OK | os.X_OK)
+            )
+        except (OSError, RuntimeError, ValueError):
+            return False
+
+    def _restore_blocker_codes(
+        self,
+        transaction: TrashTransaction,
+        portions: Mapping[Path, Path],
+    ) -> tuple[str, ...]:
+        found: set[str] = set()
+        if transaction.state is not TrashState.TRASHED:
+            found.add("trash.restore.state")
+        for root in transaction.roots:
+            if not self._restore_root_available(root):
+                found.add("trash.restore.root_unavailable")
+        if set(portions) != set(transaction.roots):
+            found.add("trash.restore.journal_invalid")
+        else:
+            for root, transaction_path in portions.items():
+                expected = root / ".trash" / transaction.transaction_id
+                journal = transaction_path / "trash.json"
+                try:
+                    valid = (
+                        transaction_path == expected
+                        and os.path.lexists(transaction_path)
+                        and not _is_redirected_path(transaction_path)
+                        and transaction_path.is_dir()
+                        and transaction_path.resolve(strict=True) == transaction_path
+                        and journal.parent == transaction_path
+                        and not _is_redirected_path(journal)
+                        and journal.is_file()
+                    )
+                except (OSError, RuntimeError, ValueError):
+                    valid = False
+                if not valid:
+                    found.add("trash.restore.journal_invalid")
+                    break
+        if any(os.path.lexists(member.identity.expected_path) for member in transaction.members):
+            found.add("trash.restore.destination_occupied")
+        if "trash.restore.journal_invalid" not in found:
+            try:
+                self._trash_entries_for_restore(transaction, portions)
+            except TrashTransactionError:
+                found.add("trash.restore.journal_invalid")
+        if self._leases.conflicts(member.identity for member in transaction.members):
+            found.add("trash.restore.lease_conflict")
+        order = (
+            "trash.restore.state",
+            "trash.restore.root_unavailable",
+            "trash.restore.destination_occupied",
+            "trash.restore.journal_invalid",
+            "trash.restore.lease_conflict",
+        )
+        return tuple(code for code in order if code in found)
+
+    def restore_blockers(self, transaction_id: str) -> tuple[str, ...]:
+        try:
+            portions, transaction = self._load_actionable_transaction(transaction_id)
+        except TrashTransactionError as exc:
+            if "root" in str(exc) and "unavailable" in str(exc):
+                return ("trash.restore.root_unavailable",)
+            return ("trash.restore.journal_invalid",)
+        return self._restore_blocker_codes(
+            transaction,
+            self._portion_paths(portions),
+        )
+
+    def _preflight_restore(
+        self,
+        transaction: TrashTransaction,
+        portions: Mapping[Path, Path],
+    ) -> None:
+        blockers = self._restore_blocker_codes(transaction, portions)
+        if blockers:
+            first = blockers[0]
+            if first == "trash.restore.state":
+                if transaction.state is TrashState.PURGE_FAILED:
+                    raise TrashTransactionError("a partially purged transaction cannot be restored")
+                raise TrashTransactionError("trash transaction state is not restorable")
+            if first == "trash.restore.root_unavailable":
+                raise TrashTransactionError("an expected restore root is unavailable")
+            if first == "trash.restore.destination_occupied":
+                raise TrashTransactionError("an original restore destination is occupied")
+            if first == "trash.restore.journal_invalid":
+                raise TrashTransactionError("trash restore journal or payload is invalid")
+            raise RunLeaseConflictError("run family is in use")
+        self._operation_entries = self._trash_entries_for_restore(transaction, portions)
+
+    def _validate_restored_family(self, transaction: TrashTransaction) -> None:
+        seen: set[tuple[Any, ...]] = set()
+        for member in transaction.members:
+            try:
+                entry = RunService(member.identity.root).entry_for_path(
+                    member.identity.expected_path,
+                    run_id=member.identity.run_id,
+                )
+                self._assert_member_record(member, entry.record)
+                size = _validated_tree_size(member.identity.expected_path, seen)
+            except TrashTransactionError:
+                raise
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                raise TrashTransactionError(
+                    "restored run failed fresh identity validation"
+                ) from exc
+            if size != member.size_bytes:
+                raise TrashTransactionError("restored run size changed from its snapshot")
+
+    def restore(self, transaction_id: str) -> TrashMutationReceipt:
+        portions, transaction = self._load_actionable_transaction(transaction_id)
+        if transaction.state is TrashState.PURGE_FAILED:
+            raise TrashTransactionError("a partially purged transaction cannot be restored")
+        if transaction.state is not TrashState.TRASHED:
+            raise TrashTransactionError("trash transaction state is not restorable")
+        reservation = self._leases.reserve_mutation(
+            member.identity for member in transaction.members
+        )
+        self._operation_entries = {}
+        try:
+            portions, current = self._load_actionable_transaction(transaction_id)
+            if (
+                current.state is not TrashState.TRASHED
+                or current.completed_move_ids != transaction.completed_move_ids
+                or current.total_size_bytes != transaction.total_size_bytes
+            ):
+                raise TrashTransactionError("trash restore transaction changed; refresh and retry")
+            portion_paths = self._portion_paths(portions)
+            self._preflight_restore(current, portion_paths)
+            plan = self._plan_from_portions(current, portions)
+            move_ids = current.completed_move_ids
+            restored: list[TrashMember] = []
+            original_error: BaseException | None = None
+            try:
+                self._write_portions(
+                    plan,
+                    portion_paths,
+                    state=TrashState.RESTORING,
+                    deleted_at=current.deleted_at,
+                    completed_move_ids=move_ids,
+                )
+                for member in reversed(current.members):
+                    self._restore_member(member, portion_paths)
+                    restored.append(member)
+                    self._write_portions(
+                        plan,
+                        portion_paths,
+                        state=TrashState.RESTORING,
+                        deleted_at=current.deleted_at,
+                        completed_move_ids=move_ids,
+                        completed_restore_ids=(item.identity.run_id for item in restored),
+                    )
+                self._validate_restored_family(current)
+                self._remove_transaction_portions(portion_paths)
+            except BaseException as exc:
+                original_error = exc
+
+            if original_error is not None:
+                rollback_errors: list[str] = []
+                while restored:
+                    member = restored[-1]
+                    try:
+                        self._move_member(member, portion_paths)
+                        restored.pop()
+                        self._write_portions(
+                            plan,
+                            portion_paths,
+                            state=TrashState.RESTORING,
+                            deleted_at=current.deleted_at,
+                            completed_move_ids=move_ids,
+                            completed_restore_ids=(item.identity.run_id for item in restored),
+                            errors=(self._error_detail("restore", original_error),),
+                        )
+                    except BaseException as rollback_error:
+                        rollback_errors.append(
+                            self._error_detail("restore rollback", rollback_error)
+                        )
+                        break
+                if not rollback_errors and not restored:
+                    try:
+                        self._write_portions(
+                            plan,
+                            portion_paths,
+                            state=TrashState.TRASHED,
+                            deleted_at=current.deleted_at,
+                            completed_move_ids=move_ids,
+                        )
+                    except BaseException as journal_error:
+                        rollback_errors.append(
+                            self._error_detail("restore rollback journal", journal_error)
+                        )
+                    else:
+                        self._cleanup_live_parents(current.members)
+                        raise TrashTransactionError(
+                            "trash restore failed and was rolled back"
+                        ) from original_error
+
+                errors = (
+                    self._error_detail("restore", original_error),
+                    *rollback_errors,
+                )
+                try:
+                    self._write_portions(
+                        plan,
+                        portion_paths,
+                        state=TrashState.RESTORING,
+                        deleted_at=current.deleted_at,
+                        completed_move_ids=move_ids,
+                        completed_restore_ids=(item.identity.run_id for item in restored),
+                        errors=errors,
+                    )
+                except BaseException:
+                    pass
+                raise TrashTransactionError(
+                    "trash restore failed and requires recovery: " + "; ".join(errors)
+                ) from original_error
+
+            return TrashMutationReceipt(
+                transaction_id=current.transaction_id,
+                restored=True,
+                run_count=len(current.members),
+                size_bytes=current.total_size_bytes,
+            )
+        finally:
+            self._operation_entries = {}
+            self._leases.release_mutation(reservation)
+
+    def _existing_purge_portions(
+        self,
+        transaction: TrashTransaction,
+    ) -> dict[Path, Path]:
+        portions: dict[Path, Path] = {}
+        for root in transaction.roots:
+            if not self._restore_root_available(root):
+                raise TrashTransactionError("an expected purge root is unavailable")
+            transaction_path = root / ".trash" / transaction.transaction_id
+            if not os.path.lexists(transaction_path):
+                continue
+            try:
+                if (
+                    _is_redirected_path(transaction_path)
+                    or not transaction_path.is_dir()
+                    or transaction_path.parent != root / ".trash"
+                    or transaction_path.resolve(strict=True) != transaction_path
+                ):
+                    raise ValueError("unsafe purge portion")
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise TrashTransactionError("trash purge portion is unsafe") from exc
+            portions[root] = transaction_path
+        return portions
+
+    def _preflight_purge(
+        self,
+        transaction: TrashTransaction,
+        portions: Mapping[Path, Path],
+    ) -> None:
+        if transaction.state not in {TrashState.TRASHED, TrashState.PURGE_FAILED}:
+            raise TrashTransactionError("trash transaction state is not purgeable")
+        if not portions:
+            raise TrashTransactionError("trash transaction was not found")
+        if transaction.state is TrashState.TRASHED and not self._transaction_payloads_intact(
+            transaction,
+            portions,
+        ):
+            raise TrashTransactionError("healthy trash transaction is incomplete")
+
+    def purge(
+        self,
+        transaction_id: str,
+        *,
+        confirmation: str,
+    ) -> TrashMutationReceipt:
+        portions, transaction = self._load_actionable_transaction(transaction_id)
+        if type(confirmation) is not str or confirmation != transaction_id[:8]:
+            raise TrashTransactionError("permanent deletion confirmation does not match")
+        if transaction.state not in {TrashState.TRASHED, TrashState.PURGE_FAILED}:
+            raise TrashTransactionError("trash transaction state is not purgeable")
+        reservation = self._leases.reserve_mutation(
+            member.identity for member in transaction.members
+        )
+        try:
+            portions, current = self._load_actionable_transaction(transaction_id)
+            if (
+                current.state not in {TrashState.TRASHED, TrashState.PURGE_FAILED}
+                or current.completed_move_ids != transaction.completed_move_ids
+                or current.total_size_bytes != transaction.total_size_bytes
+            ):
+                raise TrashTransactionError("trash purge transaction changed; refresh and retry")
+            portion_paths = self._existing_purge_portions(current)
+            self._preflight_purge(current, portion_paths)
+            plan = self._plan_from_portions(current, portions)
+            try:
+                self._write_portions(
+                    plan,
+                    portion_paths,
+                    state=TrashState.PURGING,
+                    deleted_at=current.deleted_at,
+                    completed_move_ids=current.completed_move_ids,
+                )
+            except BaseException as exc:
+                fallback_state = (
+                    TrashState.TRASHED
+                    if current.state is TrashState.TRASHED
+                    else TrashState.PURGE_FAILED
+                )
+                try:
+                    self._write_portions(
+                        plan,
+                        portion_paths,
+                        state=fallback_state,
+                        deleted_at=current.deleted_at,
+                        completed_move_ids=current.completed_move_ids,
+                    )
+                except BaseException:
+                    pass
+                raise TrashTransactionError(
+                    "permanent deletion failed before payload removal"
+                ) from exc
+
+            removed_any = False
+            try:
+                for root in sorted(portion_paths, key=_canonical_path_key):
+                    RunService(root).remove_trash_transaction(transaction_id)
+                    removed_any = True
+            except BaseException as exc:
+                remaining = self._existing_purge_portions(current)
+                intact = (
+                    current.state is TrashState.TRASHED
+                    and not removed_any
+                    and self._transaction_payloads_intact(current, remaining)
+                )
+                failed_state = TrashState.TRASHED if intact else TrashState.PURGE_FAILED
+                try:
+                    self._write_portions(
+                        plan,
+                        remaining,
+                        state=failed_state,
+                        deleted_at=current.deleted_at,
+                        completed_move_ids=current.completed_move_ids,
+                        errors=(self._error_detail("purge", exc),),
+                    )
+                except BaseException:
+                    pass
+                raise TrashTransactionError(
+                    "permanent deletion stopped before all trash data was removed"
+                ) from exc
+
+            return TrashMutationReceipt(
+                transaction_id=current.transaction_id,
+                purged=True,
+                run_count=len(current.completed_move_ids),
+                size_bytes=current.total_size_bytes,
+            )
+        finally:
+            self._leases.release_mutation(reservation)
 
     def _preflight_recovery_pairs(
         self,
@@ -2201,7 +2772,7 @@ class TrashManager:
         transactions: list[TrashTransaction] = []
         for transaction_id, portions in sorted(grouped.items()):
             try:
-                transactions.append(_merge_portions(portions))
+                transactions.append(self._merge_actionable_portions(tuple(portions), roots))
             except (OSError, RuntimeError, TypeError, ValueError) as exc:
                 diagnostics.append(
                     TrashDiagnostic(

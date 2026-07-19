@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import shutil
@@ -769,6 +770,269 @@ def test_recover_stops_without_overwrite_for_ambiguous_path_pairs(
     assert not parent.run_dir.exists()
     assert child.run_dir.exists() == (copies == "both")
     assert child_trash.exists() == (copies == "both")
+
+
+def test_restore_returns_complete_family_parents_first(tmp_path, monkeypatch):
+    manager, parent, child = manager_for_two_run_family(tmp_path)
+    moved = manager.move(manager.plan(RunIdentity.from_entry(parent)))
+    restored_ids = []
+    real_restore = manager._restore_member
+
+    def tracking_restore(member, portions):
+        restored_ids.append(member.identity.run_id)
+        return real_restore(member, portions)
+
+    monkeypatch.setattr(manager, "_restore_member", tracking_restore)
+
+    receipt = manager.restore(moved.transaction_id)
+
+    assert receipt.restored is True
+    assert receipt.purged is False
+    assert receipt.run_count == 2
+    assert receipt.size_bytes == moved.total_size_bytes
+    assert restored_ids == [parent.run_id, child.run_id]
+    assert parent.run_dir.is_dir()
+    assert child.run_dir.is_dir()
+    assert manager.list_transactions() == ()
+
+
+def test_restore_rejects_any_occupied_destination_before_moving(tmp_path, monkeypatch):
+    manager, parent, child = manager_for_two_run_family(tmp_path)
+    moved = manager.move(manager.plan(RunIdentity.from_entry(parent)))
+    parent.run_dir.mkdir(parents=True)
+    restore_calls = []
+    real_restore = manager._restore_member
+
+    def tracking_restore(member, portions):
+        restore_calls.append(member.identity.run_id)
+        return real_restore(member, portions)
+
+    monkeypatch.setattr(manager, "_restore_member", tracking_restore)
+
+    assert manager.restore_blockers(moved.transaction_id) == ("trash.restore.destination_occupied",)
+    with pytest.raises(run_trash_module.TrashTransactionError, match="occupied"):
+        manager.restore(moved.transaction_id)
+
+    assert restore_calls == []
+    assert not child.run_dir.exists()
+    assert manager.transaction(moved.transaction_id).state is run_trash_module.TrashState.TRASHED
+
+
+def test_restore_failure_retrashes_restored_members_and_stays_trashed(
+    tmp_path,
+    monkeypatch,
+):
+    manager, parent, child = manager_for_two_run_family(tmp_path)
+    moved = manager.move(manager.plan(RunIdentity.from_entry(parent)))
+    real_restore = manager._restore_member
+
+    def fail_child(member, portions):
+        if member.identity.run_id == child.run_id:
+            raise OSError("simulated restore failure")
+        return real_restore(member, portions)
+
+    monkeypatch.setattr(manager, "_restore_member", fail_child)
+
+    with pytest.raises(run_trash_module.TrashTransactionError, match="rolled back"):
+        manager.restore(moved.transaction_id)
+
+    assert not parent.run_dir.exists()
+    assert not child.run_dir.exists()
+    transaction = manager.transaction(moved.transaction_id)
+    assert transaction.state is run_trash_module.TrashState.TRASHED
+    assert transaction.completed_restore_ids == ()
+
+
+def test_restore_rollback_failure_requires_recovery(tmp_path, monkeypatch):
+    manager, parent, child = manager_for_two_run_family(tmp_path)
+    moved = manager.move(manager.plan(RunIdentity.from_entry(parent)))
+    real_restore = manager._restore_member
+
+    def fail_child(member, portions):
+        if member.identity.run_id == child.run_id:
+            raise OSError("simulated restore failure")
+        return real_restore(member, portions)
+
+    monkeypatch.setattr(manager, "_restore_member", fail_child)
+    monkeypatch.setattr(
+        manager,
+        "_move_member",
+        lambda member, portions: (_ for _ in ()).throw(OSError("simulated rollback failure")),
+    )
+
+    with pytest.raises(run_trash_module.TrashTransactionError, match="recovery"):
+        manager.restore(moved.transaction_id)
+
+    assert parent.run_dir.is_dir()
+    assert not child.run_dir.exists()
+    assert (
+        manager.transaction(moved.transaction_id).state
+        is run_trash_module.TrashState.RECOVERY_REQUIRED
+    )
+
+
+def test_restore_holds_and_releases_atomic_mutation_reservation(tmp_path, monkeypatch):
+    root = tmp_path / "results"
+    parent = publish_selection(root, run_id="a" * 32)
+    child = publish_figure(root, run_id="b" * 32, parent=parent)
+    leases = RunUsageLeaseRegistry()
+    manager = run_trash_module.TrashManager(lambda: (root,), leases)
+    moved = manager.move(manager.plan(RunIdentity.from_entry(parent)))
+    real_preflight = manager._preflight_restore
+
+    def attempt_late_lease(transaction, portions):
+        with pytest.raises(RunLeaseConflictError):
+            leases.acquire((RunIdentity.from_entry(child),), "Late Figures")
+        return real_preflight(transaction, portions)
+
+    monkeypatch.setattr(manager, "_preflight_restore", attempt_late_lease)
+
+    manager.restore(moved.transaction_id)
+
+    lease_id = leases.acquire((RunIdentity.from_entry(parent),), "After restore")
+    leases.release(lease_id)
+
+
+def test_purge_confirmation_is_exact_and_case_sensitive(tmp_path):
+    manager, parent, _ = manager_for_two_run_family(tmp_path)
+    with patch.object(
+        run_trash_module,
+        "uuid4",
+        return_value=UUID(hex="abcdef0123456789abcdef0123456789"),
+    ):
+        plan = manager.plan(RunIdentity.from_entry(parent))
+    moved = manager.move(plan)
+
+    for confirmation in ("wrong", moved.transaction_id[:8].upper()):
+        with pytest.raises(run_trash_module.TrashTransactionError, match="confirmation"):
+            manager.purge(moved.transaction_id, confirmation=confirmation)
+
+    assert manager.transaction(moved.transaction_id).state is run_trash_module.TrashState.TRASHED
+
+
+def test_purge_failure_before_any_removal_returns_to_trashed(tmp_path, monkeypatch):
+    manager, parent, _ = manager_for_two_run_family(tmp_path)
+    moved = manager.move(manager.plan(RunIdentity.from_entry(parent)))
+    monkeypatch.setattr(
+        RunService,
+        "remove_trash_transaction",
+        lambda service, transaction_id: (_ for _ in ()).throw(OSError("simulated failure")),
+    )
+
+    with pytest.raises(run_trash_module.TrashTransactionError, match="permanent deletion"):
+        manager.purge(
+            moved.transaction_id,
+            confirmation=moved.transaction_id[:8],
+        )
+
+    assert manager.transaction(moved.transaction_id).state is run_trash_module.TrashState.TRASHED
+    assert manager.restore_blockers(moved.transaction_id) == ()
+
+
+def test_partial_cross_root_purge_disables_restore_and_retry_reports_full_receipt(
+    tmp_path,
+    monkeypatch,
+):
+    manager, parent, child = manager_for_cross_root_family(tmp_path)
+    moved = manager.move(manager.plan(RunIdentity.from_entry(parent)))
+    real_remove = RunService.remove_trash_transaction
+    calls = 0
+
+    def fail_second(service, transaction_id):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated second-root purge failure")
+        return real_remove(service, transaction_id)
+
+    monkeypatch.setattr(RunService, "remove_trash_transaction", fail_second)
+
+    with pytest.raises(run_trash_module.TrashTransactionError, match="permanent deletion"):
+        manager.purge(
+            moved.transaction_id,
+            confirmation=moved.transaction_id[:8],
+        )
+
+    failed = manager.transaction(moved.transaction_id)
+    assert failed.state is run_trash_module.TrashState.PURGE_FAILED
+    assert manager.list_transactions()[0].state is run_trash_module.TrashState.PURGE_FAILED
+    with pytest.raises(run_trash_module.TrashTransactionError, match="cannot be restored"):
+        manager.restore(moved.transaction_id)
+
+    monkeypatch.setattr(RunService, "remove_trash_transaction", real_remove)
+    receipt = manager.purge(
+        moved.transaction_id,
+        confirmation=moved.transaction_id[:8],
+    )
+
+    assert receipt.purged is True
+    assert receipt.restored is False
+    assert receipt.run_count == 2
+    assert receipt.size_bytes == moved.total_size_bytes
+    assert not parent.run_dir.exists()
+    assert not child.run_dir.exists()
+    assert manager.list_transactions() == ()
+
+
+def test_interrupted_purging_with_all_payloads_intact_normalizes_to_trashed(tmp_path):
+    manager, parent, _ = manager_for_two_run_family(tmp_path)
+    moved = manager.move(manager.plan(RunIdentity.from_entry(parent)))
+    journal_path = parent.root / ".trash" / moved.transaction_id / "trash.json"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    journal["state"] = "purging"
+    run_trash_module.atomic_write_json(journal_path, journal)
+
+    transaction = manager.transaction(moved.transaction_id)
+
+    assert transaction.state is run_trash_module.TrashState.TRASHED
+    assert manager.restore_blockers(moved.transaction_id) == ()
+
+
+def test_interrupted_purging_with_missing_portion_normalizes_to_purge_failed(tmp_path):
+    manager, parent, _ = manager_for_cross_root_family(tmp_path)
+    moved = manager.move(manager.plan(RunIdentity.from_entry(parent)))
+    for root in moved.roots:
+        journal_path = root / ".trash" / moved.transaction_id / "trash.json"
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        journal["state"] = "purging"
+        run_trash_module.atomic_write_json(journal_path, journal)
+    RunService(moved.roots[0]).remove_trash_transaction(moved.transaction_id)
+
+    transaction = manager.transaction(moved.transaction_id)
+
+    assert transaction.state is run_trash_module.TrashState.PURGE_FAILED
+    with pytest.raises(run_trash_module.TrashTransactionError, match="cannot be restored"):
+        manager.restore(moved.transaction_id)
+
+
+def test_run_trash_has_no_automatic_purge_entrypoint():
+    source = Path(run_trash_module.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    forbidden_names = {
+        "Timer",
+        "add_job",
+        "call_later",
+        "on_startup",
+        "schedule",
+        "scheduler",
+    }
+
+    assert not {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and node.id in forbidden_names
+    }
+    assert not {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr in forbidden_names
+    }
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "purge"
+        for node in ast.walk(tree)
+    )
 
 
 def test_run_identity_normalizes_paths_without_requiring_live_entry(tmp_path):
