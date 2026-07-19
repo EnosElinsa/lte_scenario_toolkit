@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import ctypes
 import errno
 import json
 import os
 import re
 import shutil
 import stat
+import sys
 import uuid
 from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
@@ -81,6 +83,60 @@ def _assert_unredirected_chain(path: Path, *, description: str) -> Path:
                 f"{description} path must not use redirected paths: {candidate}"
             )
     return candidate
+
+
+def _rename_noreplace(source: Path, destination: Path) -> None:
+    """Atomically rename without replacing an existing destination."""
+
+    source_value = os.fspath(source)
+    destination_value = os.fspath(destination)
+    if os.name == "nt":
+        os.rename(source_value, destination_value)
+        return
+    if sys.platform.startswith("linux"):
+        try:
+            renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+        except AttributeError as exc:
+            raise OSError(
+                errno.ENOTSUP,
+                "atomic no-replace rename is unavailable",
+                destination_value,
+            ) from exc
+        renameat2.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        renameat2.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        result = renameat2(
+            -100,
+            os.fsencode(source_value),
+            -100,
+            os.fsencode(destination_value),
+            1,
+        )
+        if result != 0:
+            error = ctypes.get_errno()
+            raise OSError(
+                error,
+                os.strerror(error),
+                destination_value,
+            )
+        return
+    raise OSError(
+        errno.ENOTSUP,
+        "atomic no-replace rename is unsupported on this platform",
+        destination_value,
+    )
+
+
+def _path_safety_observation(path: Path) -> tuple[os.stat_result, bool]:
+    """Return no-follow metadata and whether an existing path is a mount."""
+
+    return path.lstat(), os.path.ismount(path)
 
 
 @dataclass(frozen=True)
@@ -428,21 +484,30 @@ class RunService:
         return transaction, candidate
 
     def _assert_real_tree(self, root: Path, *, description: str) -> None:
-        pending = [root]
+        pending = [(root, True)]
+        expected_device: int | None = None
         while pending:
-            current = pending.pop()
+            current, is_root = pending.pop()
             try:
                 self._assert_contained(current, description=description)
                 if _is_redirected_path(current):
                     raise ValueError(f"{description} contains a redirected path")
-                details = current.lstat()
+                details, is_mount = _path_safety_observation(current)
+                if expected_device is None:
+                    expected_device = details.st_dev
+                elif details.st_dev != expected_device:
+                    raise ValueError(
+                        f"{description} crosses a filesystem device boundary"
+                    )
+                if not is_root and is_mount:
+                    raise ValueError(f"{description} contains a mounted path")
                 if stat.S_ISDIR(details.st_mode):
-                    pending.extend(current.iterdir())
+                    pending.extend((child, False) for child in current.iterdir())
                 elif not stat.S_ISREG(details.st_mode):
                     raise ValueError(
                         f"{description} contains a non-regular filesystem entry"
                     )
-            except OSError as exc:
+            except (AttributeError, OSError, RuntimeError) as exc:
                 raise ValueError(f"{description} could not be safely validated") from exc
 
     def _prepare_trash_payload_parent(
@@ -493,7 +558,7 @@ class RunService:
         self._assert_contained(target, description="trash destination")
         if os.path.lexists(target):
             raise FileExistsError(f"trash destination already exists: {target}")
-        current.run_dir.replace(target)
+        _rename_noreplace(current.run_dir, target)
         return target
 
     def _validated_trash_source_record(
@@ -553,7 +618,7 @@ class RunService:
         self._assert_contained(destination, description="restore destination")
         if os.path.lexists(destination):
             raise FileExistsError(f"restore destination already exists: {destination}")
-        trash_source.replace(destination)
+        _rename_noreplace(trash_source, destination)
         return destination
 
     def remove_trash_transaction(self, transaction_id: str) -> None:
@@ -573,6 +638,7 @@ class RunService:
         transaction = self._existing_trash_transaction(validated_id)
         if transaction != expected:
             raise ValueError("trash transaction purge target changed")
+        self._assert_real_tree(transaction, description="trash transaction purge target")
         shutil.rmtree(transaction)
 
     def _expected_paths(

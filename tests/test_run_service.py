@@ -1,7 +1,9 @@
 import errno
 import json
+import os
 import shutil
 import stat
+import sys
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -750,7 +752,7 @@ def test_prepare_trash_transaction_rejects_junction_or_reparse_component(
         service.prepare_trash_transaction("f" * 32)
 
 
-def test_move_entry_to_uses_one_atomic_replace_into_exact_transaction(
+def test_move_entry_to_uses_one_atomic_noreplace_rename_into_exact_transaction(
     tmp_path,
     monkeypatch,
 ):
@@ -764,13 +766,18 @@ def test_move_entry_to_uses_one_atomic_replace_into_exact_transaction(
         if path.is_file()
     }
     calls: list[tuple[Path, Path]] = []
-    original_replace = Path.replace
+    original_rename = os.rename
 
-    def tracking_replace(path, target):
-        calls.append((Path(path), Path(target)))
-        return original_replace(path, target)
+    def tracking_rename(source, destination):
+        calls.append((Path(source), Path(destination)))
+        return original_rename(source, destination)
 
-    monkeypatch.setattr(Path, "replace", tracking_replace)
+    monkeypatch.setattr(
+        run_module,
+        "_rename_noreplace",
+        tracking_rename,
+        raising=False,
+    )
 
     moved = service.move_entry_to(entry, destination)
 
@@ -782,6 +789,60 @@ def test_move_entry_to_uses_one_atomic_replace_into_exact_transaction(
         for path in destination.rglob("*")
         if path.is_file()
     } == original_bytes
+
+
+@pytest.mark.skipif(
+    os.name != "nt" and not sys.platform.startswith("linux"),
+    reason="native no-replace rename is implemented only for Windows and Linux",
+)
+def test_rename_noreplace_refuses_existing_directory_without_mutation(tmp_path):
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    destination.mkdir()
+    source_sentinel = source / "source.txt"
+    destination_sentinel = destination / "destination.txt"
+    source_sentinel.write_text("source\n", encoding="utf-8")
+    destination_sentinel.write_text("destination\n", encoding="utf-8")
+    rename = getattr(run_module, "_rename_noreplace", None)
+
+    assert callable(rename), "private no-replace rename primitive is missing"
+    with pytest.raises(FileExistsError):
+        rename(source, destination)
+
+    assert source_sentinel.read_text(encoding="utf-8") == "source\n"
+    assert destination_sentinel.read_text(encoding="utf-8") == "destination\n"
+
+
+def test_move_entry_to_refuses_destination_created_at_rename_boundary(
+    tmp_path,
+    monkeypatch,
+):
+    service = RunService(tmp_path / "results")
+    entry = _published_entry(service)
+    transaction = service.prepare_trash_transaction("f" * 32)
+    destination = _trash_destination(transaction, entry)
+    calls = []
+
+    def racing_rename(source, target):
+        calls.append((Path(source), Path(target)))
+        Path(target).mkdir()
+        (Path(target) / "racer.txt").write_text("keep\n", encoding="utf-8")
+        raise FileExistsError(errno.EEXIST, "destination appeared", str(target))
+
+    monkeypatch.setattr(
+        run_module,
+        "_rename_noreplace",
+        racing_rename,
+        raising=False,
+    )
+
+    with pytest.raises(FileExistsError):
+        service.move_entry_to(entry, destination)
+
+    assert calls == [(entry.run_dir, destination)]
+    assert entry.run_dir.is_dir()
+    assert (destination / "racer.txt").read_text(encoding="utf-8") == "keep\n"
 
 
 def test_move_entry_to_rejects_malformed_or_unprepared_destinations(tmp_path):
@@ -916,6 +977,42 @@ def test_restore_entry_from_never_overwrites_live_destination(tmp_path):
     assert sentinel.read_text(encoding="utf-8") == "keep\n"
 
 
+def test_restore_entry_from_refuses_destination_created_at_rename_boundary(
+    tmp_path,
+    monkeypatch,
+):
+    service = RunService(tmp_path / "results")
+    entry = _published_entry(service)
+    transaction = service.prepare_trash_transaction("f" * 32)
+    source = _trash_destination(transaction, entry)
+    service.move_entry_to(entry, source)
+    calls = []
+
+    def racing_rename(trash_source, destination):
+        calls.append((Path(trash_source), Path(destination)))
+        Path(destination).mkdir()
+        (Path(destination) / "racer.txt").write_text("keep\n", encoding="utf-8")
+        raise FileExistsError(
+            errno.EEXIST,
+            "destination appeared",
+            str(destination),
+        )
+
+    monkeypatch.setattr(
+        run_module,
+        "_rename_noreplace",
+        racing_rename,
+        raising=False,
+    )
+
+    with pytest.raises(FileExistsError):
+        service.restore_entry_from(source, entry)
+
+    assert calls == [(source, entry.run_dir)]
+    assert source.is_dir()
+    assert (entry.run_dir / "racer.txt").read_text(encoding="utf-8") == "keep\n"
+
+
 def test_restore_entry_from_rejects_untrusted_source_paths(tmp_path):
     service = RunService(tmp_path / "results")
     entry = _published_entry(service)
@@ -1020,6 +1117,135 @@ def test_remove_trash_transaction_removes_only_exact_transaction(tmp_path):
     assert sentinel.read_text(encoding="utf-8") == "keep\n"
     assert service.output_root.is_dir()
     assert (service.output_root / ".trash").is_dir()
+
+
+def test_purge_rejects_descendant_mount_before_recursive_delete(
+    tmp_path,
+    monkeypatch,
+):
+    service = RunService(tmp_path / "results")
+    transaction = service.prepare_trash_transaction("f" * 32)
+    mounted = transaction / "mounted-payload"
+    mounted.mkdir()
+    calls = []
+
+    def observation(path):
+        candidate = Path(path)
+        return candidate.lstat(), candidate == mounted
+
+    monkeypatch.setattr(
+        run_module,
+        "_path_safety_observation",
+        observation,
+        raising=False,
+    )
+    monkeypatch.setattr(shutil, "rmtree", lambda path: calls.append(Path(path)))
+
+    with pytest.raises(ValueError, match="mount|filesystem|device"):
+        service.remove_trash_transaction("f" * 32)
+
+    assert calls == []
+    assert transaction.is_dir()
+
+
+def test_purge_rejects_descendant_device_crossing_before_recursive_delete(
+    tmp_path,
+    monkeypatch,
+):
+    service = RunService(tmp_path / "results")
+    transaction = service.prepare_trash_transaction("f" * 32)
+    foreign = transaction / "foreign-payload.bin"
+    foreign.write_bytes(b"payload")
+    root_device = transaction.lstat().st_dev
+    calls = []
+
+    def observation(path):
+        candidate = Path(path)
+        details = candidate.lstat()
+        if candidate == foreign:
+            details = SimpleNamespace(
+                st_mode=details.st_mode,
+                st_dev=root_device + 1,
+            )
+        return details, False
+
+    monkeypatch.setattr(
+        run_module,
+        "_path_safety_observation",
+        observation,
+        raising=False,
+    )
+    monkeypatch.setattr(shutil, "rmtree", lambda path: calls.append(Path(path)))
+
+    with pytest.raises(ValueError, match="filesystem|device"):
+        service.remove_trash_transaction("f" * 32)
+
+    assert calls == []
+    assert foreign.read_bytes() == b"payload"
+
+
+def test_purge_fails_closed_when_filesystem_observation_errors(
+    tmp_path,
+    monkeypatch,
+):
+    service = RunService(tmp_path / "results")
+    transaction = service.prepare_trash_transaction("f" * 32)
+    unreadable = transaction / "unreadable"
+    unreadable.mkdir()
+    calls = []
+
+    def observation(path):
+        candidate = Path(path)
+        if candidate == unreadable:
+            raise OSError(errno.EIO, "simulated stat failure", str(candidate))
+        return candidate.lstat(), False
+
+    monkeypatch.setattr(
+        run_module,
+        "_path_safety_observation",
+        observation,
+        raising=False,
+    )
+    monkeypatch.setattr(shutil, "rmtree", lambda path: calls.append(Path(path)))
+
+    with pytest.raises(ValueError, match="safely|filesystem|device"):
+        service.remove_trash_transaction("f" * 32)
+
+    assert calls == []
+    assert transaction.is_dir()
+
+
+def test_purge_revalidates_mount_boundary_immediately_before_rmtree(
+    tmp_path,
+    monkeypatch,
+):
+    service = RunService(tmp_path / "results")
+    transaction = service.prepare_trash_transaction("f" * 32)
+    late_mount = transaction / "late-mount"
+    late_mount.mkdir()
+    visits: dict[Path, int] = {}
+    calls = []
+
+    def observation(path):
+        candidate = Path(path)
+        visits[candidate] = visits.get(candidate, 0) + 1
+        became_mount = candidate == late_mount and visits[candidate] >= 2
+        return candidate.lstat(), became_mount
+
+    monkeypatch.setattr(
+        run_module,
+        "_path_safety_observation",
+        observation,
+        raising=False,
+    )
+    monkeypatch.setattr(shutil, "rmtree", lambda path: calls.append(Path(path)))
+
+    with pytest.raises(ValueError, match="mount|filesystem|device"):
+        service.remove_trash_transaction("f" * 32)
+
+    assert visits[late_mount] == 2
+    assert calls == []
+    assert transaction.is_dir()
 
 
 @pytest.mark.parametrize(
