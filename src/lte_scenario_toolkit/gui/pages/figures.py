@@ -538,7 +538,12 @@ class FigureController:
     ) -> tuple[RunIdentity, ...]:
         if self.usage_leases is None:
             return ()
-        roots = self._configured_run_roots()
+        needs_roots = (
+            source.source_kind == "run"
+            or parent_run_id is not None
+            or parent_run_path is not None
+        )
+        roots = self._configured_run_roots() if needs_roots else ()
         identities: list[RunIdentity] = []
         if source.source_kind == "run":
             if source.path is None or source.run_id is None:
@@ -953,72 +958,113 @@ class FigureController:
             except Exception as exc:
                 callback_warnings.append(f"figure.settings_failed:{exc}")
             result = replace(result, warnings=tuple(callback_warnings))
-        state = self.state
-        if result.kind == "source":
-            if result.revision != state.revision:
-                self.coordinator.finish(active.job_id)
-                return state
-            if result.phase == "error" or result.source is None:
-                updated = replace(
-                    state,
+        # Read once outside the commit lock so source discovery or callbacks can
+        # yield; the revision and closed checks are repeated atomically below.
+        observed_revision = self.state.revision
+        source_identities: tuple[RunIdentity, ...] = ()
+        # RunService discovery may touch the filesystem; acquire only after the
+        # final revision check below.
+        if (
+            result.kind == "source"
+            and result.phase != "error"
+            and result.source is not None
+        ):
+            try:
+                source_identities = self._source_usage_identities(
+                    result.source,
+                    output_root=result.output_root,
+                    parent_run_id=None,
+                    parent_run_path=None,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                result = replace(
+                    result,
+                    source=None,
                     phase="error",
-                    warnings=result.warnings,
-                    errors=result.errors,
-                    source_dirty=True,
-                    source_error=result.message or "Figure source loading failed",
+                    errors=(
+                        {
+                            "code": "figure.source.failed",
+                            "message": str(exc),
+                        },
+                    ),
+                    message=str(exc),
                 )
-            else:
-                self.output_root = result.output_root
-                self.parent_run_id = None
-                self.parent_run_path = None
-                updated = state.with_source(result.source)
-        elif result.kind == "preview":
-            if result.revision != state.revision:
-                updated = replace(state, preview_stale=True)
-            elif result.phase == "error":
-                updated = replace(state, phase="error", errors=result.errors)
-            else:
-                updated = replace(
-                    state,
-                    preview_path=result.path,
-                    preview_stale=False,
-                    phase="ready",
-                    errors=(),
-                )
-        elif result.kind == "export":
-            if result.revision != state.revision:
-                if result.phase == "error":
+        with self._lock:
+            state = self._state
+            if self._closed or (
+                result.kind == "source"
+                and result.revision == observed_revision
+                and state.revision != observed_revision
+            ):
+                updated = state
+            elif result.kind == "source":
+                if result.revision != state.revision:
+                    updated = state
+                elif result.phase == "error" or result.source is None:
+                    self._replace_usage_lease(())
                     updated = replace(
                         state,
                         phase="error",
+                        warnings=result.warnings,
                         errors=result.errors,
-                        warnings=(*state.warnings, *result.warnings),
+                        source_dirty=True,
+                        source_error=result.message or "Figure source loading failed",
                     )
+                else:
+                    try:
+                        self._replace_usage_lease(source_identities)
+                    except (RuntimeError, ValueError) as exc:
+                        updated = self._discard_source_locked(str(exc))
+                    else:
+                        self.output_root = result.output_root
+                        self.parent_run_id = None
+                        self.parent_run_path = None
+                        updated = state.with_source(result.source)
+            elif result.kind == "preview":
+                if result.revision != state.revision:
+                    updated = replace(state, preview_stale=True)
+                elif result.phase == "error":
+                    updated = replace(state, phase="error", errors=result.errors)
+                else:
+                    updated = replace(
+                        state,
+                        preview_path=result.path,
+                        preview_stale=False,
+                        phase="ready",
+                        errors=(),
+                    )
+            elif result.kind == "export":
+                if result.revision != state.revision:
+                    if result.phase == "error":
+                        updated = replace(
+                            state,
+                            phase="error",
+                            errors=result.errors,
+                            warnings=(*state.warnings, *result.warnings),
+                        )
+                    else:
+                        updated = replace(
+                            state,
+                            phase=result.phase,
+                            run_path=result.path,
+                            errors=result.errors,
+                            warnings=(
+                                *state.warnings,
+                                *result.warnings,
+                                "figure.stale_published",
+                            ),
+                        )
                 else:
                     updated = replace(
                         state,
                         phase=result.phase,
                         run_path=result.path,
+                        warnings=result.warnings,
                         errors=result.errors,
-                        warnings=(
-                            *state.warnings,
-                            *result.warnings,
-                            "figure.stale_published",
-                        ),
                     )
-                self._set_state(updated)
-                self.coordinator.finish(active.job_id)
-                return updated
-            updated = replace(
-                state,
-                phase=result.phase,
-                run_path=result.path,
-                warnings=result.warnings,
-                errors=result.errors,
-            )
-        else:
-            updated = state
-        self._set_state(updated)
+            else:
+                updated = state
+            self._state = updated
         self.coordinator.finish(active.job_id)
         return updated
 

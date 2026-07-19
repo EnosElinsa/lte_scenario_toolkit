@@ -411,6 +411,122 @@ def test_figure_controller_failed_lease_replacement_is_fail_closed(
         coordinator.shutdown()
 
 
+def test_figure_controller_discards_source_result_after_invalidation(
+    tmp_path,
+):
+    from threading import Event, Thread
+
+    from lte_scenario_toolkit.gui.pages.figures import (
+        FigureController,
+        _FigureJobResult,
+    )
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.run_trash import (
+        RunIdentity,
+        RunUsageLeaseRegistry,
+    )
+
+    entry, source_a = make_run_backed_figure_source(
+        tmp_path,
+        root_name="source-runs",
+    )
+    source_b = write_in_memory_selection_source(tmp_path)
+    leases = RunUsageLeaseRegistry()
+    coordinator = JobCoordinator()
+    reached_state_read = Event()
+    release_state_read = Event()
+
+    class PausingController(FigureController):
+        pause_next_state_read = False
+
+        @property
+        def state(self):
+            state = super().state
+            if self.pause_next_state_read:
+                self.pause_next_state_read = False
+                reached_state_read.set()
+                assert release_state_read.wait(2)
+            return state
+
+    controller = PausingController(
+        tmp_path,
+        coordinator,
+        source=source_a,
+        usage_leases=leases,
+        run_roots=lambda: (entry.root,),
+        lease_owner="figures:race",
+    )
+    identity = RunIdentity.from_entry(entry)
+    job = coordinator.start("figure-source")
+    controller._job = job
+    result = _FigureJobResult(
+        "source",
+        controller.state.revision,
+        source=source_b,
+        output_root=tmp_path / "selection-output",
+    )
+    controller.pause_next_state_read = True
+    applied: list[object] = []
+    worker = Thread(target=lambda: applied.append(controller._apply_result(job, result)))
+    try:
+        worker.start()
+        assert reached_state_read.wait(2)
+        controller.invalidate_source("source changed while loading")
+        release_state_read.set()
+        worker.join(timeout=2)
+
+        assert not worker.is_alive()
+        assert applied and applied[0] is controller.state
+        assert controller.state.source is None
+        assert controller.state.source_error == "source changed while loading"
+        assert leases.conflicts((identity,)) == ()
+    finally:
+        release_state_read.set()
+        worker.join(timeout=2)
+        controller.close()
+        coordinator.shutdown()
+
+
+def test_figure_controller_source_result_acquires_run_lease(tmp_path):
+    from lte_scenario_toolkit.gui.pages.figures import (
+        FigureController,
+        _FigureJobResult,
+    )
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.run_trash import (
+        RunIdentity,
+        RunUsageLeaseRegistry,
+    )
+
+    entry, source = make_run_backed_figure_source(tmp_path, root_name="runs-b")
+    leases = RunUsageLeaseRegistry()
+    coordinator = JobCoordinator()
+    controller = FigureController(
+        tmp_path,
+        coordinator,
+        usage_leases=leases,
+        run_roots=lambda: (entry.root,),
+        lease_owner="figures:source-result",
+    )
+    job = coordinator.start("figure-source")
+    controller._job = job
+    result = _FigureJobResult(
+        "source",
+        controller.state.revision,
+        source=source,
+        output_root=entry.root,
+    )
+    identity = RunIdentity.from_entry(entry)
+    try:
+        state = controller._apply_result(job, result)
+
+        assert state.source is source
+        assert leases.conflicts((identity,)) == ("figures:source-result",)
+    finally:
+        controller.close()
+        coordinator.shutdown()
+
+
 
 
 def test_run_snapshot_is_authoritative_crs_and_rectangle_size(tmp_path):
