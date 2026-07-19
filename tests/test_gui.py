@@ -5102,6 +5102,384 @@ def test_history_model_includes_partial_and_parent_runs(tmp_path):
     )
 
 
+def _task6_history_family(tmp_path):
+    """Build one published parent/child family for the History trash tests."""
+
+    from lte_scenario_toolkit.gui.pages.history import history_rows
+    from lte_scenario_toolkit.run_service import RunService
+
+    root = tmp_path / "results"
+    service = RunService(root)
+    parent = service.begin("city", "default", created_at="2026-07-16T10:00:00Z")
+    (parent.path / "scenario.csv").write_text("X,Y\n1,2\n", encoding="utf-8")
+    service.publish(parent, status="completed", artifacts=["scenario.csv"])
+    child = service.begin(
+        "city",
+        "default",
+        created_at="2026-07-16T10:00:01Z",
+        parent_run_id=parent.run_id,
+    )
+    (child.path / "terrain.png").write_bytes(b"figure")
+    service.publish(child, status="completed", artifacts=["terrain.png"])
+    rows = history_rows(service)
+    return root, service, parent, child, rows
+
+
+def test_published_parent_offers_one_whole_family_move_action(tmp_path):
+    from lte_scenario_toolkit.gui.pages.history import (
+        HistoryAction,
+        build_history_trash_plan,
+    )
+    from lte_scenario_toolkit.run_trash import RunUsageLeaseRegistry, TrashManager
+
+    root, _service, parent, child, rows = _task6_history_family(tmp_path)
+    row = next(item for item in rows if item.run_id == parent.run_id)
+    manager = TrashManager(lambda: (root,), RunUsageLeaseRegistry())
+
+    view = build_history_trash_plan(row, manager)
+
+    assert HistoryAction.MOVE_TO_TRASH in row.available_actions
+    assert view.run_count == 2
+    assert view.run_ids == (parent.run_id, child.run_id)
+    assert view.has_descendants is True
+    assert view.direct_descendant_count == 1
+    assert view.indirect_descendant_count == 0
+    assert "orphan" not in {action.value for action in view.actions}
+
+
+def test_pending_selection_does_not_render_move_to_trash(tmp_path):
+    from types import SimpleNamespace
+
+    from lte_scenario_toolkit.gui.pages.history import render_history_content
+
+    pending_session = SimpleNamespace(
+        session_id="pending-1",
+        profile_snapshot=SimpleNamespace(
+            scenario_id="city",
+            profile_id="default",
+        ),
+        locked_candidate=SimpleNamespace(flat_grid_id=7, point_count=3),
+    )
+
+    class Element:
+        def __init__(self, text=""):
+            self.text = text
+
+        def classes(self, *_args):
+            return self
+
+        def mark(self, marker):
+            markers.add(marker)
+            return self
+
+        def props(self, *_args):
+            return self
+
+        def clear(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Ui:
+        def __init__(self):
+            self.navigate = type("Navigate", (), {"reload": lambda: None})()
+
+        def __getattr__(self, name):
+            if name == "notify":
+                return lambda *_args, **_kwargs: None
+            return lambda *args, **kwargs: Element(str(args[0]) if args else "")
+
+    markers = set()
+    ui = Ui()
+    translator = _gui_module("i18n").Translator("en")
+    history = _gui_module("pages.history")
+    snapshot = history.HistorySnapshot(
+        (),
+        (),
+        (),
+        (tmp_path / ".lte-data/cache/history-index.json").absolute(),
+    )
+    render_history_content(ui, translator, Element(), snapshot, pending_selections=(pending_session,))
+
+    assert "history-pending-section" in markers
+    assert not any(marker.startswith("history-trash-move-pending-") for marker in markers)
+
+
+def test_move_dialog_lists_every_affected_run_and_requires_fresh_confirmation(tmp_path):
+    from lte_scenario_toolkit.gui.i18n import Translator
+    from lte_scenario_toolkit.gui.pages.history import (
+        HistoryTrashPlan,
+        TrashImpactRow,
+        render_move_to_trash_dialog,
+    )
+
+    class Element:
+        def __init__(self, text=""):
+            self.text = text
+
+        def classes(self, *_args):
+            return self
+
+        def mark(self, marker):
+            markers.add(marker)
+            return self
+
+        def props(self, *_args):
+            return self
+
+        def set_enabled(self, enabled):
+            enabled_values.append(enabled)
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Ui:
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: Element(" ".join(str(arg) for arg in args))
+
+    root = tmp_path / "results"
+    reference = object()
+    rows = tuple(
+        TrashImpactRow(
+            run_id=f"{index:032x}",
+            scenario_id="city",
+            profile_id="default",
+            local_created_at="2026-07-16T10:00:00+00:00",
+            run_kind="selection",
+            status="completed",
+            artifact_count=1,
+            size_bytes=1024,
+            root=root,
+            root_digest="a" * 64,
+        )
+        for index in range(1, 4)
+    )
+    plan = HistoryTrashPlan(
+        reference=reference,
+        selected_identity=object(),
+        run_ids=tuple(row.run_id for row in rows),
+        run_count=3,
+        total_size_bytes=4096,
+        roots=(root,),
+        has_descendants=True,
+        direct_descendant_count=2,
+        indirect_descendant_count=0,
+        graph_fingerprint="b" * 64,
+        plan_fingerprint="c" * 64,
+        impact_rows=rows,
+        actions=(),
+        trash_plan=object(),
+    )
+    markers = set()
+    enabled_values = []
+    render_move_to_trash_dialog(Ui(), Translator("en"), plan, on_confirm=lambda: None)
+
+    assert "history-trash-impact" in markers
+    assert "history-trash-confirm" in markers
+    assert "history-trash-orphan-option" not in markers
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_actions"),
+    [
+        ("trashed", ("restore", "purge")),
+        ("recovery_required", ("recover",)),
+        ("purge_failed", ("purge",)),
+    ],
+)
+def test_trash_card_actions_follow_transaction_state(state, expected_actions):
+    from lte_scenario_toolkit.gui.pages.history import (
+        TrashCard,
+        trash_card_actions,
+    )
+
+    card = TrashCard(
+        transaction_id="a" * 32,
+        state=state,
+        deleted_at="2026-07-16T10:00:00Z",
+        run_count=1,
+        size_bytes=10,
+        artifact_count=1,
+        scenario_profiles=("city / default",),
+        roots=(),
+        blockers=(),
+        enabled_actions=trash_card_actions(state),
+        transaction=object(),
+    )
+
+    assert tuple(action.value for action in card.available_actions) == expected_actions
+
+
+def test_history_published_card_renders_move_to_trash_overflow(tmp_path):
+    from lte_scenario_toolkit.gui.i18n import Translator
+    from lte_scenario_toolkit.gui.pages.history import (
+        HistorySnapshot,
+        render_history_content,
+    )
+    from lte_scenario_toolkit.run_trash import RunUsageLeaseRegistry, TrashManager
+
+    root, _service, parent, _child, rows = _task6_history_family(tmp_path)
+    row = next(item for item in rows if item.run_id == parent.run_id)
+    markers = set()
+
+    class Element:
+        def classes(self, *_args):
+            return self
+
+        def props(self, *_args):
+            return self
+
+        def mark(self, marker):
+            markers.add(marker)
+            return self
+
+        def set_enabled(self, *_args):
+            return self
+
+        def clear(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Ui:
+        def __getattr__(self, _name):
+            return lambda *_args, **_kwargs: Element()
+
+    manager = TrashManager(lambda: (root,), RunUsageLeaseRegistry())
+    render_history_content(
+        Ui(),
+        Translator("en"),
+        Element(),
+        HistorySnapshot((root.resolve(),), (row,), (), tmp_path / "index"),
+        trash_manager=manager,
+        on_move_to_trash=lambda _plan: None,
+    )
+
+    assert f"history-trash-overflow-{parent.run_id}" in markers
+    assert f"history-trash-move-{parent.run_id}" in markers
+
+
+def test_trash_card_restore_blocker_keeps_purge_enabled():
+    from lte_scenario_toolkit.gui.pages.history import (
+        TrashAction,
+        TrashCard,
+    )
+
+    card = TrashCard(
+        transaction_id="a" * 32,
+        state="trashed",
+        deleted_at="2026-07-16T10:00:00Z",
+        run_count=2,
+        size_bytes=4096,
+        artifact_count=3,
+        scenario_profiles=("city / default",),
+        roots=(),
+        blockers=("trash.restore.destination_occupied",),
+        enabled_actions=(TrashAction.PURGE,),
+    )
+
+    assert card.available_actions == (TrashAction.RESTORE, TrashAction.PURGE)
+    assert card.enabled_actions == (TrashAction.PURGE,)
+
+
+def test_permanent_delete_requires_exact_transaction_prefix():
+    from lte_scenario_toolkit.gui.pages.history import (
+        TrashCard,
+        permanent_delete_matches,
+    )
+
+    card = TrashCard(
+        transaction_id="abcdef0123456789abcdef0123456789",
+        state="trashed",
+        deleted_at="2026-07-16T10:00:00Z",
+        run_count=2,
+        size_bytes=4096,
+        artifact_count=3,
+        scenario_profiles=("city / default",),
+        roots=(),
+        blockers=(),
+        enabled_actions=(),
+    )
+
+    assert permanent_delete_matches(card, "abcdef01") is True
+    assert permanent_delete_matches(card, "ABCDEF01") is False
+    assert permanent_delete_matches(card, "abcdef0") is False
+
+
+def test_trash_card_renders_state_actions_and_restore_blocker(tmp_path):
+    from lte_scenario_toolkit.gui.i18n import Translator
+    from lte_scenario_toolkit.gui.pages.history import (
+        TrashAction,
+        TrashCard,
+        render_trash_card,
+    )
+
+    markers = set()
+
+    class Element:
+        def classes(self, *_args):
+            return self
+
+        def props(self, *_args):
+            return self
+
+        def mark(self, marker):
+            markers.add(marker)
+            return self
+
+        def set_enabled(self, *_args):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Ui:
+        def __getattr__(self, _name):
+            return lambda *_args, **_kwargs: Element()
+
+    card = TrashCard(
+        transaction_id="abcdef0123456789abcdef0123456789",
+        state="trashed",
+        deleted_at="2026-07-16T10:00:00Z",
+        run_count=2,
+        size_bytes=4096,
+        artifact_count=3,
+        scenario_profiles=("city / default",),
+        roots=(tmp_path / "results",),
+        blockers=("trash.restore.destination_occupied",),
+        enabled_actions=(TrashAction.PURGE,),
+    )
+
+    render_trash_card(
+        Ui(),
+        Translator("en"),
+        card,
+        on_restore=lambda _id: None,
+        on_purge=lambda _id: None,
+        on_recover=lambda _id: None,
+    )
+
+    assert "trash-card-abcdef01" in markers
+    assert "trash-action-restore-abcdef01" in markers
+    assert "trash-action-purge-abcdef01" in markers
+    assert "trash-restore-blockers-abcdef01" in markers
+
+
 def test_history_partial_csv_never_becomes_its_own_figure_source(tmp_path):
     from lte_scenario_toolkit.figure_service import FigureSpec
     from lte_scenario_toolkit.gui.pages.history import (

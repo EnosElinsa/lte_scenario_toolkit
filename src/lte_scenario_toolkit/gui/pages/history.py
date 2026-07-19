@@ -17,9 +17,23 @@ from typing import Any
 from ...figure_service import FigureSpec
 from ...io import atomic_write_json
 from ...run_service import RunEntry, RunService
+from ...run_trash import (
+    RunDependencyError,
+    RunIdentity,
+    RunLeaseConflictError,
+    TrashDiagnostic,
+    TrashDiscovery,
+    TrashManager,
+    TrashPlan,
+    TrashPlanStaleError,
+    TrashState,
+    TrashTransaction,
+)
 from ..presentation import (
+    TRASH_ACTIONS_BY_STATE,
     ActionSpec,
     PresentationSpec,
+    TrashAction,
     render_action_bar,
     render_empty_state,
     render_loading_state,
@@ -27,18 +41,25 @@ from ..presentation import (
     render_status_badge,
     render_technical_details,
     run_state_presentation,
+    trash_action_presentation,
+    trash_state_presentation,
 )
 
 HISTORY_INDEX_RELATIVE_PATH = Path(".lte-data") / "cache" / "history-index.json"
 
 
 class HistoryAction(str, Enum):
-    """The deliberately non-destructive actions exposed by the first GUI release."""
+    """Actions exposed for a published History row.
+
+    ``MOVE_TO_TRASH`` is reversible at this layer; the Trash surface owns the
+    separate, explicitly confirmed permanent-delete action.
+    """
 
     REVEAL_DIRECTORY = "reveal_directory"
     INSPECT = "inspect"
     OPEN_FIGURES = "open_figures"
     RETRY_MISSING = "retry_missing"
+    MOVE_TO_TRASH = "move_to_trash"
     REFRESH = "refresh"
 
 
@@ -146,6 +167,8 @@ class HistoryRow:
             actions.append(HistoryAction.OPEN_FIGURES)
         if self.can_retry_missing:
             actions.append(HistoryAction.RETRY_MISSING)
+        if self.status in {"completed", "partial", "published"}:
+            actions.append(HistoryAction.MOVE_TO_TRASH)
         return tuple(actions)
 
 
@@ -157,6 +180,216 @@ class HistorySnapshot:
     rows: tuple[HistoryRow, ...]
     diagnostics: tuple[HistoryDiagnostic, ...]
     index_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class TrashImpactRow:
+    """Path-free display data for one member of a proposed trash move."""
+
+    run_id: str
+    scenario_id: str
+    profile_id: str
+    local_created_at: str
+    run_kind: str
+    status: str
+    artifact_count: int
+    size_bytes: int
+    root: Path
+    root_digest: str
+
+    @property
+    def run_id_prefix(self) -> str:
+        return self.run_id[:8]
+
+    @property
+    def kind(self) -> str:
+        return self.run_kind
+
+    @property
+    def size(self) -> int:
+        return self.size_bytes
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryTrashPlan:
+    """Immutable UI adapter around one freshly validated ``TrashPlan``.
+
+    The object intentionally carries the service plan as an opaque value. UI
+    callbacks receive this adapter (or a transaction ID for Trash actions),
+    never a browser-supplied filesystem path.
+    """
+
+    reference: HistoryRunReference
+    selected_identity: RunIdentity
+    run_ids: tuple[str, ...]
+    run_count: int
+    total_size_bytes: int
+    roots: tuple[Path, ...]
+    has_descendants: bool
+    direct_descendant_count: int
+    indirect_descendant_count: int
+    graph_fingerprint: str
+    plan_fingerprint: str
+    impact_rows: tuple[TrashImpactRow, ...]
+    actions: tuple[TrashAction, ...] = ()
+    trash_plan: TrashPlan | object | None = None
+
+    @property
+    def fingerprint(self) -> str:
+        """Compatibility alias used by stale-confirmation callers."""
+
+        return self.graph_fingerprint
+
+    @property
+    def size_bytes(self) -> int:
+        return self.total_size_bytes
+
+    @property
+    def plan(self) -> TrashPlan | object | None:
+        return self.trash_plan
+
+    @property
+    def selected(self) -> RunIdentity:
+        return self.selected_identity
+
+
+@dataclass(frozen=True, slots=True)
+class TrashSnapshot:
+    """Read-only GUI snapshot sourced exclusively from ``TrashManager``."""
+
+    transactions: tuple[TrashTransaction, ...]
+    diagnostics: tuple[TrashDiagnostic, ...]
+    restore_blockers_by_transaction: tuple[
+        tuple[str, tuple[str, ...]], ...
+    ] = ()
+
+    @classmethod
+    def from_manager(cls, manager: TrashManager) -> TrashSnapshot:
+        if not isinstance(manager, TrashManager):
+            raise ValueError("TrashSnapshot requires a TrashManager")
+        discovery = manager.snapshot()
+        if not isinstance(discovery, TrashDiscovery):
+            raise ValueError("TrashManager.snapshot() returned an invalid discovery")
+        blockers = tuple(
+            (
+                transaction.transaction_id,
+                manager.restore_blockers(transaction.transaction_id),
+            )
+            for transaction in discovery.transactions
+        )
+        return cls(discovery.transactions, discovery.diagnostics, blockers)
+
+    @property
+    def count(self) -> int:
+        return len(self.transactions)
+
+    @property
+    def cards(self) -> tuple[TrashCard, ...]:
+        return build_trash_cards(self)
+
+
+@dataclass(frozen=True, slots=True)
+class TrashCard:
+    """Localized-ready summary of one logical Trash transaction."""
+
+    transaction_id: str
+    state: TrashState | str
+    deleted_at: str
+    run_count: int
+    size_bytes: int
+    artifact_count: int
+    scenario_profiles: tuple[str, ...]
+    roots: tuple[Path, ...]
+    blockers: tuple[str, ...]
+    enabled_actions: tuple[TrashAction, ...]
+    transaction: TrashTransaction | object | None = None
+    diagnostics: tuple[str, ...] = ()
+
+    @property
+    def available_actions(self) -> tuple[TrashAction, ...]:
+        return trash_card_actions(self.state)
+
+    @property
+    def id_prefix(self) -> str:
+        return self.transaction_id[:8]
+
+
+def _trash_state(value: TrashState | str | object) -> TrashState | None:
+    if isinstance(value, TrashState):
+        return value
+    if type(value) is str:
+        try:
+            return TrashState(value)
+        except ValueError:
+            return None
+    return None
+
+
+def trash_card_actions(state: TrashState | str | object) -> tuple[TrashAction, ...]:
+    """Return potential actions for a state, failing closed for unknown data."""
+
+    resolved = _trash_state(state)
+    return TRASH_ACTIONS_BY_STATE.get(resolved, ()) if resolved is not None else ()
+
+
+def build_trash_snapshot(manager: TrashManager) -> TrashSnapshot:
+    """Build a UI snapshot from the manager's authoritative discovery."""
+
+    return TrashSnapshot.from_manager(manager)
+
+
+def build_trash_cards(
+    snapshot: TrashSnapshot,
+    *,
+    restore_blockers: Mapping[str, tuple[str, ...]] | None = None,
+) -> tuple[TrashCard, ...]:
+    """Adapt one authoritative snapshot without inventing filesystem state."""
+
+    if not isinstance(snapshot, TrashSnapshot):
+        raise ValueError("trash cards require a TrashSnapshot")
+    blocker_map = (
+        dict(snapshot.restore_blockers_by_transaction)
+        if restore_blockers is None
+        else restore_blockers
+    )
+    cards: list[TrashCard] = []
+    for transaction in snapshot.transactions:
+        state = _trash_state(transaction.state)
+        potential = trash_card_actions(state)
+        blockers = tuple(blocker_map.get(transaction.transaction_id, ()))
+        has_lease = "trash.restore.lease_conflict" in blockers
+        enabled = tuple(
+            action
+            for action in potential
+            if not (action is TrashAction.RESTORE and blockers)
+            and not (has_lease and action in potential)
+        )
+        profiles = tuple(
+            dict.fromkeys(
+                f"{member.scenario_id} / {member.profile_id}"
+                for member in transaction.members
+            )
+        )
+        cards.append(
+            TrashCard(
+                transaction_id=transaction.transaction_id,
+                state=transaction.state,
+                deleted_at=transaction.deleted_at,
+                run_count=max(
+                    len(transaction.members),
+                    len(transaction.completed_move_ids),
+                ),
+                size_bytes=transaction.total_size_bytes,
+                artifact_count=sum(member.artifact_count for member in transaction.members),
+                scenario_profiles=profiles,
+                roots=transaction.roots,
+                blockers=blockers,
+                enabled_actions=enabled,
+                transaction=transaction,
+                diagnostics=transaction.errors,
+            )
+        )
+    return tuple(cards)
 
 
 def figure_source_options(snapshot: HistorySnapshot) -> dict[str, str]:
@@ -689,6 +922,167 @@ def _same_history_reference(
     )
 
 
+def _display_member_order(plan: TrashPlan) -> tuple[Any, ...]:
+    """Order family members parent-first for human review.
+
+    ``TrashPlan.members`` is deliberately descendants-first for safe mutation;
+    the dialog presents the lineage in the opposite, reader-friendly order.
+    """
+
+    members = {member.identity: member for member in plan.members}
+    children: dict[RunIdentity, list[RunIdentity]] = {
+        identity: [] for identity in members
+    }
+    for edge in plan.edges:
+        if edge.parent in members and edge.child in members:
+            children[edge.parent].append(edge.child)
+    for values in children.values():
+        values.sort(key=lambda identity: (identity.run_id, str(identity.expected_path)))
+    ordered: list[RunIdentity] = []
+    pending = [plan.selected]
+    while pending:
+        identity = pending.pop(0)
+        if identity in ordered or identity not in members:
+            continue
+        ordered.append(identity)
+        pending.extend(children[identity])
+    ordered.extend(
+        sorted(
+            (identity for identity in members if identity not in ordered),
+            key=lambda identity: (identity.run_id, str(identity.expected_path)),
+        )
+    )
+    return tuple(members[identity] for identity in ordered)
+
+
+def build_history_trash_plan(
+    row: HistoryRow,
+    manager: TrashManager,
+) -> HistoryTrashPlan:
+    """Freshly resolve a published row and adapt its complete family.
+
+    This function performs no filesystem mutation. It is safe to call when an
+    old History tab is stale; the reference and manager plan are rebuilt from
+    current discovery every time.
+    """
+
+    if not isinstance(row, HistoryRow):
+        raise HistoryActionError("trash move requires a published HistoryRow")
+    if row.status not in {"completed", "partial", "published"}:
+        raise HistoryActionError("only published runs can move to Trash")
+    if not isinstance(manager, TrashManager):
+        raise HistoryActionError("Trash service is unavailable")
+    try:
+        clicked_path, clicked_record = resolve_history_reference(row.reference)
+        if _path_identity(clicked_path) != _path_identity(row.path):
+            raise HistoryActionError("The selected run path changed; refresh History")
+        selected = RunIdentity(row.root, row.run_id, clicked_path)
+        plan = manager.plan(selected)
+    except RunLeaseConflictError as exc:
+        raise HistoryActionError(
+            "This run is in use. Close it in Figures before moving it to Trash."
+        ) from exc
+    except (RunDependencyError, TrashPlanStaleError, ValueError, OSError) as exc:
+        if isinstance(exc, HistoryActionError):
+            raise
+        raise HistoryActionError(
+            "The run family cannot be planned safely; refresh History and try again"
+        ) from exc
+    if not isinstance(plan, TrashPlan):
+        raise HistoryActionError("Trash service returned an invalid plan")
+    if plan.selected != selected:
+        raise HistoryActionError("The selected run identity changed; refresh History")
+    # The resolver above is deliberately retained so a future implementation
+    # cannot silently trust a stale row's in-memory record.
+    _ = clicked_record
+    ordered_members = _display_member_order(plan)
+    member_by_identity = {member.identity: member for member in plan.members}
+    children = {
+        edge.child
+        for edge in plan.edges
+        if edge.parent == plan.selected
+        and edge.child in member_by_identity
+    }
+    descendant_count = len(plan.members) - 1
+    impact_rows = tuple(
+        TrashImpactRow(
+            run_id=member.identity.run_id,
+            scenario_id=member.scenario_id,
+            profile_id=member.profile_id,
+            local_created_at=_local_timestamp(member.created_at),
+            run_kind=member.run_kind,
+            status=member.status,
+            artifact_count=member.artifact_count,
+            size_bytes=member.size_bytes,
+            root=member.identity.root,
+            root_digest=hashlib.sha256(
+                _path_identity(member.identity.root).encode("utf-8")
+            ).hexdigest(),
+        )
+        for member in ordered_members
+    )
+    return HistoryTrashPlan(
+        reference=row.reference,
+        selected_identity=selected,
+        run_ids=tuple(row.run_id for row in impact_rows),
+        run_count=len(impact_rows),
+        total_size_bytes=plan.total_size_bytes,
+        roots=plan.roots,
+        has_descendants=descendant_count > 0,
+        direct_descendant_count=len(children),
+        indirect_descendant_count=max(0, descendant_count - len(children)),
+        graph_fingerprint=plan.fingerprint,
+        plan_fingerprint=plan.fingerprint,
+        impact_rows=impact_rows,
+        trash_plan=plan,
+    )
+
+
+def validate_history_trash_plan(
+    displayed: HistoryTrashPlan,
+    row: HistoryRow,
+    manager: TrashManager,
+) -> HistoryTrashPlan:
+    """Rebuild and compare a confirmation plan without mutating anything."""
+
+    if not isinstance(displayed, HistoryTrashPlan):
+        raise HistoryActionError("trash confirmation requires a displayed plan")
+    current = build_history_trash_plan(row, manager)
+    if (
+        not _same_history_reference(displayed.reference, current.reference)
+        or displayed.graph_fingerprint != current.graph_fingerprint
+        or displayed.run_ids != current.run_ids
+        or displayed.total_size_bytes != current.total_size_bytes
+    ):
+        raise HistoryActionError(
+            "This run family changed. Refresh History and review the updated impact."
+        )
+    return current
+
+
+def confirm_history_trash_plan(
+    displayed: HistoryTrashPlan,
+    row: HistoryRow,
+    manager: TrashManager,
+) -> TrashTransaction:
+    """Validate a displayed plan and execute the service move atomically."""
+
+    current = validate_history_trash_plan(displayed, row, manager)
+    if not isinstance(current.trash_plan, TrashPlan):
+        raise HistoryActionError("Trash service returned an invalid plan")
+    try:
+        return manager.move(current.trash_plan)
+    except (TrashPlanStaleError, RunLeaseConflictError) as exc:
+        raise HistoryActionError(
+            "This run family changed or is in use. Refresh History and review the impact."
+        ) from exc
+
+
+# Short aliases used by the application orchestration layer.
+resolve_history_trash_plan = build_history_trash_plan
+move_history_to_trash = confirm_history_trash_plan
+
+
 def _fresh_linked_action_row(row: HistoryRow) -> HistoryRow:
     """Re-discover configured roots and rebuild the source graph for one click."""
 
@@ -812,9 +1206,587 @@ def _translated(translator: Any, key: str, fallback: str, **values: Any) -> str:
         return fallback.format(**values)
 
 
-def render_history_frame(ui: Any, translator: Any) -> Any:
+def _format_bytes(value: int) -> str:
+    size = max(0, int(value))
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    amount = float(size)
+    for unit in units:
+        if amount < 1024.0 or unit == units[-1]:
+            return f"{int(amount)} {unit}" if unit == "B" else f"{amount:.1f} {unit}"
+        amount /= 1024.0
+    return f"{size} B"
+
+
+def _invoke_opaque(callback: Callable[..., Any], value: object) -> Any:
+    """Call a UI callback with its opaque model, supporting legacy no-arg fakes."""
+
+    try:
+        return callback(value)
+    except TypeError:
+        return callback()
+
+
+def render_move_to_trash_dialog(
+    ui: Any,
+    translator: Any,
+    plan: HistoryTrashPlan,
+    *,
+    on_confirm: Callable[..., Any],
+    blocker: str | None = None,
+) -> Any | None:
+    """Render one fresh family-impact review without exposing path arguments."""
+
+    if blocker is not None:
+        ui.label(blocker).classes("lte-callout lte-callout--warning").mark(
+            "history-trash-move-blocked"
+        )
+        return None
+    if not isinstance(plan, HistoryTrashPlan):
+        raise ValueError("move dialog requires a HistoryTrashPlan")
+    with ui.dialog() as dialog, ui.card().classes(
+        "lte-confirmation-dialog lte-trash-impact-dialog"
+    ):
+        ui.label(
+            _translated(
+                translator,
+                "history.trash_impact",
+                "Trash impact",
+            )
+        ).classes("lte-card-title")
+        with ui.column().classes("lte-trash-impact full-width").mark(
+            "history-trash-impact"
+        ):
+            ui.label(
+                _translated(
+                    translator,
+                    "history.trash_impact_summary",
+                    (
+                        "This action moves {count} runs ({size}) across {roots} "
+                        "output roots. The family remains restorable."
+                    ),
+                    count=plan.run_count,
+                    size=_format_bytes(plan.total_size_bytes),
+                    roots=len(plan.roots),
+                )
+            ).classes("lte-page-subtitle")
+            ui.label(
+                _translated(
+                    translator,
+                    "history.trash_descendants",
+                    "Direct dependents: {direct} · Indirect dependents: {indirect}",
+                    direct=plan.direct_descendant_count,
+                    indirect=plan.indirect_descendant_count,
+                )
+            ).classes("lte-history-summary-item")
+            ui.label(
+                _translated(translator, "history.trash_roots", "Output roots")
+            ).classes("lte-section-title")
+            for root in plan.roots:
+                ui.label(str(root)).classes("lte-technical-copy")
+            with ui.column().classes("lte-trash-impact-runs full-width"):
+                for impact in plan.impact_rows:
+                    ui.label(
+                        _translated(
+                            translator,
+                            "history.trash_run_summary",
+                            (
+                                "{scenario} / {profile} · {kind} · {status} · "
+                                "{artifacts} artifacts · {size}"
+                            ),
+                            scenario=impact.scenario_id,
+                            profile=impact.profile_id,
+                            kind=impact.run_kind,
+                            status=impact.status,
+                            artifacts=impact.artifact_count,
+                            size=_format_bytes(impact.size_bytes),
+                        )
+                    ).classes("lte-history-summary-item").mark(
+                        f"history-trash-impact-run-{impact.run_id}"
+                    )
+                    ui.label(
+                        f"{impact.local_created_at} · {impact.run_id_prefix}"
+                    ).classes("lte-history-time")
+            ui.label(
+                _translated(
+                    translator,
+                    "history.trash_no_orphans",
+                    "All derived runs move together; orphaned runs are not available.",
+                )
+            ).classes("lte-callout lte-callout--warning")
+        with ui.row().classes("lte-action-bar"):
+            ui.button(
+                _translated(translator, "action.cancel", "Cancel"),
+                on_click=getattr(dialog, "close", lambda: None),
+            ).props("outline")
+            confirm_label = _translated(
+                translator,
+                (
+                    "history.move_family_to_trash"
+                    if plan.has_descendants
+                    else "history.move_run_to_trash"
+                ),
+                (
+                    "Move {count} related runs to Trash"
+                    if plan.has_descendants
+                    else "Move run to Trash"
+                ),
+                count=plan.run_count,
+            )
+            ui.button(
+                confirm_label,
+                on_click=lambda: _invoke_opaque(on_confirm, plan),
+            ).props("unelevated color=negative").mark("history-trash-confirm")
+    open_dialog = getattr(dialog, "open", None)
+    if callable(open_dialog):
+        open_dialog()
+    return dialog
+
+
+def permanent_delete_matches(card: TrashCard, value: object) -> bool:
+    """Return whether typed confirmation exactly matches the ID prefix."""
+
+    return type(value) is str and value == card.transaction_id[:8]
+
+
+def render_permanent_delete_dialog(
+    ui: Any,
+    translator: Any,
+    card: TrashCard,
+    *,
+    on_confirm: Callable[..., Any],
+) -> Any:
+    """Render exact-prefix, irreversible permanent-deletion confirmation."""
+
+    if not isinstance(card, TrashCard):
+        raise ValueError("permanent-delete dialog requires a TrashCard")
+    holder: dict[str, Any] = {}
+
+    def update_confirmation(event: Any) -> None:
+        value = getattr(event, "value", None)
+        if value is None:
+            sender = getattr(event, "sender", None)
+            value = getattr(sender, "value", None)
+        holder["confirm"].set_enabled(permanent_delete_matches(card, value))
+
+    with ui.dialog() as dialog, ui.card().classes(
+        "lte-confirmation-dialog lte-trash-purge-dialog"
+    ):
+        ui.label(
+            _translated(
+                translator,
+                "history.trash_permanent_title",
+                "Delete permanently",
+            )
+        ).classes("lte-card-title")
+        ui.label(
+            _translated(
+                translator,
+                "history.trash_permanent_body",
+                (
+                    "This permanently deletes {count} runs ({size}). Restoration "
+                    "becomes impossible once deletion starts."
+                ),
+                count=card.run_count,
+                size=_format_bytes(card.size_bytes),
+            )
+        ).classes("lte-callout lte-callout--error").mark(
+            "history-trash-permanent-consequence"
+        )
+        ui.label(
+            _translated(
+                translator,
+                "history.trash_permanent_prompt",
+                "Type the first eight characters of the transaction ID to continue.",
+            )
+        ).classes("lte-page-subtitle")
+        ui.input(
+            _translated(
+                translator,
+                "history.trash_permanent_confirmation",
+                "Transaction ID prefix",
+            ),
+            on_change=update_confirmation,
+        ).props("autocomplete=off spellcheck=false").mark(
+            "history-trash-permanent-input"
+        )
+        with ui.row().classes("lte-action-bar"):
+            ui.button(
+                _translated(translator, "action.cancel", "Cancel"),
+                on_click=getattr(dialog, "close", lambda: None),
+            ).props("outline")
+            confirm = ui.button(
+                _translated(
+                    translator,
+                    "history.trash_permanent_confirm",
+                    "Delete permanently",
+                ),
+                on_click=lambda: _invoke_opaque(on_confirm, card.transaction_id),
+            ).props("unelevated color=negative").mark(
+                "history-trash-permanent-confirm"
+            )
+            confirm.set_enabled(False)
+            holder["confirm"] = confirm
+    open_dialog = getattr(dialog, "open", None)
+    if callable(open_dialog):
+        open_dialog()
+    return dialog
+
+
+_RESTORE_BLOCKER_COPY: dict[str, tuple[str, str]] = {
+    "trash.restore.root_unavailable": (
+        "history.trash_root_unavailable",
+        "An expected output root is unavailable.",
+    ),
+    "trash.restore.destination_occupied": (
+        "history.trash_destination_occupied",
+        "An original destination is occupied.",
+    ),
+    "trash.restore.lease_conflict": (
+        "history.trash_lease_conflict",
+        "A family member is open in Figures.",
+    ),
+    "trash.restore.journal_invalid": (
+        "history.trash_journal_invalid",
+        "The Trash journal or payload is not actionable.",
+    ),
+    "trash.restore.state": (
+        "history.trash_recovery_required",
+        "Recovery is required before this transaction can continue.",
+    ),
+}
+
+
+def _trash_action_label(translator: Any, action: TrashAction) -> str:
+    presentation = trash_action_presentation(action)
+    return _translated(
+        translator,
+        presentation.label_key,
+        {
+            TrashAction.RESTORE: "Restore",
+            TrashAction.PURGE: "Delete permanently",
+            TrashAction.RECOVER: "Recover transaction",
+        }[action],
+    )
+
+
+def render_trash_card(
+    ui: Any,
+    translator: Any,
+    card: TrashCard,
+    *,
+    on_restore: Callable[[str], Any] | None = None,
+    on_purge: Callable[[str], Any] | None = None,
+    on_recover: Callable[[str], Any] | None = None,
+) -> Any:
+    """Render one whole-family transaction card with state-gated actions."""
+
+    if not isinstance(card, TrashCard):
+        raise ValueError("trash card renderer requires a TrashCard")
+    prefix = card.id_prefix
+    with ui.card().classes("lte-history-card lte-trash-card").mark(
+        f"trash-card-{prefix}"
+    ) as container:
+        with ui.row().classes("lte-history-card-heading"):
+            with ui.column().classes("lte-history-card-identity"):
+                ui.label(" · ".join(card.scenario_profiles) or prefix).classes(
+                    "lte-card-title"
+                )
+                ui.label(card.deleted_at).classes("lte-history-time")
+            render_status_badge(
+                ui,
+                translator,
+                trash_state_presentation(card.state),
+                marker=f"trash-state-{prefix}",
+            )
+        with ui.row().classes("lte-history-summary-grid"):
+            ui.label(f"{card.run_count} runs").classes("lte-history-summary-item")
+            ui.label(_format_bytes(card.size_bytes)).classes(
+                "lte-history-summary-item"
+            )
+            ui.label(f"{card.artifact_count} artifacts").classes(
+                "lte-history-summary-item"
+            )
+            ui.label(prefix).classes("lte-history-summary-item")
+        for root in card.roots:
+            ui.label(str(root)).classes("lte-history-summary-item")
+
+        state = _trash_state(card.state)
+        if state is TrashState.RECOVERY_REQUIRED:
+            ui.label(
+                _translated(
+                    translator,
+                    "history.trash_recovery_required",
+                    "Recovery is required before this transaction can continue.",
+                )
+            ).classes("lte-callout lte-callout--warning")
+        elif state is TrashState.PURGE_FAILED:
+            ui.label(
+                _translated(
+                    translator,
+                    "history.trash_purge_failed",
+                    (
+                        "Permanent deletion stopped after data was removed. Restore "
+                        "is no longer available; retry deletion."
+                    ),
+                )
+            ).classes("lte-callout lte-callout--error")
+
+        if card.blockers:
+            with ui.column().classes("lte-callout lte-callout--warning").mark(
+                f"trash-restore-blockers-{prefix}"
+            ):
+                for blocker in card.blockers:
+                    key, fallback = _RESTORE_BLOCKER_COPY.get(
+                        blocker,
+                        (
+                            "history.trash_journal_invalid",
+                            "The Trash transaction is not currently actionable.",
+                        ),
+                    )
+                    ui.label(_translated(translator, key, fallback))
+
+        actions: list[ActionSpec] = []
+        for action in card.available_actions:
+            callback: Callable[..., Any] | None
+            if action is TrashAction.RESTORE:
+                callback = on_restore
+
+                def restore_click(
+                    handler: Callable[[str], Any] | None = callback,
+                    value: str = card.transaction_id,
+                ) -> Any:
+                    return None if handler is None else handler(value)
+
+                click = restore_click
+                role = "primary"
+            elif action is TrashAction.RECOVER:
+                callback = on_recover
+
+                def recover_click(
+                    handler: Callable[[str], Any] | None = callback,
+                    value: str = card.transaction_id,
+                ) -> Any:
+                    return None if handler is None else handler(value)
+
+                click = recover_click
+                role = "primary"
+            else:
+                callback = on_purge
+
+                def purge_click(
+                    current: TrashCard = card,
+                    handler: Callable[[str], Any] | None = callback,
+                ) -> Any:
+                    return render_permanent_delete_dialog(
+                        ui,
+                        translator,
+                        current,
+                        on_confirm=handler or (lambda _value: None),
+                    )
+
+                click = purge_click
+                role = "danger"
+            actions.append(
+                ActionSpec(
+                    action.value,
+                    _trash_action_label(translator, action),
+                    click,
+                    role=role,
+                    enabled=(
+                        action in card.enabled_actions and callback is not None
+                    ),
+                    marker=f"trash-action-{action.value}-{prefix}",
+                )
+            )
+        if actions:
+            render_action_bar(
+                ui,
+                actions,
+                marker=f"trash-actions-{prefix}",
+            )
+
+        def render_details() -> None:
+            transaction = card.transaction
+            if isinstance(transaction, TrashTransaction):
+                for member in transaction.members:
+                    ui.label(
+                        f"{member.identity.run_id} · "
+                        f"{member.original_relative_path.as_posix()}"
+                    ).classes("lte-technical-copy")
+            for diagnostic in card.diagnostics:
+                ui.label(diagnostic).classes("lte-technical-copy")
+
+        render_technical_details(
+            ui,
+            _translated(
+                translator,
+                "history.trash_technical",
+                "Technical details",
+            ),
+            render_details,
+            marker=f"trash-technical-{prefix}",
+        )
+    return container
+
+
+def render_trash_frame(
+    ui: Any,
+    translator: Any,
+    count: int,
+    *,
+    on_back: Callable[[], Any] | None = None,
+) -> Any:
+    """Render the stable Trash header and return its replaceable holder."""
+
+    actions = (
+        ActionSpec(
+            "back_history",
+            _translated(translator, "action.back_history", "Back to History"),
+            on_back,
+            marker="trash-back-history",
+        ),
+    ) if on_back is not None else ()
+    with ui.column().classes("lte-page lte-history-page lte-trash-page"):
+        render_page_header(
+            ui,
+            _translated(
+                translator,
+                "history.trash",
+                "Trash ({count})",
+                count=count,
+            ),
+            _translated(
+                translator,
+                "history.trash_subtitle",
+                (
+                    "Run families moved here remain restorable until you permanently "
+                    "delete them."
+                ),
+            ),
+            actions,
+        )
+        return ui.column().classes("lte-history-content full-width").mark(
+            "trash-content"
+        )
+
+
+def render_trash_content(
+    ui: Any,
+    translator: Any,
+    holder: Any,
+    snapshot: TrashSnapshot,
+    *,
+    on_restore: Callable[[str], Any] | None = None,
+    on_purge: Callable[[str], Any] | None = None,
+    on_recover: Callable[[str], Any] | None = None,
+) -> None:
+    """Render authoritative transaction cards and collapsed diagnostics."""
+
+    if not isinstance(snapshot, TrashSnapshot):
+        raise ValueError("trash content requires a TrashSnapshot")
+    holder.clear()
+    with holder:
+        if not snapshot.transactions:
+            render_empty_state(
+                ui,
+                _translated(translator, "history.trash_empty", "Trash is empty."),
+                _translated(
+                    translator,
+                    "history.trash_empty_body",
+                    "Moved run families will appear here.",
+                ),
+                marker="trash-empty",
+            )
+        for card in snapshot.cards:
+            render_trash_card(
+                ui,
+                translator,
+                card,
+                on_restore=on_restore,
+                on_purge=on_purge,
+                on_recover=on_recover,
+            )
+        if snapshot.diagnostics:
+            def render_diagnostics() -> None:
+                for diagnostic in snapshot.diagnostics:
+                    ui.label(
+                        f"{diagnostic.code}: {diagnostic.error}"
+                    ).classes("lte-technical-copy")
+
+            render_technical_details(
+                ui,
+                _translated(
+                    translator,
+                    "history.trash_technical",
+                    "Technical details",
+                ),
+                render_diagnostics,
+                marker="trash-diagnostics-technical",
+            )
+
+
+def render_trash_page(
+    ui: Any,
+    translator: Any,
+    snapshot: TrashSnapshot,
+    *,
+    on_back: Callable[[], Any] | None = None,
+    on_restore: Callable[[str], Any] | None = None,
+    on_purge: Callable[[str], Any] | None = None,
+    on_recover: Callable[[str], Any] | None = None,
+) -> TrashSnapshot:
+    """Render one complete Trash snapshot; route orchestration remains external."""
+
+    holder = render_trash_frame(
+        ui,
+        translator,
+        snapshot.count,
+        on_back=on_back,
+    )
+    render_trash_content(
+        ui,
+        translator,
+        holder,
+        snapshot,
+        on_restore=on_restore,
+        on_purge=on_purge,
+        on_recover=on_recover,
+    )
+    return snapshot
+
+
+def render_history_frame(
+    ui: Any,
+    translator: Any,
+    *,
+    trash_count: int | None = None,
+    on_open_trash: Callable[[], Any] | None = None,
+) -> Any:
     """Render the stable History heading and return its replaceable content holder."""
 
+    actions = [
+        ActionSpec(
+            "refresh",
+            _translated(translator, "action.refresh", "Refresh"),
+            ui.navigate.reload,
+            marker="history-refresh",
+        )
+    ]
+    if trash_count is not None:
+        actions.append(
+            ActionSpec(
+                "trash",
+                _translated(
+                    translator,
+                    "history.trash",
+                    "Trash ({count})",
+                    count=max(0, int(trash_count)),
+                ),
+                on_open_trash or (lambda: None),
+                enabled=on_open_trash is not None,
+                marker="history-trash-link",
+            )
+        )
     with ui.column().classes("lte-page lte-history-page"):
         render_page_header(
             ui,
@@ -824,14 +1796,7 @@ def render_history_frame(ui: Any, translator: Any) -> Any:
                 "history.subtitle",
                 "Published selection and derived figure runs from local output roots.",
             ),
-            (
-                ActionSpec(
-                    "refresh",
-                    _translated(translator, "action.refresh", "Refresh"),
-                    ui.navigate.reload,
-                    marker="history-refresh",
-                ),
-            ),
+            actions,
         )
         return ui.column().classes("lte-history-content full-width").mark(
             "history-content"
@@ -906,6 +1871,8 @@ def render_history_content(
     pending_selections: Iterable[Any] = (),
     on_open_pending_figures: Callable[[str], None] | None = None,
     on_continue_pending: Callable[[str], None] | None = None,
+    trash_manager: TrashManager | None = None,
+    on_move_to_trash: Callable[[HistoryTrashPlan], None] | None = None,
 ) -> None:
     """Replace History content with one validated snapshot."""
 
@@ -983,6 +1950,21 @@ def render_history_content(
             )
         except Exception as exc:
             notify_action_error(exc)
+
+    def move_to_trash(row: HistoryRow) -> None:
+        try:
+            if trash_manager is None or on_move_to_trash is None:
+                raise HistoryActionError("Trash is unavailable in this host")
+            plan = build_history_trash_plan(row, trash_manager)
+        except Exception as exc:
+            notify_action_error(exc)
+            return
+        render_move_to_trash_dialog(
+            ui,
+            translator,
+            plan,
+            on_confirm=on_move_to_trash,
+        )
 
     pending = tuple(pending_selections)
     holder.clear()
@@ -1262,6 +2244,24 @@ def render_history_content(
                             actions,
                             marker=f"history-actions-{row.run_id}",
                         )
+                        if HistoryAction.MOVE_TO_TRASH in row.available_actions:
+                            render_action_bar(
+                                ui,
+                                (
+                                    ActionSpec(
+                                        "move_to_trash",
+                                        _translated(
+                                            translator,
+                                            "action.move_to_trash",
+                                            "Move to Trash",
+                                        ),
+                                        lambda current=row: move_to_trash(current),
+                                        role="danger",
+                                        marker=f"history-trash-move-{row.run_id}",
+                                    ),
+                                ),
+                                marker=f"history-trash-overflow-{row.run_id}",
+                            )
 
                     technical_payload = {
                         "run_id": row.run_id,
@@ -1317,6 +2317,10 @@ def render_history_page(
     pending_selections: Iterable[Any] = (),
     on_open_pending_figures: Callable[[str], None] | None = None,
     on_continue_pending: Callable[[str], None] | None = None,
+    trash_manager: TrashManager | None = None,
+    on_move_to_trash: Callable[[HistoryTrashPlan], None] | None = None,
+    trash_count: int | None = None,
+    on_open_trash: Callable[[], Any] | None = None,
 ) -> HistorySnapshot:
     """Synchronously rebuild and render History from live run manifests."""
 
@@ -1334,7 +2338,12 @@ def render_history_page(
             raise ValueError("history snapshot does not match this page request")
         current_snapshot = snapshot
 
-    holder = render_history_frame(ui, translator)
+    holder = render_history_frame(
+        ui,
+        translator,
+        trash_count=trash_count,
+        on_open_trash=on_open_trash,
+    )
     render_history_content(
         ui,
         translator,
@@ -1346,6 +2355,8 @@ def render_history_page(
         pending_selections=pending_selections,
         on_open_pending_figures=on_open_pending_figures,
         on_continue_pending=on_continue_pending,
+        trash_manager=trash_manager,
+        on_move_to_trash=on_move_to_trash,
     )
     return current_snapshot
 
@@ -1358,16 +2369,37 @@ __all__ = [
     "HistoryRow",
     "HistoryRunReference",
     "HistorySnapshot",
+    "HistoryTrashPlan",
     "ResolvedHistoryAction",
+    "TRASH_ACTIONS_BY_STATE",
+    "TrashAction",
+    "TrashCard",
+    "TrashImpactRow",
+    "TrashSnapshot",
+    "build_history_trash_plan",
+    "build_trash_cards",
+    "build_trash_snapshot",
+    "confirm_history_trash_plan",
     "figure_source_options",
     "history_roots",
     "history_rows",
+    "move_history_to_trash",
+    "permanent_delete_matches",
     "rebuild_history",
     "render_history_content",
     "render_history_error",
     "render_history_frame",
     "render_history_loading",
     "render_history_page",
+    "render_move_to_trash_dialog",
+    "render_permanent_delete_dialog",
+    "render_trash_card",
+    "render_trash_content",
+    "render_trash_frame",
+    "render_trash_page",
     "resolve_history_action",
     "resolve_history_reference",
+    "resolve_history_trash_plan",
+    "trash_card_actions",
+    "validate_history_trash_plan",
 ]
