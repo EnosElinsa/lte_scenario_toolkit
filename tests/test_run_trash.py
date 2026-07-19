@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
+import sys
 from dataclasses import FrozenInstanceError
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
@@ -95,6 +98,468 @@ def publish_figure(
     )
 
 
+def manager_for_two_run_family(tmp_path):
+    root = tmp_path / "results"
+    parent = publish_selection(root, run_id="a" * 32)
+    child = publish_figure(root, run_id="b" * 32, parent=parent)
+    assert hasattr(run_trash_module, "TrashManager"), "TrashManager is missing"
+    manager = run_trash_module.TrashManager(
+        lambda: (root,),
+        RunUsageLeaseRegistry(),
+    )
+    return manager, parent, child
+
+
+def manager_for_cross_root_family(tmp_path):
+    source_root = tmp_path / "source-results"
+    child_root = tmp_path / "figure-results"
+    parent = publish_selection(source_root, run_id="a" * 32)
+    child = _publish_run(
+        child_root,
+        run_id="b" * 32,
+        run_kind="figure",
+        source={"path": str(parent.run_dir), "run_id": parent.run_id},
+    )
+    manager = run_trash_module.TrashManager(
+        lambda: (source_root, child_root),
+        RunUsageLeaseRegistry(),
+    )
+    return manager, parent, child
+
+
+def manager_for_three_run_family(tmp_path):
+    root = tmp_path / "results"
+    parent = publish_selection(root, run_id="a" * 32)
+    child = publish_figure(root, run_id="b" * 32, parent=parent)
+    grandchild = publish_figure(root, run_id="c" * 32, parent=child)
+    manager = run_trash_module.TrashManager(
+        lambda: (root,),
+        RunUsageLeaseRegistry(),
+    )
+    return manager, parent, child, grandchild
+
+
+def force_interrupted_move(manager, plan, monkeypatch):
+    real_write = manager._write_portions
+
+    def fail_finalization(*args, **kwargs):
+        if kwargs.get("state") is run_trash_module.TrashState.TRASHED:
+            raise OSError("simulated finalization failure")
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(manager, "_write_portions", fail_finalization)
+    monkeypatch.setattr(
+        manager,
+        "_restore_member",
+        lambda member, portions: (_ for _ in ()).throw(OSError("simulated rollback failure")),
+    )
+    with pytest.raises(run_trash_module.TrashTransactionError, match="recovery"):
+        manager.move(plan)
+
+
+def test_move_family_journals_descendants_before_parent(tmp_path):
+    manager, parent, child = manager_for_two_run_family(tmp_path)
+    plan = manager.plan(RunIdentity.from_entry(parent))
+
+    transaction = manager.move(plan)
+
+    assert transaction.state is run_trash_module.TrashState.TRASHED
+    assert not parent.run_dir.exists()
+    assert not child.run_dir.exists()
+    assert transaction.completed_move_ids == (child.run_id, parent.run_id)
+    journal_path = parent.root / ".trash" / transaction.transaction_id / "trash.json"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert set(journal) == {
+        "schema_version",
+        "transaction_id",
+        "deleted_at",
+        "state",
+        "selected",
+        "expected_roots",
+        "members",
+        "edges",
+        "completed_move_ids",
+        "completed_restore_ids",
+        "total_size_bytes",
+        "errors",
+    }
+    assert journal["state"] == "trashed"
+    assert journal["completed_move_ids"] == [child.run_id, parent.run_id]
+    assert str(parent.root) not in journal_path.read_text(encoding="utf-8")
+
+
+def test_move_rolls_back_when_second_rename_fails(tmp_path, monkeypatch):
+    manager, parent, child = manager_for_two_run_family(tmp_path)
+    plan = manager.plan(RunIdentity.from_entry(parent))
+    real_move = manager._move_member
+    calls = 0
+
+    def fail_second(member, portions):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated rename failure")
+        return real_move(member, portions)
+
+    monkeypatch.setattr(manager, "_move_member", fail_second)
+    error_type = getattr(run_trash_module, "TrashTransactionError", None)
+    assert error_type is not None, "TrashTransactionError is missing"
+    with pytest.raises(error_type, match="rolled back"):
+        manager.move(plan)
+
+    assert parent.run_dir.is_dir()
+    assert child.run_dir.is_dir()
+
+
+def test_active_lease_blocks_plan(tmp_path):
+    root = tmp_path / "results"
+    parent = publish_selection(root, run_id="a" * 32)
+    child = publish_figure(root, run_id="b" * 32, parent=parent)
+    leases = RunUsageLeaseRegistry()
+    manager = run_trash_module.TrashManager(lambda: (root,), leases)
+    leases.acquire((RunIdentity.from_entry(child),), "Figures")
+
+    with pytest.raises(RunLeaseConflictError, match="Figures"):
+        manager.plan(RunIdentity.from_entry(parent))
+
+
+def test_lease_acquired_after_plan_blocks_move_before_mutation(tmp_path):
+    root = tmp_path / "results"
+    parent = publish_selection(root, run_id="a" * 32)
+    child = publish_figure(root, run_id="b" * 32, parent=parent)
+    leases = RunUsageLeaseRegistry()
+    manager = run_trash_module.TrashManager(lambda: (root,), leases)
+    plan = manager.plan(RunIdentity.from_entry(parent))
+    leases.acquire((RunIdentity.from_entry(child),), "Figures")
+
+    with pytest.raises(RunLeaseConflictError, match="Figures"):
+        manager.move(plan)
+
+    assert parent.run_dir.is_dir()
+    assert child.run_dir.is_dir()
+    assert not (root / ".trash" / plan.transaction_id).exists()
+
+
+def test_second_root_preparation_failure_leaves_cross_root_family_live(
+    tmp_path,
+    monkeypatch,
+):
+    manager, parent, child = manager_for_cross_root_family(tmp_path)
+    plan = manager.plan(RunIdentity.from_entry(parent))
+    for root in plan.roots:
+        trash_root = root / ".trash"
+        trash_root.mkdir()
+        (trash_root / "keep.txt").write_text("keep\n", encoding="utf-8")
+    real_prepare = RunService.prepare_trash_transaction
+    calls = 0
+
+    def fail_second(service, transaction_id):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated second-root failure")
+        return real_prepare(service, transaction_id)
+
+    monkeypatch.setattr(RunService, "prepare_trash_transaction", fail_second)
+
+    with pytest.raises(run_trash_module.TrashTransactionError, match="before mutation"):
+        manager.move(plan)
+
+    assert parent.run_dir.is_dir()
+    assert child.run_dir.is_dir()
+    for root in plan.roots:
+        assert not (root / ".trash" / plan.transaction_id).exists()
+        assert (root / ".trash" / "keep.txt").read_text(encoding="utf-8") == "keep\n"
+
+
+def test_finalization_write_failure_rolls_back_entire_family(tmp_path, monkeypatch):
+    manager, parent, child = manager_for_two_run_family(tmp_path)
+    plan = manager.plan(RunIdentity.from_entry(parent))
+    real_write = manager._write_portions
+    failed = False
+
+    def fail_finalization(*args, **kwargs):
+        nonlocal failed
+        if not failed and kwargs.get("state") is run_trash_module.TrashState.TRASHED:
+            failed = True
+            raise OSError("simulated finalization failure")
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(manager, "_write_portions", fail_finalization)
+
+    with pytest.raises(run_trash_module.TrashTransactionError, match="rolled back"):
+        manager.move(plan)
+
+    assert parent.run_dir.is_dir()
+    assert child.run_dir.is_dir()
+    assert not (parent.root / ".trash" / plan.transaction_id).exists()
+
+
+def test_empty_parent_cleanup_failure_is_harmless(tmp_path, monkeypatch):
+    manager, parent, child = manager_for_two_run_family(tmp_path)
+    plan = manager.plan(RunIdentity.from_entry(parent))
+    cleanup_targets = {
+        parent.run_dir.parent,
+        parent.run_dir.parent.parent,
+    }
+    calls = []
+    real_rmdir = Path.rmdir
+
+    def fail_cleanup(path):
+        if path in cleanup_targets:
+            calls.append(path)
+            raise OSError("simulated cleanup failure")
+        return real_rmdir(path)
+
+    monkeypatch.setattr(Path, "rmdir", fail_cleanup)
+
+    transaction = manager.move(plan)
+
+    assert transaction.state is run_trash_module.TrashState.TRASHED
+    assert set(calls) == cleanup_targets
+    assert all(path.is_dir() for path in cleanup_targets)
+
+
+def test_cyclic_journal_edges_fail_closed_without_hanging(tmp_path):
+    manager, parent, child, grandchild = manager_for_three_run_family(tmp_path)
+    moved = manager.move(manager.plan(RunIdentity.from_entry(parent)))
+    journal_path = parent.root / ".trash" / moved.transaction_id / "trash.json"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    child_edge = next(
+        edge
+        for edge in journal["edges"]
+        if edge["parent"]["run_id"] == child.run_id and edge["child"]["run_id"] == grandchild.run_id
+    )
+    journal["edges"].append(
+        {
+            "parent": child_edge["child"],
+            "child": child_edge["parent"],
+            "source": "metadata.source",
+        }
+    )
+    run_trash_module.atomic_write_json(journal_path, journal)
+    script = """
+import sys
+from pathlib import Path
+from lte_scenario_toolkit.run_trash import (
+    RunUsageLeaseRegistry,
+    TrashManager,
+    TrashTransactionError,
+)
+manager = TrashManager(lambda: (Path(sys.argv[1]),), RunUsageLeaseRegistry())
+discovery = manager.snapshot()
+if not discovery.diagnostics:
+    raise SystemExit(2)
+try:
+    manager.recover(sys.argv[2])
+except TrashTransactionError:
+    raise SystemExit(0)
+raise SystemExit(3)
+"""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(parent.root), moved.transaction_id],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("cyclic trash journal caused discovery or recovery to hang")
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_new_dependent_makes_displayed_plan_stale(tmp_path):
+    manager, parent, child = manager_for_two_run_family(tmp_path)
+    plan = manager.plan(RunIdentity.from_entry(parent))
+    publish_figure(parent.root, run_id="c" * 32, parent=child)
+
+    error_type = getattr(run_trash_module, "TrashPlanStaleError", None)
+    assert error_type is not None, "TrashPlanStaleError is missing"
+    with pytest.raises(error_type):
+        manager.move(plan)
+
+
+def test_snapshot_merges_one_cross_root_transaction(tmp_path):
+    manager, parent, child = manager_for_cross_root_family(tmp_path)
+    moved = manager.move(manager.plan(RunIdentity.from_entry(parent)))
+
+    discovery = run_trash_module.TrashManager(
+        lambda: (child.root, parent.root),
+        RunUsageLeaseRegistry(),
+    ).snapshot()
+
+    assert discovery.diagnostics == ()
+    assert len(discovery.transactions) == 1
+    assert discovery.transactions[0] == moved
+    assert [member.identity.run_id for member in moved.members] == [
+        child.run_id,
+        parent.run_id,
+    ]
+    for root in moved.roots:
+        journal = json.loads(
+            (root / ".trash" / moved.transaction_id / "trash.json").read_text(encoding="utf-8")
+        )
+        assert len(journal["members"]) == 1
+        assert len(journal["expected_roots"]) == 2
+
+
+def test_rollback_failure_is_discoverable_as_recovery_required(
+    tmp_path,
+    monkeypatch,
+):
+    manager, parent, child = manager_for_two_run_family(tmp_path)
+    plan = manager.plan(RunIdentity.from_entry(parent))
+    real_move = manager._move_member
+    calls = 0
+
+    def fail_second(member, portions):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated original failure")
+        return real_move(member, portions)
+
+    monkeypatch.setattr(manager, "_move_member", fail_second)
+    monkeypatch.setattr(
+        manager,
+        "_restore_member",
+        lambda member, portions: (_ for _ in ()).throw(OSError("simulated rollback failure")),
+    )
+
+    with pytest.raises(run_trash_module.TrashTransactionError, match="recovery"):
+        manager.move(plan)
+
+    discovery = run_trash_module.TrashManager(
+        lambda: (parent.root,),
+        RunUsageLeaseRegistry(),
+    ).snapshot()
+    assert discovery.diagnostics == ()
+    assert len(discovery.transactions) == 1
+    transaction = discovery.transactions[0]
+    assert transaction.state is run_trash_module.TrashState.RECOVERY_REQUIRED
+    assert any("original failure" in error for error in transaction.errors)
+    assert any("rollback failure" in error for error in transaction.errors)
+    assert parent.run_dir.is_dir()
+    assert not child.run_dir.exists()
+
+
+def test_recover_interrupted_move_restores_parents_before_descendants(
+    tmp_path,
+    monkeypatch,
+):
+    manager, parent, child, grandchild = manager_for_three_run_family(tmp_path)
+    plan = manager.plan(RunIdentity.from_entry(parent))
+    force_interrupted_move(manager, plan, monkeypatch)
+    recovering = run_trash_module.TrashManager(
+        lambda: (parent.root,),
+        RunUsageLeaseRegistry(),
+    )
+    restored_ids = []
+    real_restore = recovering._restore_member
+
+    def tracking_restore(member, portions):
+        restored_ids.append(member.identity.run_id)
+        return real_restore(member, portions)
+
+    monkeypatch.setattr(recovering, "_restore_member", tracking_restore)
+
+    recovered = recovering.recover(plan.transaction_id)
+
+    assert restored_ids == [parent.run_id, child.run_id, grandchild.run_id]
+    assert parent.run_dir.is_dir()
+    assert child.run_dir.is_dir()
+    assert grandchild.run_dir.is_dir()
+    assert recovering.snapshot().transactions == ()
+    assert recovering.recover(plan.transaction_id) == recovered
+
+
+def test_recover_interrupted_restore_retrashes_descendants_before_parents(
+    tmp_path,
+    monkeypatch,
+):
+    manager, parent, child, grandchild = manager_for_three_run_family(tmp_path)
+    moved = manager.move(manager.plan(RunIdentity.from_entry(parent)))
+    transaction_path = parent.root / ".trash" / moved.transaction_id
+    entries = {entry.run_id: entry for entry in (parent, child, grandchild)}
+    for entry in (parent, child):
+        source = (
+            transaction_path
+            / "runs"
+            / entry.record["scenario_id"]
+            / entry.record["profile_id"]
+            / entry.run_dir.name
+        )
+        RunService(parent.root).restore_entry_from(source, entries[entry.run_id])
+    journal_path = transaction_path / "trash.json"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    journal["state"] = "restoring"
+    journal["completed_restore_ids"] = [parent.run_id, child.run_id]
+    run_trash_module.atomic_write_json(journal_path, journal)
+    recovering = run_trash_module.TrashManager(
+        lambda: (parent.root,),
+        RunUsageLeaseRegistry(),
+    )
+    moved_ids = []
+    real_move = recovering._move_member
+
+    def tracking_move(member, portions):
+        moved_ids.append(member.identity.run_id)
+        return real_move(member, portions)
+
+    monkeypatch.setattr(recovering, "_move_member", tracking_move)
+
+    recovered = recovering.recover(moved.transaction_id)
+
+    assert recovered.state is run_trash_module.TrashState.TRASHED
+    assert moved_ids == [child.run_id, parent.run_id]
+    assert not parent.run_dir.exists()
+    assert not child.run_dir.exists()
+    assert not grandchild.run_dir.exists()
+    assert recovering.recover(moved.transaction_id) == recovered
+
+
+@pytest.mark.parametrize("copies", ["both", "neither"])
+def test_recover_stops_without_overwrite_for_ambiguous_path_pairs(
+    tmp_path,
+    monkeypatch,
+    copies,
+):
+    manager, parent, child = manager_for_two_run_family(tmp_path)
+    plan = manager.plan(RunIdentity.from_entry(parent))
+    force_interrupted_move(manager, plan, monkeypatch)
+    child_trash = (
+        child.root
+        / ".trash"
+        / plan.transaction_id
+        / "runs"
+        / "chicago"
+        / "default"
+        / child.run_dir.name
+    )
+    if copies == "both":
+        child.run_dir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(child_trash, child.run_dir)
+    else:
+        holding = tmp_path / "holding"
+        child_trash.rename(holding)
+
+    recovering = run_trash_module.TrashManager(
+        lambda: (parent.root,),
+        RunUsageLeaseRegistry(),
+    )
+    with pytest.raises(
+        run_trash_module.TrashTransactionError,
+        match="both|neither|ambiguous|recovery",
+    ):
+        recovering.recover(plan.transaction_id)
+
+    assert not parent.run_dir.exists()
+    assert child.run_dir.exists() == (copies == "both")
+    assert child_trash.exists() == (copies == "both")
+
+
 def test_run_identity_normalizes_paths_without_requiring_live_entry(tmp_path):
     root = tmp_path / "results"
     expected = root / "chicago" / "default" / "missing-run"
@@ -155,9 +620,7 @@ def test_source_edge_requires_matching_run_id_and_path(tmp_path):
     child = publish_figure(root, run_id="b" * 32, parent=parent)
     graph = RunDependencyGraph.from_roots((root,))
 
-    assert graph.parent_of(RunIdentity.from_entry(child)) == RunIdentity.from_entry(
-        parent
-    )
+    assert graph.parent_of(RunIdentity.from_entry(child)) == RunIdentity.from_entry(parent)
 
 
 def test_parent_run_id_creates_same_root_edge_without_source_metadata(tmp_path):
@@ -172,9 +635,7 @@ def test_parent_run_id_creates_same_root_edge_without_source_metadata(tmp_path):
 
     graph = RunDependencyGraph.from_roots((root,))
 
-    assert graph.parent_of(RunIdentity.from_entry(child)) == RunIdentity.from_entry(
-        parent
-    )
+    assert graph.parent_of(RunIdentity.from_entry(child)) == RunIdentity.from_entry(parent)
 
 
 def test_metadata_source_creates_edge_without_parent_run_id(tmp_path):
@@ -189,9 +650,7 @@ def test_metadata_source_creates_edge_without_parent_run_id(tmp_path):
 
     graph = RunDependencyGraph.from_roots((root,))
 
-    assert graph.parent_of(RunIdentity.from_entry(child)) == RunIdentity.from_entry(
-        parent
-    )
+    assert graph.parent_of(RunIdentity.from_entry(child)) == RunIdentity.from_entry(parent)
 
 
 def test_cross_root_source_path_disambiguates_copied_run_id(tmp_path):
@@ -207,16 +666,10 @@ def test_cross_root_source_path_disambiguates_copied_run_id(tmp_path):
         source={"path": str(source.run_dir), "run_id": source.run_id},
     )
 
-    graph = RunDependencyGraph.from_roots(
-        (duplicate_root, child_root, source_root)
-    )
+    graph = RunDependencyGraph.from_roots((duplicate_root, child_root, source_root))
 
-    assert graph.parent_of(RunIdentity.from_entry(child)) == RunIdentity.from_entry(
-        source
-    )
-    assert graph.parent_of(RunIdentity.from_entry(child)) != RunIdentity.from_entry(
-        duplicate
-    )
+    assert graph.parent_of(RunIdentity.from_entry(child)) == RunIdentity.from_entry(source)
+    assert graph.parent_of(RunIdentity.from_entry(child)) != RunIdentity.from_entry(duplicate)
 
 
 def test_graph_rejects_source_path_and_run_id_identifying_different_entries(
@@ -284,10 +737,7 @@ def test_family_fails_closed_when_discovery_diagnostic_may_hide_dependent(tmp_pa
 
     graph = RunDependencyGraph.from_roots((root,))
 
-    assert any(
-        Path(item["path"]) == child.run_dir / "run.json"
-        for item in graph.diagnostics
-    )
+    assert any(Path(item["path"]) == child.run_dir / "run.json" for item in graph.diagnostics)
     with pytest.raises(RunDependencyError, match="discovery diagnostic"):
         graph.family(RunIdentity.from_entry(parent))
 
@@ -342,9 +792,7 @@ def test_source_path_runtime_error_is_retained_as_unresolved_diagnostic(
     graph = RunDependencyGraph.from_roots((root,))
 
     assert any(item.get("source") == "metadata.source" for item in graph.diagnostics)
-    assert graph.family(RunIdentity.from_entry(child)) == frozenset(
-        {RunIdentity.from_entry(child)}
-    )
+    assert graph.family(RunIdentity.from_entry(child)) == frozenset({RunIdentity.from_entry(child)})
 
 
 def test_graph_rejects_ambiguous_same_root_parent_run_id(tmp_path):
@@ -493,12 +941,8 @@ def test_windows_equivalent_missing_roots_have_stable_universe_and_fingerprint(
     parent = publish_selection(live_root, run_id="a" * 32)
     upper_missing = tmp_path / "MISSING"
     lower_missing = tmp_path / "missing"
-    first_graph = RunDependencyGraph.from_roots(
-        (live_root, upper_missing, lower_missing)
-    )
-    second_graph = RunDependencyGraph.from_roots(
-        (lower_missing, upper_missing, live_root)
-    )
+    first_graph = RunDependencyGraph.from_roots((live_root, upper_missing, lower_missing))
+    second_graph = RunDependencyGraph.from_roots((lower_missing, upper_missing, live_root))
     selected = RunIdentity.from_entry(parent)
 
     assert tuple(map(str, first_graph.roots)) == tuple(map(str, second_graph.roots))
@@ -563,9 +1007,7 @@ def test_build_trash_plan_populates_immutable_members_and_exact_paths(tmp_path):
         child.run_id,
         parent.run_id,
     ]
-    assert all(
-        isinstance(member, run_trash_module.TrashMember) for member in plan.members
-    )
+    assert all(isinstance(member, run_trash_module.TrashMember) for member in plan.members)
     child_member = plan.members[0]
     assert child_member.original_relative_path == PurePosixPath(
         "chicago",
@@ -589,16 +1031,12 @@ def test_build_trash_plan_populates_immutable_members_and_exact_paths(tmp_path):
     assert child_member.size_bytes == _unique_regular_file_size(child.run_dir)
     assert plan.roots == (parent.root,)
     assert plan.fingerprint == graph.fingerprint(selected, family)
-    assert plan.total_size_bytes == sum(
-        member.size_bytes for member in plan.members
-    )
+    assert plan.total_size_bytes == sum(member.size_bytes for member in plan.members)
     assert [edge.source for edge in plan.edges] == [
         "metadata.source",
         "parent_run_id",
     ]
-    assert all(
-        edge.parent in family and edge.child in family for edge in plan.edges
-    )
+    assert all(edge.parent in family and edge.child in family for edge in plan.edges)
     with pytest.raises(FrozenInstanceError):
         plan.transaction_id = "e" * 32
     with pytest.raises(FrozenInstanceError):
