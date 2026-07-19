@@ -3262,6 +3262,9 @@ def test_candidate_session_registry_is_bounded_opaque_and_confirms_final_identit
     assert updated.scan_result is result
     assert confirmed.confirmed_flat_grid_id == 4
     assert confirmed.locked_candidate is result.candidates[1]
+    confirmed_sessions = getattr(registry, "confirmed_sessions", None)
+    assert callable(confirmed_sessions)
+    assert confirmed_sessions() == (confirmed,)
     with pytest.raises(ValueError, match="final scan"):
         registry.confirm(second.session_id, 4)
 
@@ -4783,6 +4786,7 @@ async def test_generation_page_uses_semantic_artifact_rows_and_live_partial_stat
             marker="generation-primary-error",
             content="Some artifacts could not be generated",
         )
+        assert registry.get("semantic-run") is None
         technical = next(iter(user.find(marker="generation-technical-copy").elements))
         assert "terrain.renderer_failed" in technical.content
         assert "terrain_png" in technical.content
@@ -5266,11 +5270,235 @@ def test_figure_form_does_not_render_until_refresh():
 
     assert state.preview_path is None
     assert state.preview_stale is True
-    bounded = preview_spec(
+    preview = preview_spec(state.spec)
+    publication = preview_spec(
         replace(state.spec, preset="publication", dpi=600, max_pixels=5000)
     )
-    assert bounded.dpi == 120
-    assert bounded.max_pixels == 600
+    assert publication.dpi > preview.dpi
+    assert publication.max_pixels > preview.max_pixels
+    assert publication.dpi < 600
+    assert publication.max_pixels < 5000
+
+
+def test_figure_and_history_pages_accept_bounded_selection_sources():
+    import inspect
+
+    from lte_scenario_toolkit.gui.pages.figures import render_figures_page
+    from lte_scenario_toolkit.gui.pages.history import render_history_content
+
+    figure_parameters = inspect.signature(render_figures_page).parameters
+    history_parameters = inspect.signature(render_history_content).parameters
+
+    assert "source_options" in figure_parameters
+    assert "pending_selections" in history_parameters
+    assert "on_open_pending_figures" in history_parameters
+
+
+def test_history_figure_source_options_list_each_completed_selection_once(tmp_path):
+    from lte_scenario_toolkit.gui.pages import history
+    from lte_scenario_toolkit.run_service import RunService
+
+    service = RunService(tmp_path / "results")
+    source = service.begin("new-york-city", "new-york-default")
+    (source.path / "selection.csv").write_text("X,Y\n1,2\n", encoding="utf-8")
+    source_path = service.publish(
+        source,
+        status="completed",
+        artifacts=["selection.csv"],
+        metadata={"run_kind": "selection"},
+    )
+    derived = service.begin(
+        "new-york-city",
+        "new-york-default",
+        parent_run_id=source.run_id,
+    )
+    (derived.path / "terrain.png").write_bytes(b"png")
+    service.publish(
+        derived,
+        status="completed",
+        artifacts=["terrain.png"],
+        metadata={
+            "run_kind": "figure",
+            "source": {"path": str(source_path), "run_id": source.run_id},
+        },
+    )
+    snapshot = history.rebuild_history(tmp_path, (tmp_path / "results",))
+    build_options = getattr(history, "figure_source_options", None)
+
+    assert callable(build_options)
+    options = build_options(snapshot)
+    assert list(options) == [str(source_path.resolve())]
+    assert "new-york-city / new-york-default" in options[str(source_path.resolve())]
+
+
+async def test_figure_style_and_source_fields_are_selection_controls(user, tmp_path):
+    from nicegui import ui
+
+    from lte_scenario_toolkit.gui.i18n import Translator
+    from lte_scenario_toolkit.gui.pages.figures import render_figures_page
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    coordinator = JobCoordinator()
+    source = (tmp_path / "results/city/default/run-a").resolve()
+
+    @ui.page("/figure-selection-controls")
+    def figure_selection_controls():
+        render_figures_page(
+            ui,
+            Translator("en"),
+            tmp_path,
+            coordinator,
+            source_options={str(source): "City / Default"},
+        )
+
+    try:
+        await user.open("/figure-selection-controls")
+        source_control = next(iter(user.find(marker="figure-source-path").elements))
+        colormap_control = next(iter(user.find(marker="figure-colormap").elements))
+        station_control = next(iter(user.find(marker="figure-station-color").elements))
+
+        assert type(source_control).__name__ == "Select"
+        assert type(colormap_control).__name__ == "Select"
+        assert type(station_control).__name__ == "Select"
+        assert str(source) in source_control.options
+        assert "terrain" in colormap_control.options
+        assert "viridis" in colormap_control.options
+        assert "red" in station_control.options
+        assert "royalblue" in station_control.options
+    finally:
+        coordinator.shutdown()
+
+
+async def test_figures_route_discovers_completed_run_sources_without_path_typing(
+    user,
+    tmp_path,
+):
+    from types import SimpleNamespace
+
+    from lte_scenario_toolkit.gui.app import create_app
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.run_service import RunService
+
+    service = RunService(tmp_path / "results")
+    source = service.begin("new-york-city", "new-york-default")
+    (source.path / "selection.csv").write_text("X,Y\n1,2\n", encoding="utf-8")
+    source_path = service.publish(
+        source,
+        status="completed",
+        artifacts=["selection.csv"],
+        metadata={"run_kind": "selection"},
+    )
+    coordinator = JobCoordinator()
+    try:
+        create_app(
+            catalog=SimpleNamespace(root=tmp_path.resolve()),
+            coordinator=coordinator,
+            testing=True,
+        )
+        await user.open("/figures")
+        source_control = next(iter(user.find(marker="figure-source-path").elements))
+
+        assert str(source_path.resolve()) in source_control.options
+        assert (
+            "new-york-city / new-york-default"
+            in source_control.options[str(source_path.resolve())]
+        )
+    finally:
+        coordinator.shutdown()
+
+
+async def test_history_exposes_confirmed_unpublished_selection_with_safe_actions(
+    user,
+    tmp_path,
+):
+    from nicegui import ui
+
+    from lte_scenario_toolkit.gui.i18n import Translator
+    from lte_scenario_toolkit.gui.pages.history import (
+        HistorySnapshot,
+        render_history_content,
+        render_history_frame,
+    )
+
+    session = _task15_locked_session(
+        tmp_path,
+        object(),
+        session_id="new-york-pending",
+    )
+    opened = []
+    continued = []
+
+    @ui.page("/history-pending-selection")
+    def history_pending_selection():
+        translator = Translator("en")
+        holder = render_history_frame(ui, translator)
+        render_history_content(
+            ui,
+            translator,
+            holder,
+            HistorySnapshot(
+                roots=((tmp_path / "results").resolve(),),
+                rows=(),
+                diagnostics=(),
+                index_path=(tmp_path / ".lte-data/cache/history-index.json").absolute(),
+            ),
+            pending_selections=(session,),
+            on_open_pending_figures=opened.append,
+            on_continue_pending=continued.append,
+        )
+
+    await user.open("/history-pending-selection")
+
+    await user.should_see(marker="history-pending-new-york-pending")
+    await user.should_see("ready-city / default")
+    await user.should_see(
+        marker="history-pending-status-new-york-pending",
+        content="Not published",
+    )
+    user.find(marker="history-pending-open-new-york-pending").click()
+    user.find(marker="history-pending-continue-new-york-pending").click()
+    assert opened == ["new-york-pending"]
+    assert continued == ["new-york-pending"]
+
+
+async def test_app_history_prioritizes_current_confirmed_selection(user, tmp_path):
+    from types import SimpleNamespace
+
+    from lte_scenario_toolkit.gui.app import create_app
+    from lte_scenario_toolkit.gui.pages.candidates import CandidateSessionRegistry
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    registry = CandidateSessionRegistry()
+    registry.add(
+        _task15_locked_session(
+            tmp_path,
+            object(),
+            session_id="new-york-current",
+        )
+    )
+    coordinator = JobCoordinator()
+    try:
+        create_app(
+            catalog=SimpleNamespace(root=tmp_path.resolve()),
+            candidate_registry=registry,
+            coordinator=coordinator,
+            testing=True,
+        )
+        await user.open("/history")
+
+        await user.should_see(
+            marker="history-pending-new-york-current",
+            retries=15,
+        )
+        await user.should_see("ready-city / default")
+        user.find(marker="history-pending-open-new-york-current").click()
+        for _ in range(20):
+            if user.back_history and user.back_history[-1].startswith("/figures/"):
+                break
+            await asyncio.sleep(0.05)
+        assert user.back_history[-1].startswith("/figures/")
+    finally:
+        coordinator.shutdown()
 
 
 
@@ -5297,6 +5525,22 @@ def test_preview_cache_is_explicit_and_style_changes_only_mark_stale(tmp_path):
     changed = rendered.with_dpi(200)
     assert changed.preview_path == expected
     assert changed.preview_stale is True
+
+
+def test_station_visibility_renderer_invalidates_v2_preview_cache(
+    tmp_path,
+    monkeypatch,
+):
+    from lte_scenario_toolkit.gui.pages import figures
+
+    source = _task15_figure_source(tmp_path)
+    spec = figures.FigurePageState.for_source(source).spec
+    current = figures.preview_cache_path(tmp_path, source, spec)
+
+    monkeypatch.setattr(figures, "PREVIEW_CACHE_VERSION", "figure-preview-v2")
+    legacy = figures.preview_cache_path(tmp_path, source, spec)
+
+    assert current != legacy
 
 
 def test_figure_controller_invalidate_source_clears_all_exportable_state(tmp_path):
@@ -5418,18 +5662,24 @@ async def test_figure_page_invalidates_old_source_on_edit_and_failed_load(
         create_app(
             catalog=SimpleNamespace(root=tmp_path.resolve()),
             coordinator=coordinator,
+            figure_source_options_provider=lambda: {
+                str(completed_a): "Completed A",
+                str(missing_b): "Missing B",
+            },
             testing=True,
         )
         await user.open("/figures")
-        source_field = user.find(marker="figure-source-path")
-        source_field.clear().type(str(completed_a))
+        source_field = next(iter(user.find(marker="figure-source-path").elements))
+        with user.client:
+            source_field.set_value(str(completed_a.resolve()))
         user.find(marker="figure-load-source").click()
 
         await user.should_see(marker="figure-source-ready", content="Rectangle 1")
         assert next(iter(user.find(marker="figure-refresh-preview").elements)).enabled
         assert next(iter(user.find(marker="figure-export").elements)).enabled
 
-        source_field.clear().type(str(missing_b))
+        with user.client:
+            source_field.set_value(str(missing_b.resolve()))
 
         await user.should_see(marker="figure-source-dirty", content="Load to continue")
         await user.should_not_see(marker="figure-source-ready")
@@ -5482,20 +5732,21 @@ async def test_figure_primary_source_error_is_localized_and_raw_detail_is_collap
             Translator("zh-CN"),
             tmp_path,
             coordinator,
+            source_options={str(tmp_path / "missing-run"): "Missing run"},
         )
 
     try:
         await user.open("/figures-human-errors")
-        source = user.find(marker="figure-source-path")
-        source.clear().type(str(tmp_path / "missing-run"))
+        source = next(iter(user.find(marker="figure-source-path").elements))
+        with user.client:
+            source.set_value(str((tmp_path / "missing-run").resolve()))
         user.find(marker="figure-load-source").click()
 
         await user.should_see(
             marker="figure-source-error",
             content=(
-                "\u65e0\u6cd5\u52a0\u8f7d\u8be5\u56fe\u8868\u6765\u6e90\u3002"
-                "\u8bf7\u68c0\u67e5\u8def\u5f84\u4ee5\u53ca\u8fd0\u884c\u662f\u5426"
-                "\u5df2\u5b8c\u6210\uff0c\u7136\u540e\u91cd\u8bd5\u3002"
+                "\u65e0\u6cd5\u52a0\u8f7d\u6240\u9009\u56fe\u8868\u6765\u6e90\u3002"
+                "\u8bf7\u5237\u65b0\u8fd0\u884c\u5217\u8868\u540e\u91cd\u8bd5\u3002"
             ),
         )
         primary = next(iter(user.find(marker="figure-source-error").elements))
@@ -5693,10 +5944,13 @@ async def test_figure_page_locks_all_controls_and_restores_rejected_edits(
         app_module.create_app(
             catalog=SimpleNamespace(root=tmp_path.resolve()),
             coordinator=coordinator,
+            figure_source_options_provider=lambda: {
+                str(completed_a): "Completed A",
+                str(rejected_b): "Rejected B",
+            },
             testing=True,
         )
         await user.open("/figures")
-        source_interaction = user.find(marker="figure-source-path")
         control_markers = (
             "figure-source-path",
             "figure-load-source",
@@ -5723,7 +5977,8 @@ async def test_figure_page_locks_all_controls_and_restores_rejected_edits(
         source_element = control_elements["figure-source-path"]
         preset_element = control_elements["figure-preset"]
         dpi_element = control_elements["figure-dpi"]
-        source_interaction.clear().type(str(completed_a))
+        with user.client:
+            source_element.set_value(str(completed_a))
         user.find(marker="figure-load-source").click()
         user.find(marker="figure-refresh-preview").click()
         assert await asyncio.to_thread(entered.wait, 2)
@@ -5776,6 +6031,89 @@ async def test_figure_page_locks_all_controls_and_restores_rejected_edits(
         coordinator.shutdown()
 
 
+async def test_figure_page_runs_final_export_in_a_cpu_bound_process(
+    tmp_path,
+    monkeypatch,
+    user,
+):
+    import pickle
+    from dataclasses import replace
+
+    from nicegui import run, ui
+
+    from lte_scenario_toolkit.gui.i18n import Translator
+    from lte_scenario_toolkit.gui.pages import figures
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    source_path = (tmp_path / "completed-source").resolve()
+    source = replace(
+        _task15_figure_source(tmp_path),
+        path=source_path,
+        source_kind="run",
+        run_id="a" * 32,
+    )
+    output_root = (tmp_path / "results").resolve()
+    published = output_root / "city" / "default" / "published"
+    published.mkdir(parents=True)
+    cpu_calls = []
+    remembered = []
+    views = []
+
+    async def fake_cpu_bound(callback, *args, **kwargs):
+        pickle.dumps((callback, args, kwargs))
+        cpu_calls.append((callback, args, kwargs))
+        request = args[0]
+        return figures._FigureJobResult(
+            "export",
+            request.revision,
+            path=published,
+            phase="completed",
+        )
+
+    monkeypatch.setattr(run, "cpu_bound", fake_cpu_bound)
+    monkeypatch.setattr(figures, "load_figure_source", lambda _path: source)
+    coordinator = JobCoordinator()
+
+    @ui.page("/figure-cpu-export")
+    def figure_cpu_export():
+        views.append(
+            figures.render_figures_page(
+                ui,
+                Translator("en"),
+                tmp_path,
+                coordinator,
+                initial_source=source_path,
+                source_options={str(source_path): "Completed source"},
+                output_root=output_root,
+                on_published=remembered.append,
+            )
+        )
+
+    try:
+        await user.open("/figure-cpu-export")
+        await user.should_see(marker="figure-source-ready", content="Rectangle 1")
+
+        user.find(marker="figure-export").click()
+        for _ in range(30):
+            if cpu_calls:
+                break
+            await asyncio.sleep(0.05)
+
+        assert len(cpu_calls) == 1
+        callback, args, kwargs = cpu_calls[0]
+        assert callback is figures._render_figure_export
+        assert len(args) == 1
+        assert kwargs == {}
+        await user.should_see(str(published))
+        assert remembered == [published]
+        assert views[0].controller.state.run_path == published
+        assert coordinator.snapshot().active is False
+    finally:
+        if views:
+            views[0].timer.cancel(with_current_invocation=True)
+        coordinator.shutdown()
+
+
 async def test_figure_page_shows_loaded_no_dem_reason_and_no_legacy_controls(
     tmp_path,
     monkeypatch,
@@ -5795,10 +6133,17 @@ async def test_figure_page_shows_loaded_no_dem_reason_and_no_legacy_controls(
         create_app(
             catalog=SimpleNamespace(root=tmp_path.resolve()),
             coordinator=coordinator,
+            figure_source_options_provider=lambda: {
+                str(completed): "Completed without DEM"
+            },
             testing=True,
         )
         await user.open("/figures")
-        user.find(marker="figure-source-path").clear().type(str(completed))
+        source_control = next(
+            iter(user.find(marker="figure-source-path").elements)
+        )
+        with user.client:
+            source_control.set_value(str(completed.resolve()))
         user.find(marker="figure-load-source").click()
 
         await user.should_see(marker="figure-source-ready", content="Rectangle 1")

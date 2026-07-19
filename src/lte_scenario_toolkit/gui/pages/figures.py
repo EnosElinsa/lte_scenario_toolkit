@@ -12,6 +12,8 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
+from matplotlib import colormaps
+
 from ... import io
 from ...figure_service import (
     FigureService,
@@ -23,10 +25,52 @@ from ...jobs import Job, JobBusyError, JobCoordinator
 from ...run_service import RunService
 from ..presentation import render_technical_details
 
-PREVIEW_CACHE_VERSION = "figure-preview-v1"
-PREVIEW_DPI_LIMIT = 120
-PREVIEW_PIXEL_LIMIT = 600
+PREVIEW_CACHE_VERSION = "figure-preview-v3"
+PREVIEW_LIMITS = {
+    "preview": {"dpi": 120, "max_pixels": 600},
+    "publication": {"dpi": 180, "max_pixels": 900},
+}
 FIGURE_FORMAT_ORDER = ("png", "eps", "html")
+STATION_COLOR_OPTIONS = {
+    "red": "Red",
+    "crimson": "Crimson",
+    "darkorange": "Orange",
+    "gold": "Gold",
+    "forestgreen": "Green",
+    "teal": "Teal",
+    "royalblue": "Blue",
+    "navy": "Navy",
+    "purple": "Purple",
+    "black": "Black",
+    "white": "White",
+}
+
+
+def _colormap_options(current: str) -> dict[str, str]:
+    options = {name: name for name in sorted(colormaps)}
+    options.setdefault(current, current)
+    return options
+
+
+def _station_color_options(current: str) -> dict[str, str]:
+    options = dict(STATION_COLOR_OPTIONS)
+    options.setdefault(current, current)
+    return options
+
+
+def _source_options(
+    values: Mapping[str, str] | None,
+    initial_source: str | Path | None,
+) -> dict[str, str]:
+    options: dict[str, str] = {}
+    for raw_path, raw_label in (values or {}).items():
+        path = str(Path(raw_path).expanduser().resolve(strict=False))
+        label = str(raw_label).strip()
+        options[path] = label or path
+    if initial_source is not None:
+        path = str(Path(initial_source).expanduser().resolve(strict=False))
+        options.setdefault(path, path)
+    return options
 
 
 def load_figure_source(path: str | Path) -> FigureSource:
@@ -147,10 +191,11 @@ def preview_spec(spec: FigureSpec) -> FigureSpec:
     """Bound every GUI preview while preserving the selected visual style."""
 
     spec.validate()
+    limits = PREVIEW_LIMITS[spec.preset]
     return replace(
         spec,
-        dpi=min(spec.dpi, PREVIEW_DPI_LIMIT),
-        max_pixels=min(spec.max_pixels, PREVIEW_PIXEL_LIMIT),
+        dpi=min(spec.dpi, limits["dpi"]),
+        max_pixels=min(spec.max_pixels, limits["max_pixels"]),
     )
 
 
@@ -241,6 +286,128 @@ class _FigureJobResult:
     output_root: Path | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _FigureExportRequest:
+    source: FigureSource
+    spec: FigureSpec
+    output_root: Path
+    requested: tuple[str, ...]
+    parent_run_id: str | None
+    revision: int
+    repository: Path
+
+
+def _render_figure_export(request: _FigureExportRequest) -> _FigureJobResult:
+    """Render and validate one export in a process-safe, UI-free function."""
+
+    source = request.source
+    try:
+        path = FigureService.render(
+            source,
+            request.spec,
+            RunService(request.output_root),
+            request.requested,
+            parent_run_id=request.parent_run_id,
+            entrypoint=("lte-gui", "figures"),
+            repository=request.repository,
+        )
+        entry = RunService(request.output_root).entry_for_path(path)
+        record = entry.record
+        metadata = record.get("metadata")
+        if record.get("scenario_id") != (source.scenario_id or "figures"):
+            raise ValueError("figure run scenario does not match its source")
+        if record.get("profile_id") != (source.profile_id or "figures"):
+            raise ValueError("figure run profile does not match its source")
+        if record.get("parent_run_id") != request.parent_run_id:
+            raise ValueError("figure run parent does not match its source")
+        if not isinstance(metadata, Mapping) or metadata.get("run_kind") != "figure":
+            raise ValueError("published run is not a figure run")
+        recorded_formats = metadata.get("requested_formats")
+        if not isinstance(recorded_formats, (list, tuple)) or tuple(
+            recorded_formats
+        ) != request.requested:
+            raise ValueError("figure run formats do not match the request")
+        recorded_spec = metadata.get("figure_spec")
+        if not isinstance(recorded_spec, Mapping) or dict(
+            recorded_spec
+        ) != request.spec.as_dict():
+            raise ValueError("figure run style does not match the request")
+        source_metadata = metadata.get("source")
+        if not isinstance(source_metadata, Mapping):
+            raise ValueError("figure run is missing source metadata")
+        if source_metadata.get("run_id") != source.run_id:
+            raise ValueError("figure run source ID does not match")
+        if source_metadata.get("kind") != source.source_kind:
+            raise ValueError("figure run source kind does not match")
+        if source_metadata.get("path") != (
+            str(source.path) if source.path is not None else None
+        ):
+            raise ValueError("figure run source path does not match")
+        if source_metadata.get("csv") != (
+            str(source.csv_path) if source.csv_path is not None else None
+        ):
+            raise ValueError("figure run source CSV does not match")
+        expected_selection = (
+            source.selection_identity.as_dict()
+            if source.selection_identity is not None
+            else None
+        )
+        if source_metadata.get("selection") != expected_selection:
+            raise ValueError("figure run selection identity does not match")
+        artifact_paths = metadata.get("artifact_paths")
+        if not isinstance(artifact_paths, Mapping):
+            raise ValueError("figure run artifact paths are missing")
+        artifacts = tuple(record.get("artifacts", ()))
+        if source_metadata.get("artifact") != "source.csv":
+            raise ValueError("figure run source snapshot is not recorded")
+        if "source.csv" not in artifacts:
+            raise ValueError("figure run source snapshot is missing")
+        if any(relative not in artifacts for relative in artifact_paths.values()):
+            raise ValueError("figure run artifact paths are inconsistent")
+        if len(set(artifact_paths.values())) != len(artifact_paths):
+            raise ValueError("figure run artifact paths must be unique")
+        successful = set(artifact_paths)
+        if not successful or not successful.issubset(set(request.requested)):
+            raise ValueError("figure run has invalid successful formats")
+        phase = str(entry.record["status"])
+        if phase == "completed" and successful != set(request.requested):
+            raise ValueError("completed figure run is missing formats")
+        failed_tokens = {
+            item.get("artifact")
+            for item in record.get("errors", ())
+            if isinstance(item, Mapping)
+        }
+        if phase == "partial" and failed_tokens != set(request.requested) - successful:
+            raise ValueError("partial figure run errors do not match missing formats")
+        if phase == "completed" and failed_tokens:
+            raise ValueError("completed figure run must not contain errors")
+        if phase == "partial" and successful == set(request.requested):
+            raise ValueError("partial figure run must have a failed format")
+        errors = tuple(
+            dict(item)
+            for item in entry.record["errors"]
+            if isinstance(item, Mapping)
+        )
+        return _FigureJobResult(
+            "export",
+            request.revision,
+            path=entry.run_dir,
+            phase=phase,
+            warnings=source.warnings,
+            errors=errors,
+        )
+    except Exception as exc:
+        return _FigureJobResult(
+            "export",
+            request.revision,
+            phase="error",
+            errors=(
+                {"code": "figure.export.failed", "message": str(exc)},
+            ),
+            message=str(exc),
+        )
+
+
 class FigureController:
     """Coordinate source preparation, explicit preview, and final publication."""
 
@@ -292,8 +459,10 @@ class FigureController:
     def _job_unfinished_locked(self) -> bool:
         return (
             self._job is not None
-            and self._job.future is not None
-            and not self._job.future.done()
+            and (
+                self._job.future is None
+                or not self._job.future.done()
+            )
         )
 
     @property
@@ -396,6 +565,15 @@ class FigureController:
             self._job = job
         assert job.future is not None
         job.future.add_done_callback(lambda _future: self.coordinator.finish(job.job_id))
+        return job
+
+    def _reserve(self, kind: str) -> Job:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("figure controller is closed")
+        job = self.coordinator.start(kind)
+        with self._lock:
+            self._job = job
         return job
 
     def prepare_selection(self, session: Any) -> Job:
@@ -536,7 +714,7 @@ class FigureController:
                 raise ValueError("figure parent run changed; reopen from History")
         return output_root.resolve(strict=False), parent_run_id
 
-    def export(self, formats: Iterable[str]) -> Job:
+    def _export_request(self, formats: Iterable[str]) -> _FigureExportRequest:
         state = self.state
         source = state.source
         if not isinstance(source, FigureSource):
@@ -547,138 +725,90 @@ class FigureController:
         source_snapshot = source.snapshot()
         spec = state.spec.validate()
         output_root, parent_run_id = self._target(source_snapshot)
-        revision = state.revision
+        return _FigureExportRequest(
+            source=source_snapshot,
+            spec=spec,
+            output_root=output_root,
+            requested=requested,
+            parent_run_id=parent_run_id,
+            revision=state.revision,
+            repository=self.repo_root,
+        )
+
+    def export(self, formats: Iterable[str]) -> Job:
+        request = self._export_request(formats)
 
         def worker(_cancel: Any, _emit: Callable[[Any], None]) -> _FigureJobResult:
-            try:
-                path = FigureService.render(
-                    source_snapshot,
-                    spec,
-                    RunService(output_root),
-                    requested,
-                    parent_run_id=parent_run_id,
-                    entrypoint=("lte-gui", "figures"),
-                    repository=self.repo_root,
-                )
-                entry = RunService(output_root).entry_for_path(path)
-                record = entry.record
-                metadata = record.get("metadata")
-                if record.get("scenario_id") != (source_snapshot.scenario_id or "figures"):
-                    raise ValueError("figure run scenario does not match its source")
-                if record.get("profile_id") != (source_snapshot.profile_id or "figures"):
-                    raise ValueError("figure run profile does not match its source")
-                if record.get("parent_run_id") != parent_run_id:
-                    raise ValueError("figure run parent does not match its source")
-                if not isinstance(metadata, Mapping) or metadata.get("run_kind") != "figure":
-                    raise ValueError("published run is not a figure run")
-                recorded_formats = metadata.get("requested_formats")
-                if not isinstance(recorded_formats, (list, tuple)) or tuple(
-                    recorded_formats
-                ) != requested:
-                    raise ValueError("figure run formats do not match the request")
-                recorded_spec = metadata.get("figure_spec")
-                if not isinstance(recorded_spec, Mapping) or dict(
-                    recorded_spec
-                ) != spec.as_dict():
-                    raise ValueError("figure run style does not match the request")
-                source_metadata = metadata.get("source")
-                if not isinstance(source_metadata, Mapping):
-                    raise ValueError("figure run is missing source metadata")
-                if source_metadata.get("run_id") != source_snapshot.run_id:
-                    raise ValueError("figure run source ID does not match")
-                if source_metadata.get("kind") != source_snapshot.source_kind:
-                    raise ValueError("figure run source kind does not match")
-                if source_metadata.get("path") != (
-                    str(source_snapshot.path)
-                    if source_snapshot.path is not None
-                    else None
-                ):
-                    raise ValueError("figure run source path does not match")
-                if source_metadata.get("csv") != (
-                    str(source_snapshot.csv_path)
-                    if source_snapshot.csv_path is not None
-                    else None
-                ):
-                    raise ValueError("figure run source CSV does not match")
-                expected_selection = (
-                    source_snapshot.selection_identity.as_dict()
-                    if source_snapshot.selection_identity is not None
-                    else None
-                )
-                if source_metadata.get("selection") != expected_selection:
-                    raise ValueError("figure run selection identity does not match")
-                artifact_paths = metadata.get("artifact_paths")
-                if not isinstance(artifact_paths, Mapping):
-                    raise ValueError("figure run artifact paths are missing")
-                artifacts = tuple(record.get("artifacts", ()))
-                if source_metadata.get("artifact") != "source.csv":
-                    raise ValueError("figure run source snapshot is not recorded")
-                if "source.csv" not in artifacts:
-                    raise ValueError("figure run source snapshot is missing")
-                if any(
-                    relative not in artifacts for relative in artifact_paths.values()
-                ):
-                    raise ValueError("figure run artifact paths are inconsistent")
-                if len(set(artifact_paths.values())) != len(artifact_paths):
-                    raise ValueError("figure run artifact paths must be unique")
-                successful = set(artifact_paths)
-                if not successful or not successful.issubset(set(requested)):
-                    raise ValueError("figure run has invalid successful formats")
-                phase = str(entry.record["status"])
-                if phase == "completed" and successful != set(requested):
-                    raise ValueError("completed figure run is missing formats")
-                failed_tokens = {
-                    item.get("artifact")
-                    for item in record.get("errors", ())
-                    if isinstance(item, Mapping)
-                }
-                if phase == "partial" and failed_tokens != set(requested) - successful:
-                    raise ValueError("partial figure run errors do not match missing formats")
-                if phase == "completed" and failed_tokens:
-                    raise ValueError("completed figure run must not contain errors")
-                if phase == "partial" and successful == set(requested):
-                    raise ValueError("partial figure run must have a failed format")
-                errors = tuple(
-                    dict(item)
-                    for item in entry.record["errors"]
-                    if isinstance(item, Mapping)
-                )
-                callback_warnings = list(source_snapshot.warnings)
-                if self.on_published is not None:
-                    try:
-                        self.on_published(entry.run_dir)
-                    except Exception as exc:
-                        callback_warnings.append(
-                            f"figure.settings_failed:{exc}"
-                        )
-                return _FigureJobResult(
-                    "export",
-                    revision,
-                    path=entry.run_dir,
-                    phase=phase,
-                    warnings=tuple(callback_warnings),
-                    errors=errors,
-                )
-            except Exception as exc:
-                return _FigureJobResult(
-                    "export",
-                    revision,
-                    phase="error",
-                    errors=(
-                        {"code": "figure.export.failed", "message": str(exc)},
-                    ),
-                    message=str(exc),
-                )
+            return _render_figure_export(request)
 
         job = self._submit("figure-export", worker)
-        self._set_state(replace(state, phase="exporting", errors=()))
+        self._set_state(replace(self.state, phase="exporting", errors=()))
         return job
+
+    def reserve_cpu_export(
+        self,
+        formats: Iterable[str],
+    ) -> tuple[Job, _FigureExportRequest]:
+        request = self._export_request(formats)
+        job = self._reserve("figure-export")
+        self._set_state(replace(self.state, phase="exporting", errors=()))
+        return job, request
 
     def drain(self, job: Job | None = None) -> FigurePageState:
         active = self.job if job is None else job
         if active is None or active.future is None or not active.future.done():
             return self.state
         result = active.future.result()
+        return self._apply_result(active, result)
+
+    def complete_cpu_export(
+        self,
+        job: Job,
+        result: _FigureJobResult,
+    ) -> FigurePageState:
+        if job.future is not None or job.kind != "figure-export":
+            raise ValueError("job must be a reserved CPU figure export")
+        if result.kind != "export":
+            raise ValueError("CPU figure export returned the wrong result kind")
+        return self._apply_result(job, result)
+
+    def abandon_cpu_export(self, job: Job) -> FigurePageState:
+        with self._lock:
+            if self._job is not None and self._job.job_id == job.job_id:
+                self._job = None
+            state = self._state
+            phase = (
+                "ready"
+                if state.source is not None and not state.source_dirty
+                else "error"
+                if state.source_error is not None
+                else "empty"
+            )
+            self._state = replace(state, phase=phase)
+            updated = self._state
+        self.coordinator.finish(job.job_id)
+        return updated
+
+    def _apply_result(
+        self,
+        active: Job,
+        result: _FigureJobResult,
+    ) -> FigurePageState:
+        with self._lock:
+            if self._job is not None and self._job.job_id == active.job_id:
+                self._job = None
+        if (
+            result.kind == "export"
+            and result.phase != "error"
+            and result.path is not None
+            and self.on_published is not None
+        ):
+            callback_warnings = list(result.warnings)
+            try:
+                self.on_published(result.path)
+            except Exception as exc:
+                callback_warnings.append(f"figure.settings_failed:{exc}")
+            result = replace(result, warnings=tuple(callback_warnings))
         state = self.state
         if result.kind == "source":
             if result.revision != state.revision:
@@ -751,6 +881,15 @@ class FigureController:
     def close(self) -> None:
         with self._lock:
             self._closed = True
+            reserved = (
+                self._job
+                if self._job is not None and self._job.future is None
+                else None
+            )
+            if reserved is not None:
+                self._job = None
+        if reserved is not None:
+            self.coordinator.finish(reserved.job_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -782,6 +921,7 @@ def render_figures_page(
     coordinator: JobCoordinator,
     *,
     initial_source: str | Path | None = None,
+    source_options: Mapping[str, str] | None = None,
     current_session: Any | None = None,
     output_root: str | os.PathLike[str] | None = None,
     on_published: Callable[[Path], None] | None = None,
@@ -802,6 +942,7 @@ def render_figures_page(
         parent_run_path=parent_run_path,
         on_published=on_published,
     )
+    page_client = ui.context.client
     route_output_root = controller.output_root
     route_parent_run_id = controller.parent_run_id
     route_parent_run_path = controller.parent_run_path
@@ -811,6 +952,12 @@ def render_figures_page(
         ("png", "html")
         if initial_formats is None
         else FigureController._normalise_formats(initial_formats)
+    )
+    available_source_options = _source_options(source_options, initial_source)
+    initial_source_value = (
+        None
+        if initial_source is None
+        else str(Path(initial_source).expanduser().resolve(strict=False))
     )
 
     with ui.column().classes("lte-page lte-figures-page"):
@@ -827,10 +974,14 @@ def render_figures_page(
                     "lte-figure-section-note"
                 )
             with ui.row().classes("lte-figure-source-actions items-end full-width"):
-                source_input = ui.input(
-                    translator.text("figures.source_path"),
-                    value="" if initial_source is None else str(initial_source),
-                ).classes("grow").mark("figure-source-path")
+                source_input = ui.select(
+                    available_source_options,
+                    value=initial_source_value,
+                    label=translator.text("figures.source_path"),
+                    with_input=True,
+                ).props("clearable options-dense").classes("grow").mark(
+                    "figure-source-path"
+                )
                 load_button = ui.button(
                     translator.text("figures.load_source")
                 ).mark("figure-load-source")
@@ -913,10 +1064,12 @@ def render_figures_page(
                         value=form_spec.dpi,
                         precision=0,
                     ).mark("figure-dpi")
-                    colormap = ui.input(
-                        translator.text("figures.colormap"),
+                    colormap = ui.select(
+                        _colormap_options(form_spec.colormap),
                         value=form_spec.colormap,
-                    ).mark("figure-colormap")
+                        label=translator.text("figures.colormap"),
+                        with_input=True,
+                    ).props("options-dense").mark("figure-colormap")
                     with ui.row().classes("lte-figure-style-pair full-width"):
                         azimuth = ui.number(
                             translator.text("figures.azimuth"),
@@ -931,10 +1084,12 @@ def render_figures_page(
                         value=form_spec.vertical_exaggeration,
                     ).mark("figure-vertical-exaggeration")
                     with ui.row().classes("lte-figure-style-pair full-width"):
-                        station_color = ui.input(
-                            translator.text("figures.station_color"),
+                        station_color = ui.select(
+                            _station_color_options(form_spec.station_color),
                             value=form_spec.station_color,
-                        ).mark("figure-station-color")
+                            label=translator.text("figures.station_color"),
+                            with_input=True,
+                        ).props("options-dense").mark("figure-station-color")
                         station_size = ui.number(
                             translator.text("figures.station_size"),
                             value=form_spec.station_size,
@@ -1038,7 +1193,7 @@ def render_figures_page(
             if isinstance(state.source, FigureSource)
             and not state.source_dirty
             and state.source.path is not None
-            else ""
+            else None
         )
         if source_input.value != confirmed:
             restoring_source_control = True
@@ -1114,6 +1269,8 @@ def render_figures_page(
                 control.enable()
             else:
                 control.disable()
+        if not running and not source_input.value:
+            load_button.disable()
 
         source_status.set_visibility(valid_source)
         source_identity.set_visibility(valid_source)
@@ -1239,6 +1396,11 @@ def render_figures_page(
     ) -> None:
         if not invalidate_visible_source():
             return
+        if not source_input.value:
+            invalidate_visible_source(
+                translator.text("figures.no_source")
+            )
+            return
         try:
             source = load_figure_source(source_input.value)
         except Exception as exc:
@@ -1265,7 +1427,7 @@ def render_figures_page(
                 vertical_exaggeration=float(vertical.value),
                 station_color=str(station_color.value),
                 station_size=float(station_size.value),
-                title=str(title.value) or None,
+                title=str(title.value).strip() or None,
                 max_pixels=_positive_integer_control(
                     max_pixels.value,
                     field="Maximum terrain pixels",
@@ -1340,24 +1502,45 @@ def render_figures_page(
         sync_controls()
         timer.activate()
 
-    def final_export() -> None:
+    async def final_export() -> None:
         if not changed_spec():
             return
         formats = tuple(
             token for token in FIGURE_FORMAT_ORDER if format_boxes[token].value
         )
         try:
-            controller.export(formats)
+            job, request = controller.reserve_cpu_export(formats)
         except JobBusyError as exc:
             set_ui_diagnostic(str(exc))
             ui.notify(translator.text("error.job_busy"), type="warning")
             return
-        except ValueError as exc:
+        except (RuntimeError, ValueError) as exc:
             set_ui_diagnostic(str(exc))
             ui.notify(translator.text("figures.export_failed"), type="warning")
             return
         sync_controls()
-        timer.activate()
+        from nicegui import run
+
+        try:
+            result = await run.cpu_bound(_render_figure_export, request)
+        except Exception as exc:
+            result = _FigureJobResult(
+                "export",
+                request.revision,
+                phase="error",
+                errors=(
+                    {"code": "figure.export.failed", "message": str(exc)},
+                ),
+                message=str(exc),
+            )
+        if result is None:
+            state = controller.abandon_cpu_export(job)
+        else:
+            state = controller.complete_cpu_export(job, result)
+        if page_client.is_deleted:
+            return
+        sync_controls(state)
+        render_messages()
 
     def prepare_current_selection() -> None:
         if not invalidate_visible_source():

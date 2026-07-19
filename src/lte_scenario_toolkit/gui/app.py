@@ -8,7 +8,7 @@ import os
 import stat
 import sys
 from collections import OrderedDict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
@@ -43,6 +43,7 @@ from .pages.generate import (
     render_generation_unavailable,
 )
 from .pages.history import (
+    figure_source_options,
     rebuild_history,
     render_history_content,
     render_history_error,
@@ -282,6 +283,7 @@ def create_app(
     candidate_style_asset_builder: Callable[[CandidateSession, Any], Any]
     | None = None,
     online_tile_probe: Callable[[], bool] | None = None,
+    figure_source_options_provider: Callable[[], Mapping[str, str]] | None = None,
 ):
     """Register and return the NiceGUI application for one validated catalog."""
 
@@ -407,6 +409,21 @@ def create_app(
         with ephemeral_roots_lock:
             current = tuple(ephemeral_roots)
         return (*configured, *current)
+
+    def available_figure_source_options() -> dict[str, str]:
+        if figure_source_options_provider is not None:
+            provided = figure_source_options_provider()
+            if not isinstance(provided, Mapping):
+                raise ValueError("figure source options provider must return a mapping")
+            return {str(path): str(label) for path, label in provided.items()}
+        try:
+            snapshot = rebuild_history(
+                repo_root,
+                history_output_roots(),
+            )
+        except (OSError, ValueError):
+            return {}
+        return figure_source_options(snapshot)
 
     def remember_published_run(path: Path) -> None:
         try:
@@ -598,14 +615,16 @@ def create_app(
         except ValueError:
             render_generation_unavailable(ui, translator)
             return
+        def remember_generation_run(path: Path) -> None:
+            remember_output_root(session.preflight.output_root)
+            sessions.discard(session.session_id)
+
         render_generate_page(
             ui,
             translator,
             session,
             runtime.coordinator,
-            on_published=lambda _path: remember_output_root(
-                session.preflight.output_root
-            ),
+            on_published=remember_generation_run,
             on_complete=lambda _state: ui.navigate.to("/history"),
             on_open_figures=lambda: ui.navigate.to(
                 "/figures/"
@@ -650,12 +669,18 @@ def create_app(
         translator: Translator,
         request: _FigureRouteRequest | None = None,
     ) -> None:
+        def remember_figure_run(path: Path) -> None:
+            remember_published_run(path)
+            if request is not None and request.session_id is not None:
+                sessions.discard(request.session_id)
+
         render_figures_page(
             ui,
             translator,
             repo_root,
             runtime.coordinator,
             initial_source=None if request is None else request.source,
+            source_options=available_figure_source_options(),
             current_session=request_figure_session(request),
             output_root=None if request is None else request.output_root,
             initial_formats=(
@@ -664,7 +689,7 @@ def create_app(
             initial_spec=None if request is None else request.figure_spec,
             parent_run_id=None if request is None else request.parent_run_id,
             parent_run_path=None if request is None else request.parent_run_path,
-            on_published=remember_published_run,
+            on_published=remember_figure_run,
             preview_url_builder=preview_asset_url,
         )
 
@@ -724,6 +749,13 @@ def create_app(
             raise OSError("Directory reveal is unavailable on this platform")
         startfile(str(path))
 
+    def open_pending_figures(session_id: str) -> None:
+        token = figure_requests.add(_FigureRouteRequest(session_id=session_id))
+        ui.navigate.to(f"/figures/{token}")
+
+    def continue_pending_generation(session_id: str) -> None:
+        ui.navigate.to(f"/generate/{session_id}")
+
     @ui.page("/history", **page_options)
     async def history() -> None:
         from nicegui import run
@@ -775,6 +807,9 @@ def create_app(
                 formats,
                 figure_spec,
             ),
+            pending_selections=sessions.confirmed_sessions(),
+            on_open_pending_figures=open_pending_figures,
+            on_continue_pending=continue_pending_generation,
         )
 
     @ui.page("/configure", **page_options)

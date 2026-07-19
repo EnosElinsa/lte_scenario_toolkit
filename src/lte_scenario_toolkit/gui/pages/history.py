@@ -19,6 +19,7 @@ from ...io import atomic_write_json
 from ...run_service import RunEntry, RunService
 from ..presentation import (
     ActionSpec,
+    PresentationSpec,
     render_action_bar,
     render_empty_state,
     render_loading_state,
@@ -156,6 +157,24 @@ class HistorySnapshot:
     rows: tuple[HistoryRow, ...]
     diagnostics: tuple[HistoryDiagnostic, ...]
     index_path: Path
+
+
+def figure_source_options(snapshot: HistorySnapshot) -> dict[str, str]:
+    """Return one labeled dropdown option per authoritative selection run."""
+
+    if not isinstance(snapshot, HistorySnapshot):
+        raise ValueError("snapshot must be a HistorySnapshot")
+    options: dict[str, str] = {}
+    for row in snapshot.rows:
+        source_path = row.figure_source_path
+        if source_path is None or _path_identity(source_path) != _path_identity(row.path):
+            continue
+        resolved = str(source_path.resolve(strict=False))
+        options.setdefault(
+            resolved,
+            f"{row.scenario_id} / {row.profile_id} · {row.local_created_at}",
+        )
+    return options
 
 
 @dataclass(frozen=True, slots=True)
@@ -884,6 +903,9 @@ def render_history_content(
         [Path, Path, str, Path, tuple[str, ...], FigureSpec | None], None
     ]
     | None = None,
+    pending_selections: Iterable[Any] = (),
+    on_open_pending_figures: Callable[[str], None] | None = None,
+    on_continue_pending: Callable[[str], None] | None = None,
 ) -> None:
     """Replace History content with one validated snapshot."""
 
@@ -962,8 +984,114 @@ def render_history_content(
         except Exception as exc:
             notify_action_error(exc)
 
+    pending = tuple(pending_selections)
     holder.clear()
     with holder:
+        if pending:
+            ui.label(
+                _translated(
+                    translator,
+                    "history.pending_section",
+                    "Current confirmed selections",
+                )
+            ).classes("lte-section-title").mark("history-pending-section")
+            with ui.column().classes("lte-history-list lte-history-pending-list"):
+                for session in pending:
+                    session_id = getattr(session, "session_id", None)
+                    profile = getattr(session, "profile_snapshot", None)
+                    candidate = getattr(session, "locked_candidate", None)
+                    scenario_id = getattr(profile, "scenario_id", None)
+                    profile_id = getattr(profile, "profile_id", None)
+                    if (
+                        type(session_id) is not str
+                        or not session_id
+                        or type(scenario_id) is not str
+                        or not scenario_id
+                        or type(profile_id) is not str
+                        or not profile_id
+                        or candidate is None
+                    ):
+                        continue
+                    with ui.card().classes(
+                        "lte-history-card lte-history-card--pending"
+                    ).mark(f"history-pending-{session_id}"):
+                        with ui.column().classes("lte-history-primary"):
+                            with ui.row().classes("lte-history-card-heading"):
+                                with ui.column().classes("lte-history-card-identity"):
+                                    ui.label(
+                                        f"{scenario_id} / {profile_id}"
+                                    ).classes("lte-card-title")
+                                    ui.label(
+                                        _translated(
+                                            translator,
+                                            "history.pending_candidate",
+                                            "Candidate grid {grid_id} · {count} stations",
+                                            grid_id=getattr(
+                                                candidate,
+                                                "flat_grid_id",
+                                                "?",
+                                            ),
+                                            count=getattr(candidate, "point_count", "?"),
+                                        )
+                                    ).classes("lte-history-time")
+                                render_status_badge(
+                                    ui,
+                                    translator,
+                                    PresentationSpec(
+                                        "history.pending_status",
+                                        "warning",
+                                    ),
+                                    marker=f"history-pending-status-{session_id}",
+                                )
+                            ui.label(
+                                _translated(
+                                    translator,
+                                    "history.pending_body",
+                                    (
+                                        "This selection is available in the current app "
+                                        "session. Publish artifacts to make it permanent."
+                                    ),
+                                )
+                            ).classes("lte-history-summary-item")
+                            actions: list[ActionSpec] = []
+                            if on_open_pending_figures is not None:
+                                actions.append(
+                                    ActionSpec(
+                                        "open",
+                                        _translated(
+                                            translator,
+                                            "action.open_figures",
+                                            "Open in Figures",
+                                        ),
+                                        lambda value=session_id: (
+                                            on_open_pending_figures(value)
+                                        ),
+                                        role="primary",
+                                        marker=f"history-pending-open-{session_id}",
+                                    )
+                                )
+                            if on_continue_pending is not None:
+                                actions.append(
+                                    ActionSpec(
+                                        "continue",
+                                        _translated(
+                                            translator,
+                                            "action.continue_generation",
+                                            "Continue generation",
+                                        ),
+                                        lambda value=session_id: (
+                                            on_continue_pending(value)
+                                        ),
+                                        marker=f"history-pending-continue-{session_id}",
+                                    )
+                                )
+                            if actions:
+                                render_action_bar(
+                                    ui,
+                                    actions,
+                                    marker=f"history-pending-actions-{session_id}",
+                                )
+
         if current_snapshot.diagnostics:
             ui.label(
                 _translated(
@@ -992,7 +1120,7 @@ def render_history_content(
                 marker="history-diagnostics-technical",
             )
 
-        if not current_snapshot.rows:
+        if not current_snapshot.rows and not pending:
             render_empty_state(
                 ui,
                 _translated(translator, "history.empty", "No published runs were found."),
@@ -1186,6 +1314,9 @@ def render_history_page(
         [Path, Path, str, Path, tuple[str, ...], FigureSpec | None], None
     ]
     | None = None,
+    pending_selections: Iterable[Any] = (),
+    on_open_pending_figures: Callable[[str], None] | None = None,
+    on_continue_pending: Callable[[str], None] | None = None,
 ) -> HistorySnapshot:
     """Synchronously rebuild and render History from live run manifests."""
 
@@ -1212,6 +1343,9 @@ def render_history_page(
         on_reveal=on_reveal,
         on_open_figures=on_open_figures,
         on_retry_missing=on_retry_missing,
+        pending_selections=pending_selections,
+        on_open_pending_figures=on_open_pending_figures,
+        on_continue_pending=on_continue_pending,
     )
     return current_snapshot
 
@@ -1225,6 +1359,7 @@ __all__ = [
     "HistoryRunReference",
     "HistorySnapshot",
     "ResolvedHistoryAction",
+    "figure_source_options",
     "history_roots",
     "history_rows",
     "rebuild_history",

@@ -410,6 +410,13 @@ def test_figure_models_are_immutable_and_presets_are_validated(tmp_path):
     assert publication.dpi == 300
     assert publication.max_pixels == 1800
     assert preview.dpi < publication.dpi
+    assert preview.resolved_title(3000, 30) is None
+    assert publication.resolved_title(3000, 30) is None
+    assert replace(publication, title="  ").resolved_title(3000, 30) is None
+    assert (
+        replace(publication, title="New York terrain").resolved_title(3000, 30)
+        == "New York terrain"
+    )
     with pytest.raises(ValueError, match="DPI"):
         replace(publication, dpi=0).validate()
     with pytest.raises(ValueError, match="preset"):

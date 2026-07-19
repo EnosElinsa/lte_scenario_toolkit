@@ -1,5 +1,6 @@
 import builtins
 from dataclasses import replace
+from pathlib import Path
 
 import geopandas as gpd
 import matplotlib
@@ -7,6 +8,7 @@ import numpy as np
 import plotly.graph_objects as go
 import pytest
 from matplotlib.figure import Figure as MatplotlibFigure
+from mpl_toolkits.mplot3d.axes3d import Axes3D
 from rasterio.io import MemoryFile
 from rasterio.transform import from_origin
 from shapely.geometry import Point, box
@@ -253,6 +255,293 @@ def test_render_3d_terrain_accepts_spec_without_pyplot_or_backend_change(
     assert eps_path.stat().st_size > 0
     assert not (tmp_path / "terrain.png").exists()
     assert matplotlib.get_backend() == backend
+
+
+def test_publication_surface_uses_explicit_dense_sampling_and_rasterizes_mesh(
+    tmp_path,
+    monkeypatch,
+):
+    captured = []
+    actual_plot_surface = Axes3D.plot_surface
+
+    def record_plot_surface(axis, *args, **kwargs):
+        captured.append(dict(kwargs))
+        return actual_plot_surface(axis, *args, **kwargs)
+
+    monkeypatch.setattr(Axes3D, "plot_surface", record_plot_surface)
+    rows, columns = 64, 72
+    x, y = np.meshgrid(np.arange(columns), np.arange(rows))
+    arrays = {
+        "x": x.astype(float),
+        "y": y.astype(float),
+        "z": (x + y).astype(float),
+        "point_x": np.array([10.0]),
+        "point_y": np.array([10.0]),
+        "point_z": np.array([20.0]),
+    }
+    selected = gpd.GeoDataFrame(
+        {"elevation": [20.0]}, geometry=[Point(10.0, 10.0)], crs="EPSG:3857"
+    )
+
+    render_3d_terrain(
+        {"left_x": 0.0, "bottom_y": 0.0, "pt_count": 1},
+        selected,
+        None,
+        FigureSpec.from_preset("publication"),
+        rectangle_size=3000,
+        target_crs="EPSG:3857",
+        png_path=tmp_path / "publication.png",
+        terrain_arrays=arrays,
+    )
+
+    assert len(captured) == 1
+    assert captured[0].get("rcount", 0) > 50
+    assert captured[0].get("ccount", 0) > 50
+    assert captured[0].get("rasterized") is True
+
+
+def test_publication_station_markers_render_above_the_terrain_surface(
+    tmp_path,
+    monkeypatch,
+):
+    captured = {}
+    actual_plot_surface = Axes3D.plot_surface
+    actual_scatter = Axes3D.scatter
+
+    def record_plot_surface(axis, *args, **kwargs):
+        artist = actual_plot_surface(axis, *args, **kwargs)
+        captured["axis"] = axis
+        captured["surface"] = artist
+        return artist
+
+    def record_scatter(axis, *args, **kwargs):
+        artist = actual_scatter(axis, *args, **kwargs)
+        captured["stations"] = artist
+        return artist
+
+    monkeypatch.setattr(Axes3D, "plot_surface", record_plot_surface)
+    monkeypatch.setattr(Axes3D, "scatter", record_scatter)
+    x, y = np.meshgrid(np.arange(8), np.arange(8))
+    arrays = {
+        "x": x.astype(float),
+        "y": y.astype(float),
+        "z": np.linspace(5.0, 55.0, 64).reshape(8, 8),
+        "point_x": np.array([2.0, 6.0]),
+        "point_y": np.array([2.0, 6.0]),
+        "point_z": np.array([20.0, 40.0]),
+    }
+    selected = gpd.GeoDataFrame(
+        {"elevation": [20.0, 40.0]},
+        geometry=[Point(2.0, 2.0), Point(6.0, 6.0)],
+        crs="EPSG:3857",
+    )
+
+    render_3d_terrain(
+        {"left_x": 0.0, "bottom_y": 0.0, "pt_count": 2},
+        selected,
+        None,
+        FigureSpec.from_preset("publication"),
+        rectangle_size=3000,
+        target_crs="EPSG:3857",
+        png_path=tmp_path / "publication.png",
+        terrain_arrays=arrays,
+    )
+
+    assert captured["axis"].computed_zorder is False
+    assert captured["stations"].get_zorder() > captured["surface"].get_zorder()
+
+
+def test_publication_static_layout_uses_paper_font_blank_title_and_readable_z_axis(
+    tmp_path,
+    monkeypatch,
+):
+    captured = {}
+
+    def inspect_figure(figure, output, *args, **kwargs):
+        axis = figure.axes[0]
+        captured["size"] = tuple(figure.get_size_inches())
+        captured["title"] = axis.get_title()
+        captured["font_families"] = (
+            axis.xaxis.label.get_fontfamily(),
+            axis.yaxis.label.get_fontfamily(),
+            axis.zaxis.label.get_fontfamily(),
+            *(label.get_fontfamily() for label in axis.get_xticklabels()),
+            *(label.get_fontfamily() for label in axis.get_yticklabels()),
+            *(label.get_fontfamily() for label in axis.get_zticklabels()),
+        )
+        aspect = axis.get_box_aspect()
+        captured["relative_z_aspect"] = float(aspect[2] / aspect[0])
+        captured["z_tick_labels_visible"] = tuple(
+            label.get_visible() for label in axis.get_zticklabels()
+        )
+        captured["colorbar_label"] = figure.axes[1].get_ylabel()
+        Path(output).write_bytes(b"rendered")
+
+    monkeypatch.setattr(MatplotlibFigure, "savefig", inspect_figure)
+    x, y = np.meshgrid(np.arange(8), np.arange(8))
+    arrays = {
+        "x": x.astype(float),
+        "y": y.astype(float),
+        "z": np.linspace(5.0, 55.0, 64).reshape(8, 8),
+        "point_x": np.array([2.0]),
+        "point_y": np.array([2.0]),
+        "point_z": np.array([20.0]),
+    }
+    selected = gpd.GeoDataFrame(
+        {"elevation": [20.0]}, geometry=[Point(2.0, 2.0)], crs="EPSG:3857"
+    )
+
+    render_3d_terrain(
+        {"left_x": 0.0, "bottom_y": 0.0, "pt_count": 1},
+        selected,
+        None,
+        FigureSpec.from_preset("publication"),
+        rectangle_size=3000,
+        target_crs="EPSG:3857",
+        png_path=tmp_path / "publication.png",
+        terrain_arrays=arrays,
+    )
+
+    assert captured["title"] == ""
+    assert captured["size"][0] <= 8.0
+    assert captured["relative_z_aspect"] == pytest.approx(50.0 / 3000.0)
+    assert not any(captured["z_tick_labels_visible"])
+    assert captured["colorbar_label"] == "Elevation (m)"
+    assert all(
+        "Times New Roman" in family for family in captured["font_families"]
+    )
+
+
+def test_publication_static_layout_discloses_non_unit_vertical_exaggeration(
+    tmp_path,
+    monkeypatch,
+):
+    captured = {}
+
+    def inspect_figure(figure, output, *args, **kwargs):
+        axis = figure.axes[0]
+        captured["notes"] = tuple(text.get_text() for text in axis.texts)
+        Path(output).write_bytes(b"rendered")
+
+    monkeypatch.setattr(MatplotlibFigure, "savefig", inspect_figure)
+    x, y = np.meshgrid(np.arange(8), np.arange(8))
+    arrays = {
+        "x": x.astype(float),
+        "y": y.astype(float),
+        "z": np.linspace(5.0, 55.0, 64).reshape(8, 8),
+        "point_x": np.array([2.0]),
+        "point_y": np.array([2.0]),
+        "point_z": np.array([20.0]),
+    }
+    selected = gpd.GeoDataFrame(
+        {"elevation": [20.0]}, geometry=[Point(2.0, 2.0)], crs="EPSG:3857"
+    )
+    spec = replace(
+        FigureSpec.from_preset("publication"),
+        vertical_exaggeration=4.0,
+    )
+
+    render_3d_terrain(
+        {"left_x": 0.0, "bottom_y": 0.0, "pt_count": 1},
+        selected,
+        None,
+        spec,
+        rectangle_size=3000,
+        target_crs="EPSG:3857",
+        png_path=tmp_path / "publication.png",
+        terrain_arrays=arrays,
+    )
+
+    assert "Vertical exaggeration: 4x" in captured["notes"]
+
+
+def test_html_uses_true_vertical_scale_colorbar_and_exaggeration_disclosure(
+    tmp_path,
+    monkeypatch,
+):
+    captured = {}
+
+    def inspect_html(figure, output, *args, **kwargs):
+        scene = figure.layout.scene
+        captured["relative_z_aspect"] = float(scene.aspectratio.z)
+        captured["z_tick_labels"] = scene.zaxis.showticklabels
+        captured["colorbar_label"] = figure.data[0].colorbar.title.text
+        captured["notes"] = tuple(
+            annotation.text for annotation in figure.layout.annotations
+        )
+        Path(output).write_text("rendered", encoding="utf-8")
+
+    monkeypatch.setattr(go.Figure, "write_html", inspect_html)
+    x, y = np.meshgrid(np.arange(8), np.arange(8))
+    arrays = {
+        "x": x.astype(float),
+        "y": y.astype(float),
+        "z": np.linspace(5.0, 55.0, 64).reshape(8, 8),
+        "point_x": np.array([2.0]),
+        "point_y": np.array([2.0]),
+        "point_z": np.array([20.0]),
+    }
+    selected = gpd.GeoDataFrame(
+        {"elevation": [20.0]}, geometry=[Point(2.0, 2.0)], crs="EPSG:3857"
+    )
+    spec = replace(
+        FigureSpec.from_preset("publication"),
+        vertical_exaggeration=4.0,
+    )
+
+    render_3d_terrain(
+        {"left_x": 0.0, "bottom_y": 0.0, "pt_count": 1},
+        selected,
+        None,
+        spec,
+        rectangle_size=3000,
+        target_crs="EPSG:3857",
+        html_path=tmp_path / "publication.html",
+        terrain_arrays=arrays,
+    )
+
+    assert captured["relative_z_aspect"] == pytest.approx(4.0 * 50.0 / 3000.0)
+    assert captured["z_tick_labels"] is False
+    assert captured["colorbar_label"] == "Elevation (m)"
+    assert "Vertical exaggeration: 4x" in captured["notes"]
+
+
+def test_publication_eps_does_not_emit_transparency_warning(
+    tmp_path,
+    caplog,
+    capsys,
+):
+    x, y = np.meshgrid(np.arange(8), np.arange(8))
+    arrays = {
+        "x": x.astype(float),
+        "y": y.astype(float),
+        "z": np.linspace(5.0, 55.0, 64).reshape(8, 8),
+        "point_x": np.array([2.0]),
+        "point_y": np.array([2.0]),
+        "point_z": np.array([20.0]),
+    }
+    selected = gpd.GeoDataFrame(
+        {"elevation": [20.0]},
+        geometry=[Point(2.0, 2.0)],
+        crs="EPSG:3857",
+    )
+
+    render_3d_terrain(
+        {"left_x": 0.0, "bottom_y": 0.0, "pt_count": 1},
+        selected,
+        None,
+        FigureSpec.from_preset("publication"),
+        rectangle_size=3000,
+        target_crs="EPSG:3857",
+        eps_path=tmp_path / "publication.eps",
+        terrain_arrays=arrays,
+    )
+
+    captured = capsys.readouterr()
+    messages = "\n".join(
+        (captured.out, captured.err, *(record.getMessage() for record in caplog.records))
+    )
+    assert "does not support transparency" not in messages
 
 
 def test_render_3d_terrain_closes_static_figure_when_save_fails(
