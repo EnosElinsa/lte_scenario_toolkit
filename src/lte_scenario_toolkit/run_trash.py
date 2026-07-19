@@ -50,6 +50,12 @@ class RunEdge:
     child: RunIdentity
     source: Literal["parent_run_id", "metadata.source"]
 
+    def __post_init__(self) -> None:
+        if self.source not in ("parent_run_id", "metadata.source"):
+            raise ValueError(
+                "run dependency edge source must be parent_run_id or metadata.source"
+            )
+
 
 class RunDependencyError(ValueError):
     code = "run.dependency_invalid"

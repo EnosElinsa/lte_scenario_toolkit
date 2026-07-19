@@ -12,6 +12,7 @@ from lte_scenario_toolkit.run_service import RunEntry, RunService
 from lte_scenario_toolkit.run_trash import (
     RunDependencyError,
     RunDependencyGraph,
+    RunEdge,
     RunIdentity,
     RunLeaseConflictError,
     RunUsageLeaseRegistry,
@@ -208,6 +209,23 @@ def test_cross_root_source_path_disambiguates_copied_run_id(tmp_path):
     assert graph.parent_of(RunIdentity.from_entry(child)) != RunIdentity.from_entry(
         duplicate
     )
+
+
+def test_graph_rejects_source_path_and_run_id_identifying_different_entries(
+    tmp_path,
+):
+    root = tmp_path / "results"
+    path_parent = publish_selection(root, run_id="a" * 32)
+    id_parent = publish_selection(root, run_id="d" * 32)
+    _publish_run(
+        root,
+        run_id="b" * 32,
+        run_kind="figure",
+        source={"path": str(path_parent.run_dir), "run_id": id_parent.run_id},
+    )
+
+    with pytest.raises(RunDependencyError, match="ambiguous"):
+        RunDependencyGraph.from_roots((root,))
 
 
 def test_graph_rejects_conflicting_resolved_provenance_parents(tmp_path):
@@ -416,6 +434,13 @@ def test_fingerprint_is_root_order_independent_and_includes_root_universe(tmp_pa
 
 def _identity(tmp_path: Path, name: str = "run") -> RunIdentity:
     return RunIdentity(tmp_path, "a" * 32, tmp_path / name)
+
+
+def test_run_edge_rejects_unknown_source(tmp_path):
+    identity = _identity(tmp_path)
+
+    with pytest.raises(ValueError, match="source"):
+        RunEdge(parent=identity, child=identity, source="bogus")
 
 
 def test_usage_registry_allows_multiple_read_leases_and_reports_owners(tmp_path):
