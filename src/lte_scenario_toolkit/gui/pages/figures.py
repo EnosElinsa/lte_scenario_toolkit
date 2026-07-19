@@ -11,6 +11,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Lock
 from typing import Any
+from uuid import uuid4
 
 from matplotlib import colormaps
 
@@ -23,6 +24,7 @@ from ...figure_service import (
 )
 from ...jobs import Job, JobBusyError, JobCoordinator
 from ...run_service import RunService
+from ...run_trash import RunIdentity, RunUsageLeaseRegistry
 from ..presentation import render_technical_details
 
 PREVIEW_CACHE_VERSION = "figure-preview-v3"
@@ -422,9 +424,27 @@ class FigureController:
         parent_run_id: str | None = None,
         parent_run_path: str | os.PathLike[str] | None = None,
         on_published: Callable[[Path], None] | None = None,
+        usage_leases: RunUsageLeaseRegistry | None = None,
+        run_roots: Callable[[], Iterable[Path]] | None = None,
+        lease_owner: str | None = None,
     ) -> None:
         self.repo_root = Path(repo_root).resolve(strict=False)
         self.coordinator = coordinator
+        if usage_leases is not None and not isinstance(
+            usage_leases,
+            RunUsageLeaseRegistry,
+        ):
+            raise ValueError("usage_leases must be a RunUsageLeaseRegistry")
+        if run_roots is not None and not callable(run_roots):
+            raise ValueError("run_roots must be callable")
+        if lease_owner is not None and (
+            type(lease_owner) is not str or not lease_owner.strip()
+        ):
+            raise ValueError("lease_owner must be non-empty text")
+        self.usage_leases = usage_leases
+        self.run_roots = run_roots
+        self.lease_owner = lease_owner or f"figures:{uuid4().hex}"
+        self._usage_lease_id: str | None = None
         self.output_root = (
             None
             if output_root is None
@@ -440,11 +460,20 @@ class FigureController:
         self._lock = Lock()
         initial_spec = FigureSpec.from_preset("preview") if spec is None else spec.validate()
         initial_state = (
-            FigurePageState() if source is None else FigurePageState.for_source(source)
+            FigurePageState(revision=-1)
+            if source is not None
+            else FigurePageState()
         )
         self._state = replace(initial_state, spec=initial_spec)
         self._job: Job | None = None
         self._closed = False
+        if source is not None:
+            self.set_source(
+                source,
+                output_root=output_root,
+                parent_run_id=parent_run_id,
+                parent_run_path=parent_run_path,
+            )
 
     @property
     def state(self) -> FigurePageState:
@@ -477,6 +506,110 @@ class FigureController:
             self._state = state
             return state
 
+    def _configured_run_roots(self) -> tuple[Path, ...]:
+        if self.run_roots is None:
+            raise ValueError(
+                "figure run roots are unavailable; reopen the source from History"
+            )
+        try:
+            supplied = tuple(self.run_roots())
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "figure run roots are unavailable; reopen the source from History"
+            ) from exc
+        canonical: dict[str, Path] = {}
+        for value in supplied:
+            try:
+                root = RunService(value).output_root
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "figure run roots are unavailable; reopen the source from History"
+                ) from exc
+            canonical.setdefault(os.path.normcase(str(root)), root)
+        return tuple(canonical[key] for key in sorted(canonical))
+
+    def _source_usage_identities(
+        self,
+        source: FigureSource,
+        *,
+        output_root: Path | None,
+        parent_run_id: str | None,
+        parent_run_path: Path | None,
+    ) -> tuple[RunIdentity, ...]:
+        if self.usage_leases is None:
+            return ()
+        roots = self._configured_run_roots()
+        identities: list[RunIdentity] = []
+        if source.source_kind == "run":
+            if source.path is None or source.run_id is None:
+                raise ValueError(
+                    "figure source is no longer available; reopen it from History"
+                )
+            matches = []
+            for root in roots:
+                try:
+                    entry = RunService(root).entry_for_path(
+                        source.path,
+                        run_id=source.run_id,
+                    )
+                except (OSError, RuntimeError, ValueError):
+                    continue
+                matches.append(entry)
+            if len(matches) != 1:
+                raise ValueError(
+                    "figure source is no longer uniquely available; "
+                    "reopen it from History"
+                )
+            identities.append(RunIdentity.from_entry(matches[0]))
+
+        if parent_run_path is not None and parent_run_id is None:
+            raise ValueError("figure parent path requires a parent run id")
+        if parent_run_id is not None:
+            if output_root is None or parent_run_path is None:
+                raise ValueError(
+                    "figure parent run is no longer available; reopen from History"
+                )
+            parent_root = RunService(output_root).output_root
+            if parent_root not in roots:
+                raise ValueError(
+                    "figure parent run root is no longer configured; reopen from History"
+                )
+            try:
+                parent_entry = RunService(parent_root).entry_for_path(
+                    parent_run_path,
+                    run_id=parent_run_id,
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise ValueError(
+                    "figure parent run is no longer available; reopen from History"
+                ) from exc
+            identities.append(RunIdentity.from_entry(parent_entry))
+
+        return tuple(dict.fromkeys(identities))
+
+    def _replace_usage_lease(self, identities: tuple[RunIdentity, ...]) -> None:
+        old = self._usage_lease_id
+        new = None
+        if self.usage_leases is not None and identities:
+            new = self.usage_leases.acquire(identities, self.lease_owner)
+        self._usage_lease_id = new
+        if old is not None and self.usage_leases is not None:
+            self.usage_leases.release(old)
+
+    def _discard_source_locked(self, error: str | None = None) -> FigurePageState:
+        self._replace_usage_lease(())
+        self.output_root = None
+        self.parent_run_id = None
+        self.parent_run_path = None
+        self._state = FigurePageState(
+            spec=self._state.spec,
+            revision=self._state.revision + 1,
+            phase="error" if error is not None else "empty",
+            source_dirty=error is not None,
+            source_error=error,
+        )
+        return self._state
+
     def set_source(
         self,
         source: FigureSource,
@@ -487,22 +620,46 @@ class FigureController:
     ) -> FigurePageState:
         if not isinstance(source, FigureSource):
             raise ValueError("source must be a FigureSource")
+        next_output_root = (
+            None
+            if output_root is None
+            else Path(output_root).expanduser().resolve(strict=False)
+        )
+        next_parent_path = (
+            None
+            if parent_run_path is None
+            else Path(parent_run_path).expanduser().resolve(strict=False)
+        )
         with self._lock:
             if self._closed:
                 raise RuntimeError("figure controller is closed")
             if self._job_unfinished_locked():
                 raise RuntimeError("figure source cannot change while a job is running")
-            self.output_root = (
-                None
-                if output_root is None
-                else Path(output_root).expanduser().resolve(strict=False)
+        try:
+            identities = self._source_usage_identities(
+                source,
+                output_root=next_output_root,
+                parent_run_id=parent_run_id,
+                parent_run_path=next_parent_path,
             )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            with self._lock:
+                if not self._closed and not self._job_unfinished_locked():
+                    self._discard_source_locked(str(exc))
+            raise
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("figure controller is closed")
+            if self._job_unfinished_locked():
+                raise RuntimeError("figure source cannot change while a job is running")
+            try:
+                self._replace_usage_lease(identities)
+            except (RuntimeError, ValueError) as exc:
+                self._discard_source_locked(str(exc))
+                raise
+            self.output_root = next_output_root
             self.parent_run_id = parent_run_id
-            self.parent_run_path = (
-                None
-                if parent_run_path is None
-                else Path(parent_run_path).resolve(strict=False)
-            )
+            self.parent_run_path = next_parent_path
             self._state = self._state.with_source(source)
             return self._state
 
@@ -521,14 +678,7 @@ class FigureController:
                 raise RuntimeError("figure controller is closed")
             if self._job_unfinished_locked():
                 raise RuntimeError("figure source cannot change while a job is running")
-            self.output_root = None
-            self.parent_run_id = None
-            self.parent_run_path = None
-            self._state = FigurePageState(
-                spec=self._state.spec,
-                revision=self._state.revision + 1,
-            )
-            return self._state
+            return self._discard_source_locked()
 
     def invalidate_source(self, error: str | None = None) -> FigurePageState:
         """Atomically discard every value derived from an unconfirmed source."""
@@ -540,17 +690,11 @@ class FigureController:
                 raise RuntimeError("figure controller is closed")
             if self._job_unfinished_locked():
                 raise RuntimeError("figure source cannot change while a job is running")
-            self.output_root = None
-            self.parent_run_id = None
-            self.parent_run_path = None
-            self._state = FigurePageState(
-                spec=self._state.spec,
-                revision=self._state.revision + 1,
-                phase="error" if error is not None else "empty",
-                source_dirty=True,
-                source_error=error,
-            )
-            return self._state
+            state = self._discard_source_locked(error)
+            if error is None:
+                state = replace(state, source_dirty=True)
+                self._state = state
+            return state
 
     def _submit(
         self,
@@ -881,6 +1025,7 @@ class FigureController:
     def close(self) -> None:
         with self._lock:
             self._closed = True
+            self._replace_usage_lease(())
             reserved = (
                 self._job
                 if self._job is not None and self._job.future is None
@@ -930,6 +1075,9 @@ def render_figures_page(
     initial_spec: FigureSpec | None = None,
     parent_run_id: str | None = None,
     parent_run_path: str | os.PathLike[str] | None = None,
+    usage_leases: RunUsageLeaseRegistry | None = None,
+    run_roots: Callable[[], Iterable[Path]] | None = None,
+    lease_owner: str | None = None,
 ) -> FigurePageView:
     """Render an offline form whose expensive actions are always explicit."""
 
@@ -941,6 +1089,9 @@ def render_figures_page(
         parent_run_id=parent_run_id,
         parent_run_path=parent_run_path,
         on_published=on_published,
+        usage_leases=usage_leases,
+        run_roots=run_roots,
+        lease_owner=lease_owner,
     )
     page_client = ui.context.client
     route_output_root = controller.output_root

@@ -438,6 +438,48 @@ def test_presentation_mappings_fail_safe_for_unknown_values():
         assert mapping(None) == unknown
 
 
+def test_trash_job_kinds_use_localizable_shared_job_gate():
+    from lte_scenario_toolkit.jobs import JobBusyError, JobCoordinator
+
+    module = _gui_module("presentation")
+    spec = module.PresentationSpec
+    assert {
+        value: module.job_kind_presentation(value)
+        for value in (
+            "history.trash_move",
+            "history.trash_restore",
+            "history.trash_purge",
+        )
+    } == {
+        "history.trash_move": spec("job.kind.history_trash_move", "active"),
+        "history.trash_restore": spec(
+            "job.kind.history_trash_restore",
+            "active",
+        ),
+        "history.trash_purge": spec("job.kind.history_trash_purge", "active"),
+    }
+
+    coordinator = JobCoordinator()
+    blocker = coordinator.start("figure-preview")
+    try:
+        with pytest.raises(JobBusyError):
+            coordinator.start("history.trash_move")
+    finally:
+        assert coordinator.finish(blocker.job_id) is True
+
+    for fails in (False, True):
+        job = coordinator.start("history.trash_restore")
+        try:
+            if fails:
+                raise RuntimeError("simulated callback failure")
+        except RuntimeError:
+            pass
+        finally:
+            assert coordinator.finish(job.job_id) is True
+        assert coordinator.snapshot().active is False
+    coordinator.shutdown()
+
+
 def test_presentation_translation_keys_are_complete_and_localized():
     i18n = _gui_module("i18n")
     presentation = _gui_module("presentation")

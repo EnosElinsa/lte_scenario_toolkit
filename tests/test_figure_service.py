@@ -211,6 +211,206 @@ def write_in_memory_selection_source(tmp_path: Path):
     )
 
 
+def make_run_backed_figure_source(
+    tmp_path: Path,
+    *,
+    root_name: str,
+) -> tuple[object, FigureSource]:
+    """Publish one real run and attach its identity to a validated source."""
+
+    service = RunService(tmp_path / root_name)
+    run = service.begin("city", "default")
+    (run.path / "source.csv").write_text("X,Y\n1,2\n", encoding="utf-8")
+    run_path = service.publish(
+        run,
+        status="completed",
+        artifacts=["source.csv"],
+        metadata={"run_kind": "selection"},
+    )
+    entry = service.entry_for_path(run_path, run_id=run.run_id)
+    source = replace(
+        write_in_memory_selection_source(tmp_path),
+        path=run_path,
+        source_kind="run",
+        run_id=run.run_id,
+        selection_identity=None,
+    )
+    return entry, source
+
+
+def test_figure_controller_releases_run_lease_on_source_invalidation(tmp_path):
+    from lte_scenario_toolkit.gui.pages.figures import FigureController
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.run_trash import (
+        RunIdentity,
+        RunUsageLeaseRegistry,
+    )
+
+    entry, source = make_run_backed_figure_source(tmp_path, root_name="source-runs")
+    leases = RunUsageLeaseRegistry()
+    coordinator = JobCoordinator()
+    controller = FigureController(
+        tmp_path,
+        coordinator,
+        usage_leases=leases,
+        run_roots=lambda: (entry.root,),
+        lease_owner="figures:invalidate",
+    )
+    identity = RunIdentity.from_entry(entry)
+    try:
+        controller.set_source(source)
+        assert leases.conflicts((identity,)) == ("figures:invalidate",)
+
+        controller.invalidate_source()
+
+        assert leases.conflicts((identity,)) == ()
+    finally:
+        controller.close()
+        coordinator.shutdown()
+
+
+def test_figure_controller_replaces_run_source_lease_atomically(tmp_path):
+    from lte_scenario_toolkit.gui.pages.figures import FigureController
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.run_trash import (
+        RunIdentity,
+        RunUsageLeaseRegistry,
+    )
+
+    entry_a, source_a = make_run_backed_figure_source(tmp_path, root_name="runs-a")
+    entry_b, source_b = make_run_backed_figure_source(tmp_path, root_name="runs-b")
+    leases = RunUsageLeaseRegistry()
+    coordinator = JobCoordinator()
+    controller = FigureController(
+        tmp_path,
+        coordinator,
+        usage_leases=leases,
+        run_roots=lambda: (entry_a.root, entry_b.root),
+        lease_owner="figures:replace",
+    )
+    identity_a = RunIdentity.from_entry(entry_a)
+    identity_b = RunIdentity.from_entry(entry_b)
+    try:
+        controller.set_source(source_a)
+        assert leases.conflicts((identity_a,)) == ("figures:replace",)
+
+        controller.set_source(source_b)
+
+        assert leases.conflicts((identity_a,)) == ()
+        assert leases.conflicts((identity_b,)) == ("figures:replace",)
+    finally:
+        controller.close()
+        coordinator.shutdown()
+
+
+def test_figure_controller_leases_cross_root_source_and_explicit_parent(tmp_path):
+    from lte_scenario_toolkit.gui.pages.figures import FigureController
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.run_trash import (
+        RunIdentity,
+        RunUsageLeaseRegistry,
+    )
+
+    source_entry, source = make_run_backed_figure_source(
+        tmp_path,
+        root_name="source-runs",
+    )
+    parent_entry, _unused = make_run_backed_figure_source(
+        tmp_path,
+        root_name="parent-runs",
+    )
+    leases = RunUsageLeaseRegistry()
+    coordinator = JobCoordinator()
+    controller = FigureController(
+        tmp_path,
+        coordinator,
+        usage_leases=leases,
+        run_roots=lambda: (
+            source_entry.root,
+            Path(str(source_entry.root)),
+            parent_entry.root,
+        ),
+        lease_owner="figures:cross-root",
+    )
+    source_identity = RunIdentity.from_entry(source_entry)
+    parent_identity = RunIdentity.from_entry(parent_entry)
+    try:
+        controller.set_source(
+            source,
+            output_root=parent_entry.root,
+            parent_run_id=parent_entry.run_id,
+            parent_run_path=parent_entry.run_dir,
+        )
+
+        assert leases.conflicts((source_identity,)) == ("figures:cross-root",)
+        assert leases.conflicts((parent_identity,)) == ("figures:cross-root",)
+    finally:
+        controller.close()
+        controller.close()
+        coordinator.shutdown()
+    assert leases.conflicts((source_identity, parent_identity)) == ()
+
+
+@pytest.mark.parametrize("failure_kind", ["resolution", "lease"])
+def test_figure_controller_failed_lease_replacement_is_fail_closed(
+    tmp_path,
+    failure_kind,
+):
+    from lte_scenario_toolkit.gui.pages.figures import FigureController
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.run_trash import (
+        RunIdentity,
+        RunLeaseConflictError,
+        RunUsageLeaseRegistry,
+    )
+
+    entry_a, source_a = make_run_backed_figure_source(tmp_path, root_name="runs-a")
+    entry_b, source_b = make_run_backed_figure_source(tmp_path, root_name="runs-b")
+    leases = RunUsageLeaseRegistry()
+    identity_b = RunIdentity.from_entry(entry_b)
+    mutation = (
+        leases.reserve_mutation((identity_b,))
+        if failure_kind == "lease"
+        else None
+    )
+    coordinator = JobCoordinator()
+    controller = FigureController(
+        tmp_path,
+        coordinator,
+        source=source_a,
+        usage_leases=leases,
+        run_roots=lambda: (entry_a.root, entry_b.root),
+        lease_owner="figures:fail-closed",
+    )
+    identity_a = RunIdentity.from_entry(entry_a)
+    try:
+        assert controller.state.source is source_a
+        assert controller.state.revision == 0
+        assert leases.conflicts((identity_a,)) == ("figures:fail-closed",)
+        replacement = (
+            replace(source_b, path=source_b.path / "missing")
+            if failure_kind == "resolution"
+            else source_b
+        )
+        expected_error = (
+            ValueError
+            if failure_kind == "resolution"
+            else RunLeaseConflictError
+        )
+        with pytest.raises(expected_error):
+            controller.set_source(replacement)
+
+        assert controller.state.source is None
+        assert controller.state.source_dirty is True
+        assert leases.conflicts((identity_a,)) == ()
+        assert leases.conflicts((identity_b,)) == ()
+    finally:
+        if mutation is not None:
+            leases.release_mutation(mutation)
+        controller.close()
+        coordinator.shutdown()
+
+
 
 
 def test_run_snapshot_is_authoritative_crs_and_rectangle_size(tmp_path):

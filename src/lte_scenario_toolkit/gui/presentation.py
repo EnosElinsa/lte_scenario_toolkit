@@ -124,6 +124,18 @@ _JOB_KINDS: Final = {
     "figure-source": PresentationSpec("job.kind.figure_source", "active"),
     "figure-preview": PresentationSpec("job.kind.figure_preview", "active"),
     "figure-export": PresentationSpec("job.kind.figure_export", "active"),
+    "history.trash_move": PresentationSpec(
+        "job.kind.history_trash_move",
+        "active",
+    ),
+    "history.trash_restore": PresentationSpec(
+        "job.kind.history_trash_restore",
+        "active",
+    ),
+    "history.trash_purge": PresentationSpec(
+        "job.kind.history_trash_purge",
+        "active",
+    ),
 }
 
 
