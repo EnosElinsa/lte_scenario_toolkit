@@ -527,6 +527,55 @@ def test_figure_controller_source_result_acquires_run_lease(tmp_path):
         coordinator.shutdown()
 
 
+def test_figure_controller_failed_source_result_clears_source_and_lease(tmp_path):
+    from lte_scenario_toolkit.gui.pages.figures import (
+        FigureController,
+        _FigureJobResult,
+    )
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.run_trash import (
+        RunIdentity,
+        RunUsageLeaseRegistry,
+    )
+
+    entry, source = make_run_backed_figure_source(tmp_path, root_name="runs-a")
+    leases = RunUsageLeaseRegistry()
+    coordinator = JobCoordinator()
+    controller = FigureController(
+        tmp_path,
+        coordinator,
+        source=source,
+        usage_leases=leases,
+        run_roots=lambda: (entry.root,),
+        lease_owner="figures:failed-source",
+    )
+    job = coordinator.start("figure-source")
+    controller._job = job
+    result = _FigureJobResult(
+        "source",
+        controller.state.revision,
+        phase="error",
+        errors=({"code": "figure.source.failed"},),
+        message="source load failed",
+    )
+    identity = RunIdentity.from_entry(entry)
+    try:
+        state = controller._apply_result(job, result)
+
+        assert state.source is None
+        assert state.source_dirty is True
+        assert state.source_error == "source load failed"
+        assert controller.output_root is None
+        assert controller.parent_run_id is None
+        assert controller.parent_run_path is None
+        assert leases.conflicts((identity,)) == ()
+        with pytest.raises(ValueError, match="source"):
+            controller._export_request(("png",))
+    finally:
+        controller.close()
+        coordinator.shutdown()
+
+
 
 
 def test_run_snapshot_is_authoritative_crs_and_rectangle_size(tmp_path):

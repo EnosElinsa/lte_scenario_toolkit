@@ -1001,9 +1001,11 @@ class FigureController:
                 if result.revision != state.revision:
                     updated = state
                 elif result.phase == "error" or result.source is None:
-                    self._replace_usage_lease(())
+                    failed = self._discard_source_locked(
+                        result.message or "Figure source loading failed"
+                    )
                     updated = replace(
-                        state,
+                        failed,
                         phase="error",
                         warnings=result.warnings,
                         errors=result.errors,
