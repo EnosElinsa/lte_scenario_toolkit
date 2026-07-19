@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from unittest.mock import patch
 from uuid import UUID
@@ -268,6 +269,22 @@ def test_pre_existing_orphan_source_allows_its_own_discovered_family(tmp_path):
     )
 
 
+def test_family_fails_closed_when_discovery_diagnostic_may_hide_dependent(tmp_path):
+    root = tmp_path / "results"
+    parent = publish_selection(root, run_id="a" * 32)
+    child = publish_figure(root, run_id="b" * 32, parent=parent)
+    (child.run_dir / "figure.png").unlink()
+
+    graph = RunDependencyGraph.from_roots((root,))
+
+    assert any(
+        Path(item["path"]) == child.run_dir / "run.json"
+        for item in graph.diagnostics
+    )
+    with pytest.raises(RunDependencyError, match="discovery diagnostic"):
+        graph.family(RunIdentity.from_entry(parent))
+
+
 @pytest.mark.parametrize("matching_component", ["path", "run_id"])
 def test_unresolved_source_component_blocks_referenced_parent_family(
     tmp_path,
@@ -291,6 +308,35 @@ def test_unresolved_source_component_blocks_referenced_parent_family(
         graph.family(RunIdentity.from_entry(parent))
     assert graph.family(RunIdentity.from_entry(orphan)) == frozenset(
         {RunIdentity.from_entry(orphan)}
+    )
+
+
+def test_source_path_runtime_error_is_retained_as_unresolved_diagnostic(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "results"
+    source_path = tmp_path / "symlink-loop"
+    child = _publish_run(
+        root,
+        run_id="b" * 32,
+        run_kind="figure",
+        source={"path": str(source_path), "run_id": "d" * 32},
+    )
+    original_resolve = Path.resolve
+
+    def resolve(candidate, strict=False):
+        if candidate == source_path:
+            raise RuntimeError("symlink loop")
+        return original_resolve(candidate, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+
+    graph = RunDependencyGraph.from_roots((root,))
+
+    assert any(item.get("source") == "metadata.source" for item in graph.diagnostics)
+    assert graph.family(RunIdentity.from_entry(child)) == frozenset(
+        {RunIdentity.from_entry(child)}
     )
 
 
@@ -430,6 +476,29 @@ def test_fingerprint_is_root_order_independent_and_includes_root_universe(tmp_pa
 
     assert first == second
     assert expanded != first
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path equivalence is required")
+def test_windows_equivalent_missing_roots_have_stable_universe_and_fingerprint(
+    tmp_path,
+):
+    live_root = tmp_path / "results"
+    parent = publish_selection(live_root, run_id="a" * 32)
+    upper_missing = tmp_path / "MISSING"
+    lower_missing = tmp_path / "missing"
+    first_graph = RunDependencyGraph.from_roots(
+        (live_root, upper_missing, lower_missing)
+    )
+    second_graph = RunDependencyGraph.from_roots(
+        (lower_missing, upper_missing, live_root)
+    )
+    selected = RunIdentity.from_entry(parent)
+
+    assert tuple(map(str, first_graph.roots)) == tuple(map(str, second_graph.roots))
+    assert first_graph.fingerprint(
+        selected,
+        first_graph.family(selected),
+    ) == second_graph.fingerprint(selected, second_graph.family(selected))
 
 
 def _identity(tmp_path: Path, name: str = "run") -> RunIdentity:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -82,15 +83,15 @@ class _UnresolvedProvenance:
         )
 
 
-def _path_key(path: Path) -> str:
-    return path.as_posix()
+def _canonical_path_key(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(os.path.normpath(path)))
 
 
 def _identity_key(identity: RunIdentity) -> tuple[str, str, str]:
     return (
-        _path_key(identity.root),
+        _canonical_path_key(identity.root),
         identity.run_id,
-        _path_key(identity.expected_path),
+        _canonical_path_key(identity.expected_path),
     )
 
 
@@ -115,7 +116,7 @@ def _normalise_source_path(value: object) -> Path | None:
         return None
     try:
         return Path(value).expanduser().resolve(strict=False)
-    except (OSError, ValueError):
+    except (OSError, RuntimeError, ValueError):
         return None
 
 
@@ -139,21 +140,22 @@ class RunDependencyGraph:
 
     @classmethod
     def from_roots(cls, roots: Iterable[str | Path]) -> RunDependencyGraph:
-        services: dict[Path, RunService] = {}
+        services: dict[str, RunService] = {}
         for value in roots:
             service = RunService(value)
-            services.setdefault(service.output_root, service)
-        canonical_roots = tuple(sorted(services, key=_path_key))
+            services.setdefault(_canonical_path_key(service.output_root), service)
+        root_keys = tuple(sorted(services))
+        canonical_roots = tuple(Path(key) for key in root_keys)
 
         entries: dict[RunIdentity, RunEntry] = {}
         discovery_diagnostics: list[dict[str, Any]] = []
-        for root in canonical_roots:
-            discovered = services[root].discover_entries()
+        for root_key in root_keys:
+            discovered = services[root_key].discover_entries()
             entries.update(
                 (RunIdentity.from_entry(entry), entry) for entry in discovered.entries
             )
             discovery_diagnostics.extend(
-                {"root": str(root), **dict(item)} for item in discovered.diagnostics
+                {"root": root_key, **dict(item)} for item in discovered.diagnostics
             )
 
         by_root_id: dict[tuple[Path, str], list[RunIdentity]] = {}
@@ -262,7 +264,11 @@ class RunDependencyGraph:
                 _identity_key(item.child),
                 item.source,
                 item.run_id or "",
-                "" if item.expected_path is None else _path_key(item.expected_path),
+                (
+                    ""
+                    if item.expected_path is None
+                    else _canonical_path_key(item.expected_path)
+                ),
             )
         )
         discovery_diagnostics.sort(
@@ -349,6 +355,10 @@ class RunDependencyGraph:
         return next(iter(values), None)
 
     def family(self, selected: RunIdentity) -> frozenset[RunIdentity]:
+        if self._discovery_diagnostics:
+            raise RunDependencyError(
+                "run family cannot be evaluated while discovery diagnostics exist"
+            )
         pending = [selected]
         found: set[RunIdentity] = set()
         while pending:
@@ -406,7 +416,7 @@ class RunDependencyGraph:
                 }
                 for identity in family_identities
             ],
-            "roots": [str(root) for root in self._roots],
+            "roots": [_canonical_path_key(root) for root in self._roots],
         }
         document = json.dumps(
             payload,
