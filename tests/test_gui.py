@@ -5418,6 +5418,91 @@ def test_permanent_delete_requires_exact_transaction_prefix():
     assert permanent_delete_matches(card, "abcdef0") is False
 
 
+def test_opaque_callback_body_type_error_is_not_retried():
+    from lte_scenario_toolkit.gui.pages.history import _invoke_opaque
+
+    calls = []
+
+    def callback(value):
+        calls.append(value)
+        raise TypeError("callback body failure")
+
+    with pytest.raises(TypeError, match="callback body failure"):
+        _invoke_opaque(callback, "opaque-plan")
+
+    assert calls == ["opaque-plan"]
+
+
+def test_move_to_trash_history_action_fails_closed_before_path_resolution(tmp_path):
+    from lte_scenario_toolkit.gui.pages.history import (
+        HistoryAction,
+        HistoryActionError,
+        resolve_history_action,
+    )
+
+    _root, _service, _parent, _child, rows = _task6_history_family(tmp_path)
+    row = rows[0]
+
+    with pytest.raises(HistoryActionError, match="TrashPlan|trash plan|build"):
+        resolve_history_action(row, HistoryAction.MOVE_TO_TRASH)
+
+
+def test_trash_cards_disable_conflicting_mutations_for_unsafe_blockers():
+    from types import SimpleNamespace
+
+    from lte_scenario_toolkit.gui.pages.history import (
+        TrashAction,
+        TrashSnapshot,
+        build_trash_cards,
+    )
+    from lte_scenario_toolkit.run_trash import TrashState
+
+    member = SimpleNamespace(
+        scenario_id="city",
+        profile_id="default",
+        artifact_count=1,
+        identity=SimpleNamespace(root=Path("C:/results"), run_id="a" * 32),
+        original_relative_path=Path("city/default/run"),
+    )
+
+    def transaction(state):
+        return SimpleNamespace(
+            transaction_id="b" * 32,
+            state=state,
+            deleted_at="2026-07-16T10:00:00Z",
+            members=(member,),
+            roots=(Path("C:/results"),),
+            total_size_bytes=10,
+            completed_move_ids=(member.identity.run_id,),
+            errors=(),
+        )
+
+    trashed = TrashSnapshot((transaction(TrashState.TRASHED),), ())
+    blocked = build_trash_cards(
+        trashed,
+        restore_blockers={
+            "b" * 32: ("trash.restore.root_unavailable",),
+        },
+    )[0]
+    occupied = build_trash_cards(
+        trashed,
+        restore_blockers={
+            "b" * 32: ("trash.restore.destination_occupied",),
+        },
+    )[0]
+    failed = TrashSnapshot((transaction(TrashState.PURGE_FAILED),), ())
+    retry = build_trash_cards(
+        failed,
+        restore_blockers={
+            "b" * 32: ("trash.restore.journal_invalid",),
+        },
+    )[0]
+
+    assert blocked.enabled_actions == ()
+    assert occupied.enabled_actions == (TrashAction.PURGE,)
+    assert retry.enabled_actions == (TrashAction.PURGE,)
+
+
 def test_trash_card_renders_state_actions_and_restore_blocker(tmp_path):
     from lte_scenario_toolkit.gui.i18n import Translator
     from lte_scenario_toolkit.gui.pages.history import (

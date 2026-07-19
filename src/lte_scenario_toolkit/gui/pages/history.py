@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 from collections.abc import Callable, Iterable, Mapping
@@ -358,12 +359,32 @@ def build_trash_cards(
         potential = trash_card_actions(state)
         blockers = tuple(blocker_map.get(transaction.transaction_id, ()))
         has_lease = "trash.restore.lease_conflict" in blockers
-        enabled = tuple(
-            action
-            for action in potential
-            if not (action is TrashAction.RESTORE and blockers)
-            and not (has_lease and action in potential)
+        unsafe_storage = bool(
+            {
+                "trash.restore.root_unavailable",
+                "trash.restore.journal_invalid",
+            }.intersection(blockers)
         )
+        only_destination_collision = bool(blockers) and set(blockers) <= {
+            "trash.restore.destination_occupied"
+        }
+        if state is TrashState.TRASHED:
+            if has_lease or unsafe_storage:
+                enabled = ()
+            elif only_destination_collision:
+                enabled = (TrashAction.PURGE,)
+            else:
+                enabled = potential
+        elif state is TrashState.PURGE_FAILED:
+            # A failed purge remains retryable even when a surviving root or
+            # journal needs attention; a live Figures lease still gates the
+            # mutation reservation.
+            enabled = () if has_lease else (TrashAction.PURGE,)
+        elif state is TrashState.RECOVERY_REQUIRED:
+            recovery_blocked = has_lease or unsafe_storage
+            enabled = () if recovery_blocked else potential
+        else:
+            enabled = ()
         profiles = tuple(
             dict.fromkeys(
                 f"{member.scenario_id} / {member.profile_id}"
@@ -1128,6 +1149,10 @@ def resolve_history_action(
         raise HistoryActionError(f"Unsupported history action: {action!r}") from exc
     if selected is HistoryAction.REFRESH:
         raise HistoryActionError("Refresh is a page action and has no run target")
+    if selected is HistoryAction.MOVE_TO_TRASH:
+        raise HistoryActionError(
+            "Move to Trash requires a fresh HistoryTrashPlan; use build_history_trash_plan"
+        )
     clicked_path, clicked_record = resolve_history_reference(row.reference)
     metadata_value = clicked_record.get("metadata", {})
     metadata = metadata_value if isinstance(metadata_value, Mapping) else {}
@@ -1221,9 +1246,17 @@ def _invoke_opaque(callback: Callable[..., Any], value: object) -> Any:
     """Call a UI callback with its opaque model, supporting legacy no-arg fakes."""
 
     try:
+        parameters = inspect.signature(callback)
+    except (TypeError, ValueError):
+        # Some extension/builtin callables have no inspectable signature. Call
+        # them exactly once; a callback-body TypeError must never be retried.
         return callback(value)
+    try:
+        parameters.bind(value)
     except TypeError:
+        parameters.bind()
         return callback()
+    return callback(value)
 
 
 def render_move_to_trash_dialog(
