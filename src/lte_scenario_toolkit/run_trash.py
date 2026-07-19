@@ -101,6 +101,10 @@ class TrashTransactionError(RuntimeError):
     code = "trash.transaction_failed"
 
 
+class _TrashRootUnavailableError(TrashTransactionError):
+    code = "trash.root_unavailable"
+
+
 class TrashPlanStaleError(TrashTransactionError):
     code = "trash.plan_stale"
 
@@ -1079,7 +1083,7 @@ def _deserialise_portion(
     ):
         raise ValueError("trash journal expected roots are invalid or unordered")
     if any(item not in roots_by_digest for item in expected_roots):
-        raise ValueError("trash journal expects an unconfigured root")
+        raise _TrashRootUnavailableError("trash journal expects an unconfigured root")
     if _root_digest(root) not in expected_roots:
         raise ValueError("trash journal is stored below an unexpected root")
 
@@ -1290,6 +1294,12 @@ def _reconcile_mutable_portions(
         state = TrashState.MOVING
     elif states == {TrashState.RESTORING, TrashState.TRASHED}:
         state = TrashState.RESTORING
+    elif TrashState.PURGE_FAILED in states and states.issubset(
+        {TrashState.TRASHED, TrashState.PURGING, TrashState.PURGE_FAILED}
+    ):
+        state = TrashState.PURGE_FAILED
+    elif states == {TrashState.TRASHED, TrashState.PURGING}:
+        state = TrashState.PURGING
     else:
         raise ValueError("trash transaction states diverge across portions")
     errors = tuple(sorted({error for portion in portions for error in portion.errors}))
@@ -1795,6 +1805,8 @@ class TrashManager:
                         roots_by_digest=roots_by_digest,
                     )
                 )
+            except _TrashRootUnavailableError:
+                raise
             except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise TrashTransactionError("trash recovery journal is non-actionable") from exc
         return roots, tuple(portions)
@@ -1943,7 +1955,7 @@ class TrashManager:
         ):
             raise ValueError("trash transaction portions disagree")
         roots_by_digest = {_root_digest(root): root for root in roots}
-        if set(first.expected_root_digests) != set(roots_by_digest):
+        if not set(first.expected_root_digests).issubset(roots_by_digest):
             raise ValueError("trash transaction expected roots are unavailable")
         present_by_digest = {_root_digest(portion.root): portion for portion in portions}
         if len(present_by_digest) != len(portions):
@@ -1952,13 +1964,17 @@ class TrashManager:
             raise ValueError("trash transaction is not a partial purge")
         expected_roots = tuple(roots_by_digest[digest] for digest in first.expected_root_digests)
         for root in expected_roots:
-            if (
-                not os.path.lexists(root)
-                or _is_redirected_path(root)
-                or not root.is_dir()
-                or root.resolve(strict=True) != root
-            ):
-                raise ValueError("trash transaction expected root is unavailable")
+            try:
+                available = (
+                    os.path.lexists(root)
+                    and not _is_redirected_path(root)
+                    and root.is_dir()
+                    and root.resolve(strict=True) == root
+                )
+            except (OSError, RuntimeError, ValueError):
+                available = False
+            if not available:
+                raise _TrashRootUnavailableError("trash transaction expected root is unavailable")
         if any(
             portion.state not in {TrashState.PURGING, TrashState.PURGE_FAILED}
             for portion in portions
@@ -2006,6 +2022,8 @@ class TrashManager:
         except (OSError, RuntimeError, TypeError, ValueError) as strict_error:
             try:
                 return self._partial_purge_transaction(portions, roots)
+            except _TrashRootUnavailableError:
+                raise
             except (OSError, RuntimeError, TypeError, ValueError):
                 raise strict_error from None
         if transaction.state is TrashState.PURGING:
@@ -2029,6 +2047,8 @@ class TrashManager:
             raise TrashTransactionError("trash transaction was not found")
         try:
             transaction = self._merge_actionable_portions(portions, roots)
+        except _TrashRootUnavailableError:
+            raise
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             raise TrashTransactionError(
                 "trash transaction portions are incomplete or inconsistent"
@@ -2134,9 +2154,9 @@ class TrashManager:
     def restore_blockers(self, transaction_id: str) -> tuple[str, ...]:
         try:
             portions, transaction = self._load_actionable_transaction(transaction_id)
-        except TrashTransactionError as exc:
-            if "root" in str(exc) and "unavailable" in str(exc):
-                return ("trash.restore.root_unavailable",)
+        except _TrashRootUnavailableError:
+            return ("trash.restore.root_unavailable",)
+        except TrashTransactionError:
             return ("trash.restore.journal_invalid",)
         return self._restore_blocker_codes(
             transaction,
@@ -2207,6 +2227,7 @@ class TrashManager:
             move_ids = current.completed_move_ids
             restored: list[TrashMember] = []
             original_error: BaseException | None = None
+            cleanup_started = False
             try:
                 self._write_portions(
                     plan,
@@ -2227,11 +2248,38 @@ class TrashManager:
                         completed_restore_ids=(item.identity.run_id for item in restored),
                     )
                 self._validate_restored_family(current)
+                cleanup_started = True
                 self._remove_transaction_portions(portion_paths)
             except BaseException as exc:
                 original_error = exc
 
             if original_error is not None:
+                if cleanup_started:
+                    errors = (self._error_detail("restore cleanup", original_error),)
+                    recovery_portions: dict[Path, Path] = {}
+                    try:
+                        for root in current.roots:
+                            recovery_portions[root] = RunService(root).prepare_trash_transaction(
+                                current.transaction_id
+                            )
+                        self._write_portions(
+                            plan,
+                            recovery_portions,
+                            state=TrashState.RESTORING,
+                            deleted_at=current.deleted_at,
+                            completed_move_ids=move_ids,
+                            completed_restore_ids=(item.identity.run_id for item in restored),
+                            errors=errors,
+                        )
+                    except BaseException as journal_error:
+                        errors = (
+                            *errors,
+                            self._error_detail("restore cleanup journal", journal_error),
+                        )
+                    raise TrashTransactionError(
+                        "trash restore cleanup failed and requires recovery: " + "; ".join(errors)
+                    ) from original_error
+
                 rollback_errors: list[str] = []
                 while restored:
                     member = restored[-1]

@@ -1005,6 +1005,147 @@ def test_interrupted_purging_with_missing_portion_normalizes_to_purge_failed(tmp
         manager.restore(moved.transaction_id)
 
 
+def test_partial_purge_survives_an_unrelated_configured_root(tmp_path, monkeypatch):
+    manager, parent, child = manager_for_cross_root_family(tmp_path)
+    moved = manager.move(manager.plan(RunIdentity.from_entry(parent)))
+    real_remove = RunService.remove_trash_transaction
+    calls = 0
+
+    def fail_second(service, transaction_id):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated second-root purge failure")
+        return real_remove(service, transaction_id)
+
+    monkeypatch.setattr(RunService, "remove_trash_transaction", fail_second)
+    with pytest.raises(run_trash_module.TrashTransactionError, match="permanent deletion"):
+        manager.purge(moved.transaction_id, confirmation=moved.transaction_id[:8])
+
+    unrelated = tmp_path / "unrelated-results"
+    unrelated.mkdir()
+    reloaded = run_trash_module.TrashManager(
+        lambda: (parent.root, child.root, unrelated),
+        RunUsageLeaseRegistry(),
+    )
+
+    assert (
+        reloaded.transaction(moved.transaction_id).state is run_trash_module.TrashState.PURGE_FAILED
+    )
+    assert reloaded.list_transactions()[0].state is run_trash_module.TrashState.PURGE_FAILED
+    receipt = reloaded.purge(
+        moved.transaction_id,
+        confirmation=moved.transaction_id[:8],
+    )
+    assert receipt.purged is True
+    assert receipt.run_count == 2
+
+
+@pytest.mark.parametrize("remove_payload", [False, True], ids=["intact", "missing-payload"])
+def test_mixed_trashed_and_purging_state_uses_payload_integrity(
+    tmp_path,
+    remove_payload,
+):
+    manager, parent, _ = manager_for_cross_root_family(tmp_path)
+    moved = manager.move(manager.plan(RunIdentity.from_entry(parent)))
+    journals = [root / ".trash" / moved.transaction_id / "trash.json" for root in moved.roots]
+    documents = [json.loads(path.read_text(encoding="utf-8")) for path in journals]
+    documents[0]["state"] = "trashed"
+    documents[1]["state"] = "purging"
+    for path, document in zip(journals, documents, strict=True):
+        run_trash_module.atomic_write_json(path, document)
+    if remove_payload:
+        relative = PurePosixPath(documents[0]["members"][0]["trash_relative_path"])
+        shutil.rmtree(journals[0].parent.joinpath(*relative.parts))
+
+    transaction = manager.transaction(moved.transaction_id)
+
+    expected = (
+        run_trash_module.TrashState.PURGE_FAILED
+        if remove_payload
+        else run_trash_module.TrashState.TRASHED
+    )
+    assert transaction.state is expected
+
+
+@pytest.mark.parametrize("other_state", ["trashed", "purging"])
+def test_mixed_purge_failed_state_never_reenables_restore(tmp_path, other_state):
+    manager, parent, _ = manager_for_cross_root_family(tmp_path)
+    moved = manager.move(manager.plan(RunIdentity.from_entry(parent)))
+    journals = [root / ".trash" / moved.transaction_id / "trash.json" for root in moved.roots]
+    documents = [json.loads(path.read_text(encoding="utf-8")) for path in journals]
+    documents[0]["state"] = "purge_failed"
+    documents[1]["state"] = other_state
+    for path, document in zip(journals, documents, strict=True):
+        run_trash_module.atomic_write_json(path, document)
+
+    transaction = manager.transaction(moved.transaction_id)
+
+    assert transaction.state is run_trash_module.TrashState.PURGE_FAILED
+    with pytest.raises(run_trash_module.TrashTransactionError, match="cannot be restored"):
+        manager.restore(moved.transaction_id)
+
+
+def test_restore_cleanup_failure_recreates_recoverable_cross_root_journals(
+    tmp_path,
+    monkeypatch,
+):
+    manager, parent, child = manager_for_cross_root_family(tmp_path)
+    moved = manager.move(manager.plan(RunIdentity.from_entry(parent)))
+    real_cleanup = manager._remove_transaction_portions
+    real_move = manager._move_member
+    rollback_attempts = []
+
+    def fail_after_first_portion(portions):
+        first_root = sorted(portions, key=lambda root: str(root))[0]
+        real_cleanup({first_root: portions[first_root]})
+        raise OSError("simulated second-root cleanup failure")
+
+    def tracking_move(member, portions):
+        rollback_attempts.append(member.identity.run_id)
+        return real_move(member, portions)
+
+    monkeypatch.setattr(manager, "_remove_transaction_portions", fail_after_first_portion)
+    monkeypatch.setattr(manager, "_move_member", tracking_move)
+
+    with pytest.raises(run_trash_module.TrashTransactionError, match="recovery"):
+        manager.restore(moved.transaction_id)
+
+    assert parent.run_dir.is_dir()
+    assert child.run_dir.is_dir()
+    assert rollback_attempts == []
+    transaction = manager.transaction(moved.transaction_id)
+    assert transaction.state is run_trash_module.TrashState.RECOVERY_REQUIRED
+
+    recovered = manager.recover(moved.transaction_id)
+
+    assert recovered.state is run_trash_module.TrashState.TRASHED
+    assert not parent.run_dir.exists()
+    assert not child.run_dir.exists()
+    assert manager.transaction(moved.transaction_id).state is run_trash_module.TrashState.TRASHED
+
+
+def test_restore_blockers_reports_removed_configured_root_as_unavailable(tmp_path):
+    source_root = tmp_path / "source-results"
+    child_root = tmp_path / "figure-results"
+    parent = publish_selection(source_root, run_id="a" * 32)
+    _publish_run(
+        child_root,
+        run_id="b" * 32,
+        run_kind="figure",
+        source={"path": str(parent.run_dir), "run_id": parent.run_id},
+    )
+    roots = [source_root, child_root]
+    manager = run_trash_module.TrashManager(
+        lambda: tuple(roots),
+        RunUsageLeaseRegistry(),
+    )
+    moved = manager.move(manager.plan(RunIdentity.from_entry(parent)))
+    roots.remove(child_root)
+
+    assert manager.restore_blockers(moved.transaction_id) == ("trash.restore.root_unavailable",)
+
+
 def test_run_trash_has_no_automatic_purge_entrypoint():
     source = Path(run_trash_module.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
