@@ -5,15 +5,21 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from hashlib import sha256
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from threading import Lock
 from typing import Any, Literal
 from uuid import uuid4
 
-from .run_service import RunEntry, RunService
+from .run_service import (
+    RunEntry,
+    RunService,
+    _assert_unredirected_chain,
+    _is_redirected_path,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +62,33 @@ class RunEdge:
             raise ValueError(
                 "run dependency edge source must be parent_run_id or metadata.source"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class TrashMember:
+    identity: RunIdentity
+    original_relative_path: PurePosixPath
+    trash_relative_path: PurePosixPath
+    scenario_id: str
+    profile_id: str
+    created_at: str
+    run_kind: str
+    status: str
+    parent_run_id: str | None
+    artifact_count: int
+    manifest_digest: str
+    size_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class TrashPlan:
+    transaction_id: str
+    selected: RunIdentity
+    members: tuple[TrashMember, ...]
+    edges: tuple[RunEdge, ...]
+    roots: tuple[Path, ...]
+    fingerprint: str
+    total_size_bytes: int
 
 
 class RunDependencyError(ValueError):
@@ -425,6 +458,236 @@ class RunDependencyGraph:
             separators=(",", ":"),
         ).encode("utf-8")
         return sha256(document).hexdigest()
+
+
+def _manifest_digest(record: Mapping[str, Any]) -> str:
+    document = json.dumps(
+        _json_document(record),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return sha256(document).hexdigest()
+
+
+def _filesystem_identity(path: Path, details: os.stat_result) -> tuple[Any, ...]:
+    if details.st_ino:
+        return (
+            "inode",
+            stat.S_IFMT(details.st_mode),
+            details.st_dev,
+            details.st_ino,
+        )
+    return ("path", _canonical_path_key(path))
+
+
+def _validated_tree_size(
+    root: Path,
+    seen: set[tuple[Any, ...]],
+) -> int:
+    try:
+        candidate = _assert_unredirected_chain(
+            root,
+            description="run contents size root",
+        )
+        if candidate.resolve(strict=True) != candidate:
+            raise ValueError("run contents size root must not be redirected")
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError("run contents could not be safely sized") from exc
+
+    total = 0
+    pending = [candidate]
+    while pending:
+        current = pending.pop()
+        try:
+            if _is_redirected_path(current):
+                raise ValueError("run contents contain a redirected path")
+            details = current.lstat()
+            identity = _filesystem_identity(current, details)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if stat.S_ISDIR(details.st_mode):
+                children = sorted(
+                    current.iterdir(),
+                    key=lambda path: _canonical_path_key(path),
+                    reverse=True,
+                )
+                pending.extend(children)
+            elif stat.S_ISREG(details.st_mode):
+                total += details.st_size
+            else:
+                raise ValueError(
+                    "run contents contain a non-regular filesystem entry"
+                )
+        except ValueError:
+            raise
+        except (OSError, RuntimeError) as exc:
+            raise ValueError("run contents could not be safely sized") from exc
+    return total
+
+
+def _family_depths(
+    graph: RunDependencyGraph,
+    selected: RunIdentity,
+    family: frozenset[RunIdentity],
+) -> dict[RunIdentity, int]:
+    depths = {selected: 0}
+    pending = [selected]
+    while pending:
+        current = pending.pop()
+        next_depth = depths[current] + 1
+        for child in graph.children_of(current):
+            if child not in family or next_depth <= depths.get(child, -1):
+                continue
+            depths[child] = next_depth
+            pending.append(child)
+    if set(depths) != set(family):
+        raise ValueError("trash plan family is not reachable from the selected run")
+    return depths
+
+
+def _member_sort_key(
+    identity: RunIdentity,
+    depths: Mapping[RunIdentity, int],
+) -> tuple[int, str, str, str]:
+    return (
+        -depths[identity],
+        identity.run_id,
+        _canonical_path_key(identity.expected_path),
+        _canonical_path_key(identity.root),
+    )
+
+
+def _validate_plan_entry(identity: RunIdentity, entry: RunEntry) -> PurePosixPath:
+    if RunIdentity.from_entry(entry) != identity:
+        raise ValueError("trash plan member identity does not match its graph entry")
+    try:
+        relative = entry.run_dir.relative_to(entry.root)
+    except ValueError as exc:
+        raise ValueError("trash plan member path is outside its root") from exc
+    scenario_id = entry.record["scenario_id"]
+    profile_id = entry.record["profile_id"]
+    if (
+        len(relative.parts) != 3
+        or relative.parts[0] != scenario_id
+        or relative.parts[1] != profile_id
+        or relative.parts[2] != entry.run_dir.name
+        or ".." in relative.parts
+    ):
+        raise ValueError("trash plan member path does not have the live run shape")
+    return PurePosixPath(*relative.parts)
+
+
+def build_trash_plan(
+    graph: RunDependencyGraph,
+    selected: RunIdentity,
+    members: Iterable[RunIdentity],
+) -> TrashPlan:
+    if type(graph) is not RunDependencyGraph:
+        raise ValueError("trash plan requires a RunDependencyGraph")
+    if type(selected) is not RunIdentity:
+        raise ValueError("trash plan selected run must be a RunIdentity")
+    try:
+        supplied = tuple(members)
+    except TypeError as exc:
+        raise ValueError("trash plan members must be an iterable of identities") from exc
+    if any(type(identity) is not RunIdentity for identity in supplied):
+        raise ValueError("trash plan members must be RunIdentity values")
+    supplied_family = frozenset(supplied)
+    if len(supplied_family) != len(supplied):
+        raise ValueError("trash plan members must not contain duplicates")
+
+    try:
+        graph.entry(selected)
+    except KeyError as exc:
+        raise ValueError("trash plan selected run is not present in the graph") from exc
+    for identity in supplied:
+        try:
+            graph.entry(identity)
+        except KeyError as exc:
+            raise ValueError("trash plan member is not present in the graph") from exc
+    expected_family = graph.family(selected)
+    if supplied_family != expected_family:
+        raise ValueError("trash plan members must equal the selected run family")
+
+    depths = _family_depths(graph, selected, expected_family)
+    ordered_identities = tuple(
+        sorted(
+            expected_family,
+            key=lambda identity: _member_sort_key(identity, depths),
+        )
+    )
+    relevant_edges = tuple(
+        sorted(
+            (
+                edge
+                for edge in graph.edges
+                if edge.parent in expected_family or edge.child in expected_family
+            ),
+            key=lambda edge: (
+                _identity_key(edge.parent),
+                _identity_key(edge.child),
+                edge.source,
+            ),
+        )
+    )
+
+    seen_filesystem_entries: set[tuple[Any, ...]] = set()
+    planned_members: list[TrashMember] = []
+    affected_roots: dict[str, Path] = {}
+    for identity in ordered_identities:
+        entry = graph.entry(identity)
+        original_relative_path = _validate_plan_entry(identity, entry)
+        record = entry.record
+        scenario_id = str(record["scenario_id"])
+        profile_id = str(record["profile_id"])
+        metadata = record["metadata"]
+        run_kind_value = metadata.get("run_kind")
+        run_kind = (
+            run_kind_value
+            if type(run_kind_value) is str
+            and run_kind_value in {"figure", "selection"}
+            else "selection"
+        )
+        artifacts = record["artifacts"]
+        member_size = _validated_tree_size(
+            entry.run_dir,
+            seen_filesystem_entries,
+        )
+        planned_members.append(
+            TrashMember(
+                identity=identity,
+                original_relative_path=original_relative_path,
+                trash_relative_path=PurePosixPath(
+                    "runs",
+                    scenario_id,
+                    profile_id,
+                    entry.run_dir.name,
+                ),
+                scenario_id=scenario_id,
+                profile_id=profile_id,
+                created_at=str(record["created_at"]),
+                run_kind=run_kind,
+                status=str(record["status"]),
+                parent_run_id=record["parent_run_id"],
+                artifact_count=len(artifacts),
+                manifest_digest=_manifest_digest(record),
+                size_bytes=member_size,
+            )
+        )
+        affected_roots.setdefault(_canonical_path_key(identity.root), identity.root)
+
+    frozen_members = tuple(planned_members)
+    return TrashPlan(
+        transaction_id=uuid4().hex,
+        selected=selected,
+        members=frozen_members,
+        edges=relevant_edges,
+        roots=tuple(affected_roots[key] for key in sorted(affected_roots)),
+        fingerprint=graph.fingerprint(selected, expected_family),
+        total_size_bytes=sum(member.size_bytes for member in frozen_members),
+    )
 
 
 class RunUsageLeaseRegistry:

@@ -22,6 +22,7 @@ from .io import _json_safe, atomic_write_json
 
 _SLUG_PATTERN = re.compile(r"^[a-z][a-z0-9-]*$")
 _RUN_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+_TRASH_TRANSACTION_PATTERN = re.compile(r"[0-9a-f]{32}")
 _WINDOWS_RESERVED = frozenset(
     {"con", "prn", "aux", "nul"}
     | {f"com{index}" for index in range(1, 10)}
@@ -214,6 +215,17 @@ def _safe_run_id(value: Any, *, field: str = "run_id") -> str:
     return value
 
 
+def _safe_trash_transaction_id(value: Any) -> str:
+    if (
+        type(value) is not str
+        or _TRASH_TRANSACTION_PATTERN.fullmatch(value) is None
+    ):
+        raise ValueError(
+            "trash transaction ID must be 32 lowercase hexadecimal characters"
+        )
+    return value
+
+
 def _normalise_created_at(value: str | None) -> tuple[str, datetime]:
     if value is None:
         parsed = datetime.now(timezone.utc)
@@ -281,6 +293,287 @@ class RunService:
             scenario_path / profile_id,
             description="run profile parent",
         )
+
+    def prepare_trash_transaction(self, transaction_id: str) -> Path:
+        transaction_id = _safe_trash_transaction_id(transaction_id)
+        self.output_root.mkdir(parents=True, exist_ok=True)
+        self._assert_contained(self.output_root, description="run output root")
+        if _is_redirected_path(self.output_root) or not self.output_root.is_dir():
+            raise ValueError("run output root must be a real directory")
+        trash_root = self._ensure_directory_component(
+            self.output_root / ".trash",
+            description="run trash root",
+        )
+        transaction = trash_root / transaction_id
+        self._assert_contained(transaction, description="trash transaction")
+        if not os.path.lexists(transaction):
+            transaction.mkdir()
+        if _is_redirected_path(transaction) or not transaction.is_dir():
+            raise ValueError("trash transaction must be a real directory")
+        return transaction
+
+    def _existing_trash_transaction(self, transaction_id: Any) -> Path:
+        validated_id = _safe_trash_transaction_id(transaction_id)
+        trash_root = self.output_root / ".trash"
+        self._assert_contained(trash_root, description="run trash root")
+        if not os.path.lexists(trash_root):
+            raise FileNotFoundError(f"run trash root does not exist: {trash_root}")
+        if _is_redirected_path(trash_root) or not trash_root.is_dir():
+            raise ValueError("run trash root must be a real directory")
+
+        transaction = trash_root / validated_id
+        self._assert_contained(transaction, description="trash transaction")
+        if not os.path.lexists(transaction):
+            raise FileNotFoundError(
+                f"trash transaction does not exist: {transaction}"
+            )
+        if _is_redirected_path(transaction) or not transaction.is_dir():
+            raise ValueError("trash transaction must be a real directory")
+        if transaction.parent != trash_root or transaction.name != validated_id:
+            raise ValueError("trash transaction path does not have the exact shape")
+        if transaction.resolve(strict=True) != transaction:
+            raise ValueError("trash transaction path must not be redirected")
+        return transaction
+
+    def _entry_snapshot_identity(
+        self,
+        entry: RunEntry,
+    ) -> tuple[str, str, str, Path]:
+        if type(entry) is not RunEntry:
+            raise ValueError("run entry must be an immutable RunEntry snapshot")
+        if Path(entry.root) != self.output_root:
+            raise ValueError("run entry root does not belong to this service")
+        if not isinstance(entry.record, Mapping):
+            raise ValueError("run entry snapshot manifest must be a mapping")
+        try:
+            run_id = _safe_run_id(entry.record["run_id"])
+            scenario_id = _safe_slug(
+                entry.record["scenario_id"],
+                field="scenario_id",
+            )
+            profile_id = _safe_slug(
+                entry.record["profile_id"],
+                field="profile_id",
+            )
+            created_at, _ = _normalise_created_at(entry.record["created_at"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("run entry snapshot manifest is invalid") from exc
+        _, expected_path = self._expected_paths(
+            scenario_id=scenario_id,
+            profile_id=profile_id,
+            created_at=created_at,
+            run_id=run_id,
+        )
+        candidate = Path(entry.run_dir)
+        self._assert_contained(candidate, description="run entry destination")
+        if candidate != expected_path:
+            raise ValueError(
+                "run entry snapshot destination does not match its manifest"
+            )
+        return run_id, scenario_id, profile_id, expected_path
+
+    def _live_entry_from_snapshot(self, entry: RunEntry) -> RunEntry:
+        run_id, _, _, expected_path = self._entry_snapshot_identity(entry)
+        current = self.entry_for_path(expected_path, run_id=run_id)
+        if _thaw_record(current.record) != _thaw_record(entry.record):
+            raise ValueError("live run manifest changed from the immutable snapshot")
+        return current
+
+    def _trash_payload_path(
+        self,
+        path: str | os.PathLike[str],
+        entry: RunEntry,
+        *,
+        description: str,
+        require_exists: bool,
+    ) -> tuple[Path, Path]:
+        if not isinstance(path, (str, os.PathLike)):
+            raise ValueError(f"{description} path must be path-like")
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            raise ValueError(f"{description} path must be absolute")
+        self._assert_contained(candidate, description=description)
+        _, scenario_id, profile_id, expected_live_path = (
+            self._entry_snapshot_identity(entry)
+        )
+        try:
+            relative = candidate.relative_to(self.output_root)
+        except ValueError as exc:
+            raise ValueError(f"{description} path is outside this service root") from exc
+        if len(relative.parts) != 6 or relative.parts[0] != ".trash":
+            raise ValueError(f"{description} path has an invalid trash payload shape")
+        transaction_id = _safe_trash_transaction_id(relative.parts[1])
+        expected_relative = Path(
+            ".trash",
+            transaction_id,
+            "runs",
+            scenario_id,
+            profile_id,
+            expected_live_path.name,
+        )
+        if relative != expected_relative:
+            raise ValueError(f"{description} path does not match the run identity")
+        transaction = self._existing_trash_transaction(transaction_id)
+        if candidate.parent.parent.parent.parent != transaction:
+            raise ValueError(f"{description} path is outside the exact transaction")
+        exists = os.path.lexists(candidate)
+        if require_exists and not exists:
+            raise FileNotFoundError(f"{description} path does not exist: {candidate}")
+        if not require_exists and exists:
+            raise FileExistsError(f"{description} already exists: {candidate}")
+        if require_exists and (
+            _is_redirected_path(candidate) or not candidate.is_dir()
+        ):
+            raise ValueError(f"{description} must be a real directory")
+        return transaction, candidate
+
+    def _assert_real_tree(self, root: Path, *, description: str) -> None:
+        pending = [root]
+        while pending:
+            current = pending.pop()
+            try:
+                self._assert_contained(current, description=description)
+                if _is_redirected_path(current):
+                    raise ValueError(f"{description} contains a redirected path")
+                details = current.lstat()
+                if stat.S_ISDIR(details.st_mode):
+                    pending.extend(current.iterdir())
+                elif not stat.S_ISREG(details.st_mode):
+                    raise ValueError(
+                        f"{description} contains a non-regular filesystem entry"
+                    )
+            except OSError as exc:
+                raise ValueError(f"{description} could not be safely validated") from exc
+
+    def _prepare_trash_payload_parent(
+        self,
+        transaction: Path,
+        *,
+        scenario_id: str,
+        profile_id: str,
+    ) -> Path:
+        runs = self._ensure_directory_component(
+            transaction / "runs",
+            description="trash runs parent",
+        )
+        scenario = self._ensure_directory_component(
+            runs / scenario_id,
+            description="trash scenario parent",
+        )
+        return self._ensure_directory_component(
+            scenario / profile_id,
+            description="trash profile parent",
+        )
+
+    def move_entry_to(
+        self,
+        entry: RunEntry,
+        destination: str | os.PathLike[str],
+    ) -> Path:
+        current = self._live_entry_from_snapshot(entry)
+        transaction, target = self._trash_payload_path(
+            destination,
+            current,
+            description="trash destination",
+            require_exists=False,
+        )
+        _, scenario_id, profile_id, _ = self._entry_snapshot_identity(current)
+        self._assert_real_tree(current.run_dir, description="live run contents")
+        parent = self._prepare_trash_payload_parent(
+            transaction,
+            scenario_id=scenario_id,
+            profile_id=profile_id,
+        )
+        if target.parent != parent:
+            raise ValueError("trash destination parent does not match the transaction")
+
+        current = self._live_entry_from_snapshot(entry)
+        self._assert_real_tree(current.run_dir, description="live run contents")
+        self._existing_trash_transaction(transaction.name)
+        self._assert_contained(target, description="trash destination")
+        if os.path.lexists(target):
+            raise FileExistsError(f"trash destination already exists: {target}")
+        current.run_dir.replace(target)
+        return target
+
+    def _validated_trash_source_record(
+        self,
+        source: Path,
+        entry: RunEntry,
+        expected_live_path: Path,
+    ) -> dict[str, Any]:
+        self._assert_real_tree(source, description="trash source contents")
+        record_path = source / "run.json"
+        self._assert_contained(record_path, description="trash source manifest")
+        if _is_redirected_path(record_path) or not record_path.is_file():
+            raise ValueError("trash source manifest must be a regular file")
+        try:
+            document = json.loads(record_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("trash source manifest is invalid") from exc
+        record, _ = self._validate_discovered_record(
+            record_path,
+            document,
+            expected_live_path=expected_live_path,
+        )
+        if record != _thaw_record(entry.record):
+            raise ValueError("trash source manifest changed from the immutable snapshot")
+        return record
+
+    def restore_entry_from(
+        self,
+        source: str | os.PathLike[str],
+        entry: RunEntry,
+    ) -> Path:
+        _, scenario_id, profile_id, destination = self._entry_snapshot_identity(entry)
+        _, trash_source = self._trash_payload_path(
+            source,
+            entry,
+            description="trash source",
+            require_exists=True,
+        )
+        self._validated_trash_source_record(trash_source, entry, destination)
+        if os.path.lexists(destination):
+            raise FileExistsError(f"restore destination already exists: {destination}")
+
+        self.output_root.mkdir(parents=True, exist_ok=True)
+        self._assert_contained(self.output_root, description="run output root")
+        scenario = self._ensure_directory_component(
+            self.output_root / scenario_id,
+            description="restore scenario parent",
+        )
+        profile = self._ensure_directory_component(
+            scenario / profile_id,
+            description="restore profile parent",
+        )
+        if destination.parent != profile:
+            raise ValueError("restore destination parent does not match the run identity")
+
+        self._validated_trash_source_record(trash_source, entry, destination)
+        self._assert_contained(destination, description="restore destination")
+        if os.path.lexists(destination):
+            raise FileExistsError(f"restore destination already exists: {destination}")
+        trash_source.replace(destination)
+        return destination
+
+    def remove_trash_transaction(self, transaction_id: str) -> None:
+        validated_id = _safe_trash_transaction_id(transaction_id)
+        transaction = self._existing_trash_transaction(validated_id)
+        trash_root = self.output_root / ".trash"
+        expected = trash_root / validated_id
+        self._assert_contained(expected, description="trash transaction purge target")
+        if (
+            transaction != expected
+            or transaction.parent != trash_root
+            or transaction.name != validated_id
+            or transaction in {self.output_root, trash_root}
+        ):
+            raise ValueError("trash transaction purge target is not exact")
+        self._assert_real_tree(transaction, description="trash transaction purge target")
+        transaction = self._existing_trash_transaction(validated_id)
+        if transaction != expected:
+            raise ValueError("trash transaction purge target changed")
+        shutil.rmtree(transaction)
 
     def _expected_paths(
         self,
@@ -630,6 +923,8 @@ class RunService:
                         }
                     )
                     continue
+                if child.is_dir() and child.name == ".trash":
+                    continue
                 if child.is_dir() and not child.name.startswith(".staging-"):
                     pending.append(child)
                     continue
@@ -648,6 +943,8 @@ class RunService:
         self,
         record_path: Path,
         document: Any,
+        *,
+        expected_live_path: Path | None = None,
     ) -> tuple[dict[str, Any], datetime]:
         if not isinstance(document, dict):
             raise ValueError("run record must be a JSON object")
@@ -676,7 +973,7 @@ class RunService:
         if not isinstance(document["errors"], list):
             raise ValueError("run errors must be a JSON array")
 
-        final_path = record_path.parent
+        actual_run_path = record_path.parent
         self._assert_contained(record_path, description="run record")
         if _is_redirected_path(record_path) or not record_path.is_file():
             raise ValueError("run record must be a regular file")
@@ -687,11 +984,15 @@ class RunService:
             run_id=run_id,
         )
         del expected_staging
-        if final_path != expected_final:
+        required_live_path = (
+            actual_run_path if expected_live_path is None else Path(expected_live_path)
+        )
+        self._assert_contained(required_live_path, description="expected live run")
+        if required_live_path != expected_final:
             raise ValueError(
                 f"run record path does not match its identifiers: {record_path}"
             )
-        artifacts = self._artifact_paths(final_path, document["artifacts"])
+        artifacts = self._artifact_paths(actual_run_path, document["artifacts"])
         record = dict(document)
         record["created_at"] = created_at
         record["published_at"] = published_at

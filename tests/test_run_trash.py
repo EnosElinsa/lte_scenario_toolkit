@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
+from dataclasses import FrozenInstanceError
+from hashlib import sha256
+from pathlib import Path, PurePosixPath
 from unittest.mock import patch
 from uuid import UUID
 
 import pytest
 
 import lte_scenario_toolkit.run_service as run_service_module
+import lte_scenario_toolkit.run_trash as run_trash_module
 from lte_scenario_toolkit.run_service import RunEntry, RunService
 from lte_scenario_toolkit.run_trash import (
     RunDependencyError,
@@ -20,6 +23,10 @@ from lte_scenario_toolkit.run_trash import (
 )
 
 CREATED_AT = "2026-07-20T10:00:00Z"
+
+
+def build_trash_plan(*args, **kwargs):
+    return run_trash_module.build_trash_plan(*args, **kwargs)
 
 
 def _publish_run(
@@ -499,6 +506,323 @@ def test_windows_equivalent_missing_roots_have_stable_universe_and_fingerprint(
         selected,
         first_graph.family(selected),
     ) == second_graph.fingerprint(selected, second_graph.family(selected))
+
+
+def _canonical_manifest_digest(entry: RunEntry) -> str:
+    document = json.loads((entry.run_dir / "run.json").read_text(encoding="utf-8"))
+    payload = json.dumps(
+        document,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return sha256(payload).hexdigest()
+
+
+def _unique_regular_file_size(root: Path) -> int:
+    seen: set[tuple[int, int]] = set()
+    total = 0
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        details = path.stat()
+        key = (details.st_dev, details.st_ino)
+        if key in seen:
+            continue
+        seen.add(key)
+        total += details.st_size
+    return total
+
+
+def test_build_trash_plan_populates_immutable_members_and_exact_paths(tmp_path):
+    root = tmp_path / "results"
+    parent = publish_selection(root, run_id="a" * 32)
+    child = publish_figure(
+        root,
+        run_id="b" * 32,
+        parent=parent,
+        created_at="2026-07-20T10:00:01Z",
+    )
+    (child.run_dir / "nested").mkdir()
+    (child.run_dir / "nested" / "notes.txt").write_bytes(b"notes\n")
+    graph = RunDependencyGraph.from_roots((root,))
+    selected = RunIdentity.from_entry(parent)
+    family = graph.family(selected)
+
+    with patch.object(
+        run_trash_module,
+        "uuid4",
+        return_value=UUID(hex="f" * 32),
+    ):
+        plan = build_trash_plan(graph, selected, family)
+
+    assert isinstance(plan, run_trash_module.TrashPlan)
+    assert plan.transaction_id == "f" * 32
+    assert plan.selected == selected
+    assert [member.identity.run_id for member in plan.members] == [
+        child.run_id,
+        parent.run_id,
+    ]
+    assert all(
+        isinstance(member, run_trash_module.TrashMember) for member in plan.members
+    )
+    child_member = plan.members[0]
+    assert child_member.original_relative_path == PurePosixPath(
+        "chicago",
+        "default",
+        child.run_dir.name,
+    )
+    assert child_member.trash_relative_path == PurePosixPath(
+        "runs",
+        "chicago",
+        "default",
+        child.run_dir.name,
+    )
+    assert child_member.scenario_id == "chicago"
+    assert child_member.profile_id == "default"
+    assert child_member.created_at == "2026-07-20T10:00:01Z"
+    assert child_member.run_kind == "figure"
+    assert child_member.status == "completed"
+    assert child_member.parent_run_id == parent.run_id
+    assert child_member.artifact_count == 1
+    assert child_member.manifest_digest == _canonical_manifest_digest(child)
+    assert child_member.size_bytes == _unique_regular_file_size(child.run_dir)
+    assert plan.roots == (parent.root,)
+    assert plan.fingerprint == graph.fingerprint(selected, family)
+    assert plan.total_size_bytes == sum(
+        member.size_bytes for member in plan.members
+    )
+    assert [edge.source for edge in plan.edges] == [
+        "metadata.source",
+        "parent_run_id",
+    ]
+    assert all(
+        edge.parent in family and edge.child in family for edge in plan.edges
+    )
+    with pytest.raises(FrozenInstanceError):
+        plan.transaction_id = "e" * 32
+    with pytest.raises(FrozenInstanceError):
+        child_member.size_bytes = 0
+
+
+def test_build_trash_plan_orders_descendants_first_deterministically(tmp_path):
+    root = tmp_path / "results"
+    parent = publish_selection(root, run_id="a" * 32)
+    later_sibling = publish_figure(root, run_id="c" * 32, parent=parent)
+    earlier_sibling = publish_figure(root, run_id="b" * 32, parent=parent)
+    grandchild = publish_figure(root, run_id="d" * 32, parent=later_sibling)
+    graph = RunDependencyGraph.from_roots((root,))
+    selected = RunIdentity.from_entry(parent)
+    family = graph.family(selected)
+
+    first = build_trash_plan(graph, selected, tuple(reversed(tuple(family))))
+    second = build_trash_plan(graph, selected, family)
+
+    expected = [
+        grandchild.run_id,
+        earlier_sibling.run_id,
+        later_sibling.run_id,
+        parent.run_id,
+    ]
+    assert [member.identity.run_id for member in first.members] == expected
+    assert [member.identity.run_id for member in second.members] == expected
+    assert first.edges == second.edges
+
+
+def test_build_trash_plan_records_incoming_edges_for_selected_leaf(tmp_path):
+    root = tmp_path / "results"
+    parent = publish_selection(root, run_id="a" * 32)
+    child = publish_figure(root, run_id="b" * 32, parent=parent)
+    graph = RunDependencyGraph.from_roots((root,))
+    selected = RunIdentity.from_entry(child)
+
+    plan = build_trash_plan(graph, selected, graph.family(selected))
+
+    assert tuple((edge.parent.run_id, edge.child.run_id, edge.source) for edge in plan.edges) == (
+        (parent.run_id, child.run_id, "metadata.source"),
+        (parent.run_id, child.run_id, "parent_run_id"),
+    )
+
+
+def test_build_trash_plan_manifest_digest_changes_with_manifest_snapshot(tmp_path):
+    root = tmp_path / "results"
+    entry = publish_selection(root, run_id="a" * 32)
+    selected = RunIdentity.from_entry(entry)
+    first_graph = RunDependencyGraph.from_roots((root,))
+    first = build_trash_plan(
+        first_graph,
+        selected,
+        first_graph.family(selected),
+    )
+    manifest_path = entry.run_dir / "run.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["metadata"]["label"] = "changed"
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    second_graph = RunDependencyGraph.from_roots((root,))
+    second = build_trash_plan(
+        second_graph,
+        selected,
+        second_graph.family(selected),
+    )
+
+    assert first.members[0].manifest_digest != second.members[0].manifest_digest
+    assert first.fingerprint != second.fingerprint
+
+
+@pytest.mark.parametrize(
+    "run_kind",
+    [None, "unknown", ["figure"], {"kind": "figure"}],
+)
+def test_build_trash_plan_uses_safe_selection_default_for_run_kind(
+    tmp_path,
+    run_kind,
+):
+    root = tmp_path / "results"
+    entry = publish_selection(root, run_id="a" * 32)
+    manifest_path = entry.run_dir / "run.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["metadata"]["run_kind"] = run_kind
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    graph = RunDependencyGraph.from_roots((root,))
+    selected = RunIdentity.from_entry(entry)
+
+    plan = build_trash_plan(graph, selected, graph.family(selected))
+
+    assert plan.members[0].run_kind == "selection"
+
+
+def test_build_trash_plan_size_counts_hard_link_content_once(tmp_path):
+    root = tmp_path / "results"
+    entry = publish_selection(root, run_id="a" * 32)
+    artifact = entry.run_dir / "selection.csv"
+    alias = entry.run_dir / "selection-copy.csv"
+    try:
+        os.link(artifact, alias)
+    except OSError as exc:
+        pytest.skip(f"hard-link creation is unavailable: {exc}")
+    graph = RunDependencyGraph.from_roots((root,))
+    selected = RunIdentity.from_entry(entry)
+
+    plan = build_trash_plan(graph, selected, graph.family(selected))
+
+    expected = _unique_regular_file_size(entry.run_dir)
+    naive = sum(path.stat().st_size for path in entry.run_dir.rglob("*") if path.is_file())
+    assert naive > expected
+    assert plan.members[0].size_bytes == expected
+    assert plan.total_size_bytes == expected
+
+
+def test_build_trash_plan_rejects_nested_redirected_content(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "results"
+    entry = publish_selection(root, run_id="a" * 32)
+    nested = entry.run_dir / "nested"
+    nested.mkdir()
+    (nested / "data.bin").write_bytes(b"data")
+    graph = RunDependencyGraph.from_roots((root,))
+    selected = RunIdentity.from_entry(entry)
+    original = run_trash_module._is_redirected_path
+    monkeypatch.setattr(
+        run_trash_module,
+        "_is_redirected_path",
+        lambda path: Path(path) == nested or original(Path(path)),
+    )
+
+    with pytest.raises(ValueError, match="redirected|size|contents"):
+        build_trash_plan(graph, selected, graph.family(selected))
+
+
+def test_build_trash_plan_size_fails_closed_on_oserror(tmp_path, monkeypatch):
+    root = tmp_path / "results"
+    entry = publish_selection(root, run_id="a" * 32)
+    nested = entry.run_dir / "nested"
+    nested.mkdir()
+    graph = RunDependencyGraph.from_roots((root,))
+    selected = RunIdentity.from_entry(entry)
+    original = run_trash_module._is_redirected_path
+
+    def failing_redirect_check(path):
+        if Path(path) == nested:
+            raise OSError("simulated filesystem failure")
+        return original(Path(path))
+
+    monkeypatch.setattr(
+        run_trash_module,
+        "_is_redirected_path",
+        failing_redirect_check,
+    )
+
+    with pytest.raises(ValueError, match="size|safely|contents"):
+        build_trash_plan(graph, selected, graph.family(selected))
+
+
+def test_build_trash_plan_rejects_missing_extraneous_and_duplicate_family_members(
+    tmp_path,
+):
+    root = tmp_path / "results"
+    parent = publish_selection(root, run_id="a" * 32)
+    child = publish_figure(root, run_id="b" * 32, parent=parent)
+    other = publish_selection(root, run_id="c" * 32)
+    graph = RunDependencyGraph.from_roots((root,))
+    selected = RunIdentity.from_entry(parent)
+    child_identity = RunIdentity.from_entry(child)
+    other_identity = RunIdentity.from_entry(other)
+
+    invalid_member_sets = [
+        (selected,),
+        (selected, child_identity, other_identity),
+        (selected, child_identity, child_identity),
+        (selected, child_identity, _identity(tmp_path, "not-in-graph")),
+    ]
+    for supplied in invalid_member_sets:
+        with pytest.raises(ValueError, match="family|member|graph|duplicate"):
+            build_trash_plan(graph, selected, supplied)
+
+
+def test_build_trash_plan_rejects_selected_identity_outside_graph(tmp_path):
+    root = tmp_path / "results"
+    entry = publish_selection(root, run_id="a" * 32)
+    graph = RunDependencyGraph.from_roots((root,))
+    member = RunIdentity.from_entry(entry)
+    selected = RunIdentity(root, "f" * 32, root / "missing")
+
+    with pytest.raises(ValueError, match="selected|graph|family"):
+        build_trash_plan(graph, selected, (member,))
+
+
+def test_build_trash_plan_records_cross_root_affected_roots(tmp_path):
+    source_root = tmp_path / "source-results"
+    child_root = tmp_path / "figure-results"
+    parent = publish_selection(source_root, run_id="a" * 32)
+    child = _publish_run(
+        child_root,
+        run_id="b" * 32,
+        run_kind="figure",
+        source={"path": str(parent.run_dir), "run_id": parent.run_id},
+    )
+    graph = RunDependencyGraph.from_roots((child_root, source_root))
+    selected = RunIdentity.from_entry(parent)
+
+    plan = build_trash_plan(graph, selected, graph.family(selected))
+
+    assert plan.roots == graph.roots
+    assert {member.identity.root for member in plan.members} == {
+        parent.root,
+        child.root,
+    }
+    assert all(
+        edge.parent in {member.identity for member in plan.members}
+        and edge.child in {member.identity for member in plan.members}
+        for edge in plan.edges
+    )
 
 
 def _identity(tmp_path: Path, name: str = "run") -> RunIdentity:

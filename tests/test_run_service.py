@@ -1,5 +1,6 @@
 import errno
 import json
+import shutil
 import stat
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -592,6 +593,489 @@ def test_discover_reports_bad_records_and_keeps_valid_history_unchanged(tmp_path
     )
     assert all(item["error"] for item in discovered.diagnostics)
     assert {path: path.read_bytes() for path in all_records} == before
+
+
+def test_live_discovery_skips_reserved_trash_payload(tmp_path):
+    service = RunService(tmp_path / "results")
+    run = _begin_with_artifact(service)
+    live_path = service.publish(
+        run,
+        status="completed",
+        artifacts=["scenario.csv"],
+    )
+    trash_run = (
+        service.output_root
+        / ".trash"
+        / ("f" * 32)
+        / "runs"
+        / "chicago"
+        / "default"
+        / live_path.name
+    )
+    trash_run.parent.mkdir(parents=True)
+    shutil.copytree(live_path, trash_run)
+
+    assert [
+        entry.run_id for entry in service.discover_entries().entries
+    ] == [run.run_id]
+
+
+def test_live_discovery_prunes_reserved_trash_before_nested_redirect(
+    tmp_path,
+    monkeypatch,
+):
+    service = RunService(tmp_path / "results")
+    run = _begin_with_artifact(service)
+    service.publish(run, status="completed", artifacts=["scenario.csv"])
+    nested_redirect = (
+        service.output_root / ".trash" / ("f" * 32) / "nested-redirect"
+    )
+    nested_redirect.mkdir(parents=True)
+    original = run_module._is_redirected_path
+    monkeypatch.setattr(
+        run_module,
+        "_is_redirected_path",
+        lambda path: Path(path) == nested_redirect or original(Path(path)),
+    )
+
+    discovered = service.discover_entries()
+
+    assert [entry.run_id for entry in discovered.entries] == [run.run_id]
+    assert discovered.diagnostics == ()
+
+
+def test_transaction_root_is_exactly_below_reserved_trash(tmp_path):
+    service = RunService(tmp_path / "results")
+
+    transaction = service.prepare_trash_transaction("f" * 32)
+
+    assert transaction == service.output_root / ".trash" / ("f" * 32)
+
+
+@pytest.mark.parametrize(
+    "transaction_id",
+    [
+        "F" * 32,
+        "f" * 31,
+        "f" * 33,
+        "../" + "f" * 32,
+        "f" * 16 + "/" + "f" * 16,
+        Path("f" * 32),
+        1,
+        True,
+        None,
+    ],
+)
+def test_prepare_trash_transaction_rejects_untrusted_ids(
+    tmp_path,
+    transaction_id,
+):
+    service = RunService(tmp_path / "results")
+
+    with pytest.raises(ValueError, match="32 lowercase hexadecimal"):
+        service.prepare_trash_transaction(transaction_id)
+
+
+def _published_entry(service: RunService) -> RunEntry:
+    run = _begin_with_artifact(service)
+    final_path = service.publish(
+        run,
+        status="completed",
+        artifacts=["scenario.csv"],
+        metadata={"run_kind": "selection"},
+    )
+    return service.entry_for_path(final_path, run_id=run.run_id)
+
+
+def _trash_destination(transaction: Path, entry: RunEntry) -> Path:
+    return (
+        transaction
+        / "runs"
+        / entry.record["scenario_id"]
+        / entry.record["profile_id"]
+        / entry.run_dir.name
+    )
+
+
+def test_prepare_trash_transaction_rejects_reserved_trash_symlink(tmp_path):
+    service = RunService(tmp_path / "results")
+    service.output_root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _symlink_or_skip(service.output_root / ".trash", outside, directory=True)
+
+    with pytest.raises(ValueError, match="redirected|real directory|trash"):
+        service.prepare_trash_transaction("f" * 32)
+
+    assert not (outside / ("f" * 32)).exists()
+
+
+def test_prepare_trash_transaction_rejects_redirected_transaction(tmp_path):
+    service = RunService(tmp_path / "results")
+    trash_root = service.output_root / ".trash"
+    trash_root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    transaction = trash_root / ("f" * 32)
+    _symlink_or_skip(transaction, outside, directory=True)
+
+    with pytest.raises(ValueError, match="redirected|real directory|transaction"):
+        service.prepare_trash_transaction("f" * 32)
+
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.parametrize("redirected_component", ["trash", "transaction"])
+def test_prepare_trash_transaction_rejects_junction_or_reparse_component(
+    tmp_path,
+    monkeypatch,
+    redirected_component,
+):
+    service = RunService(tmp_path / "results")
+    service.output_root.mkdir(parents=True)
+    trash_root = service.output_root / ".trash"
+    trash_root.mkdir()
+    transaction = trash_root / ("f" * 32)
+    if redirected_component == "transaction":
+        transaction.mkdir()
+    redirected = trash_root if redirected_component == "trash" else transaction
+    original = run_module._is_redirected_path
+    monkeypatch.setattr(
+        run_module,
+        "_is_redirected_path",
+        lambda path: Path(path) == redirected or original(Path(path)),
+    )
+
+    with pytest.raises(ValueError, match="redirected|real directory|trash"):
+        service.prepare_trash_transaction("f" * 32)
+
+
+def test_move_entry_to_uses_one_atomic_replace_into_exact_transaction(
+    tmp_path,
+    monkeypatch,
+):
+    service = RunService(tmp_path / "results")
+    entry = _published_entry(service)
+    transaction = service.prepare_trash_transaction("f" * 32)
+    destination = _trash_destination(transaction, entry)
+    original_bytes = {
+        path.relative_to(entry.run_dir): path.read_bytes()
+        for path in entry.run_dir.rglob("*")
+        if path.is_file()
+    }
+    calls: list[tuple[Path, Path]] = []
+    original_replace = Path.replace
+
+    def tracking_replace(path, target):
+        calls.append((Path(path), Path(target)))
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", tracking_replace)
+
+    moved = service.move_entry_to(entry, destination)
+
+    assert moved == destination
+    assert calls == [(entry.run_dir, destination)]
+    assert not entry.run_dir.exists()
+    assert {
+        path.relative_to(destination): path.read_bytes()
+        for path in destination.rglob("*")
+        if path.is_file()
+    } == original_bytes
+
+
+def test_move_entry_to_rejects_malformed_or_unprepared_destinations(tmp_path):
+    service = RunService(tmp_path / "results")
+    entry = _published_entry(service)
+    transaction = service.prepare_trash_transaction("f" * 32)
+    unprepared = service.output_root / ".trash" / ("e" * 32)
+    destinations = [
+        tmp_path / "browser-selected-path",
+        transaction,
+        transaction / "payload" / "chicago" / "default" / entry.run_dir.name,
+        transaction / "runs" / "other" / "default" / entry.run_dir.name,
+        transaction / "runs" / "chicago" / "other" / entry.run_dir.name,
+        transaction / "runs" / "chicago" / "default" / "wrong-run",
+        _trash_destination(transaction, entry) / "extra",
+        unprepared / "runs" / "chicago" / "default" / entry.run_dir.name,
+        Path(".trash") / ("f" * 32) / "runs" / "chicago" / "default" / entry.run_dir.name,
+        transaction
+        / "runs"
+        / "chicago"
+        / "default"
+        / "alias"
+        / ".."
+        / entry.run_dir.name,
+    ]
+
+    for destination in destinations:
+        with pytest.raises(
+            (FileNotFoundError, ValueError),
+            match="destination|transaction|absolute|outside|shape|traversal|prepared",
+        ):
+            service.move_entry_to(entry, destination)
+        assert entry.run_dir.is_dir()
+
+
+def test_move_entry_to_rejects_existing_destination_without_overwrite(tmp_path):
+    service = RunService(tmp_path / "results")
+    entry = _published_entry(service)
+    transaction = service.prepare_trash_transaction("f" * 32)
+    destination = _trash_destination(transaction, entry)
+    destination.mkdir(parents=True)
+    sentinel = destination / "sentinel.txt"
+    sentinel.write_text("keep\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="destination"):
+        service.move_entry_to(entry, destination)
+
+    assert entry.run_dir.is_dir()
+    assert sentinel.read_text(encoding="utf-8") == "keep\n"
+
+
+def test_move_entry_to_rejects_redirected_destination_parent(tmp_path):
+    service = RunService(tmp_path / "results")
+    entry = _published_entry(service)
+    transaction = service.prepare_trash_transaction("f" * 32)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _symlink_or_skip(transaction / "runs", outside, directory=True)
+    destination = _trash_destination(transaction, entry)
+
+    with pytest.raises(ValueError, match="redirected|destination|path"):
+        service.move_entry_to(entry, destination)
+
+    assert entry.run_dir.is_dir()
+    assert list(outside.iterdir()) == []
+
+
+def test_move_entry_to_revalidates_immutable_manifest_snapshot(tmp_path):
+    service = RunService(tmp_path / "results")
+    entry = _published_entry(service)
+    transaction = service.prepare_trash_transaction("f" * 32)
+    destination = _trash_destination(transaction, entry)
+    manifest_path = entry.run_dir / "run.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["metadata"]["label"] = "changed after selection"
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="manifest|snapshot|changed"):
+        service.move_entry_to(entry, destination)
+
+    assert entry.run_dir.is_dir()
+    assert not destination.exists()
+
+
+def test_move_entry_to_rejects_entry_from_another_root(tmp_path):
+    source_service = RunService(tmp_path / "source")
+    entry = _published_entry(source_service)
+    other_service = RunService(tmp_path / "other")
+    transaction = other_service.prepare_trash_transaction("f" * 32)
+    destination = (
+        transaction / "runs" / "chicago" / "default" / entry.run_dir.name
+    )
+
+    with pytest.raises(ValueError, match="root|service|entry"):
+        other_service.move_entry_to(entry, destination)
+
+    assert entry.run_dir.is_dir()
+
+
+def test_restore_entry_from_reconstructs_exact_live_path(tmp_path):
+    service = RunService(tmp_path / "results")
+    entry = _published_entry(service)
+    transaction = service.prepare_trash_transaction("f" * 32)
+    source = _trash_destination(transaction, entry)
+    service.move_entry_to(entry, source)
+
+    restored = service.restore_entry_from(source, entry)
+
+    assert restored == entry.run_dir
+    assert entry.run_dir.is_dir()
+    assert not source.exists()
+    assert service.entry_for_path(entry.run_dir, run_id=entry.run_id).record == entry.record
+
+
+def test_restore_entry_from_never_overwrites_live_destination(tmp_path):
+    service = RunService(tmp_path / "results")
+    entry = _published_entry(service)
+    transaction = service.prepare_trash_transaction("f" * 32)
+    source = _trash_destination(transaction, entry)
+    service.move_entry_to(entry, source)
+    entry.run_dir.mkdir()
+    sentinel = entry.run_dir / "sentinel.txt"
+    sentinel.write_text("keep\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="restore|destination"):
+        service.restore_entry_from(source, entry)
+
+    assert source.is_dir()
+    assert sentinel.read_text(encoding="utf-8") == "keep\n"
+
+
+def test_restore_entry_from_rejects_untrusted_source_paths(tmp_path):
+    service = RunService(tmp_path / "results")
+    entry = _published_entry(service)
+    transaction = service.prepare_trash_transaction("f" * 32)
+    source = _trash_destination(transaction, entry)
+    service.move_entry_to(entry, source)
+    outside = tmp_path / "browser-selected-path"
+    shutil.copytree(source, outside)
+    candidates = [
+        outside,
+        transaction,
+        source / "extra",
+        transaction / "runs" / "other" / "default" / source.name,
+        source.parent / "alias" / ".." / source.name,
+        Path(".trash") / ("f" * 32) / "runs" / "chicago" / "default" / source.name,
+    ]
+
+    for candidate in candidates:
+        with pytest.raises(
+            (FileNotFoundError, ValueError),
+            match="source|transaction|absolute|outside|shape|traversal",
+        ):
+            service.restore_entry_from(candidate, entry)
+        assert source.is_dir()
+        assert not entry.run_dir.exists()
+
+
+def test_restore_entry_from_rejects_manifest_mismatch(tmp_path):
+    service = RunService(tmp_path / "results")
+    entry = _published_entry(service)
+    transaction = service.prepare_trash_transaction("f" * 32)
+    source = _trash_destination(transaction, entry)
+    service.move_entry_to(entry, source)
+    manifest_path = source / "run.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["metadata"]["label"] = "tampered in trash"
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="manifest|snapshot|changed"):
+        service.restore_entry_from(source, entry)
+
+    assert source.is_dir()
+    assert not entry.run_dir.exists()
+
+
+def test_restore_entry_from_rejects_untrusted_snapshot_destination(tmp_path):
+    service = RunService(tmp_path / "results")
+    entry = _published_entry(service)
+    transaction = service.prepare_trash_transaction("f" * 32)
+    source = _trash_destination(transaction, entry)
+    service.move_entry_to(entry, source)
+    forged = object.__new__(RunEntry)
+    object.__setattr__(forged, "root", entry.root)
+    object.__setattr__(forged, "run_dir", tmp_path / "browser-restore-target")
+    object.__setattr__(forged, "record", entry.record)
+
+    with pytest.raises(ValueError, match="destination|path|snapshot|entry"):
+        service.restore_entry_from(source, forged)
+
+    assert source.is_dir()
+    assert not (tmp_path / "browser-restore-target").exists()
+
+
+def test_restore_entry_from_rejects_redirected_destination_ancestor(
+    tmp_path,
+    monkeypatch,
+):
+    service = RunService(tmp_path / "results")
+    entry = _published_entry(service)
+    transaction = service.prepare_trash_transaction("f" * 32)
+    source = _trash_destination(transaction, entry)
+    service.move_entry_to(entry, source)
+    redirected = entry.run_dir.parent
+    original = run_module._is_redirected_path
+    monkeypatch.setattr(
+        run_module,
+        "_is_redirected_path",
+        lambda path: Path(path) == redirected or original(Path(path)),
+    )
+
+    with pytest.raises(ValueError, match="redirected|destination|path"):
+        service.restore_entry_from(source, entry)
+
+    assert source.is_dir()
+    assert not entry.run_dir.exists()
+
+
+def test_remove_trash_transaction_removes_only_exact_transaction(tmp_path):
+    service = RunService(tmp_path / "results")
+    target = service.prepare_trash_transaction("f" * 32)
+    other = service.prepare_trash_transaction("e" * 32)
+    (target / "payload.txt").write_text("remove\n", encoding="utf-8")
+    sentinel = other / "keep.txt"
+    sentinel.write_text("keep\n", encoding="utf-8")
+
+    service.remove_trash_transaction("f" * 32)
+
+    assert not target.exists()
+    assert sentinel.read_text(encoding="utf-8") == "keep\n"
+    assert service.output_root.is_dir()
+    assert (service.output_root / ".trash").is_dir()
+
+
+@pytest.mark.parametrize(
+    "untrusted_target",
+    [
+        ".",
+        ".trash",
+        "../results",
+        "f" * 32 + "/runs",
+        "C:/Users/example/Documents",
+        Path("f" * 32),
+        None,
+    ],
+)
+def test_remove_trash_transaction_rejects_recursive_user_targets(
+    tmp_path,
+    monkeypatch,
+    untrusted_target,
+):
+    service = RunService(tmp_path / "results")
+    service.prepare_trash_transaction("f" * 32)
+    calls = []
+    monkeypatch.setattr(shutil, "rmtree", lambda path: calls.append(Path(path)))
+
+    with pytest.raises(ValueError, match="32 lowercase hexadecimal"):
+        service.remove_trash_transaction(untrusted_target)
+
+    assert calls == []
+
+
+def test_remove_trash_transaction_rejects_absent_exact_target(tmp_path):
+    service = RunService(tmp_path / "results")
+    service.prepare_trash_transaction("f" * 32)
+
+    with pytest.raises(FileNotFoundError, match="trash transaction"):
+        service.remove_trash_transaction("e" * 32)
+
+    assert (service.output_root / ".trash").is_dir()
+
+
+def test_remove_trash_transaction_rejects_redirect_to_another_transaction(
+    tmp_path,
+):
+    service = RunService(tmp_path / "results")
+    trash_root = service.output_root / ".trash"
+    trash_root.mkdir(parents=True)
+    other = trash_root / ("e" * 32)
+    other.mkdir()
+    sentinel = other / "keep.txt"
+    sentinel.write_text("keep\n", encoding="utf-8")
+    _symlink_or_skip(trash_root / ("f" * 32), other, directory=True)
+
+    with pytest.raises(ValueError, match="redirected|transaction|path"):
+        service.remove_trash_transaction("f" * 32)
+
+    assert sentinel.read_text(encoding="utf-8") == "keep\n"
 
 
 
