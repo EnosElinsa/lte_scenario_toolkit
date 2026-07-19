@@ -295,6 +295,89 @@ def test_finalization_write_failure_rolls_back_entire_family(tmp_path, monkeypat
     assert not (parent.root / ".trash" / plan.transaction_id).exists()
 
 
+def test_durable_errors_never_include_exception_paths(tmp_path, monkeypatch):
+    manager, parent, child = manager_for_two_run_family(tmp_path)
+    plan = manager.plan(RunIdentity.from_entry(parent))
+    sentinel = str((tmp_path / "private" / "sentinel.txt").resolve())
+    real_move = manager._move_member
+    calls = 0
+
+    def fail_second(member, portions):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError(f"rename failed at {sentinel}")
+        return real_move(member, portions)
+
+    monkeypatch.setattr(manager, "_move_member", fail_second)
+    monkeypatch.setattr(
+        manager,
+        "_restore_member",
+        lambda member, portions: (_ for _ in ()).throw(
+            PermissionError(f"restore denied at {sentinel}")
+        ),
+    )
+
+    with pytest.raises(run_trash_module.TrashTransactionError, match="recovery"):
+        manager.move(plan)
+
+    journal_path = parent.root / ".trash" / plan.transaction_id / "trash.json"
+    journal_text = journal_path.read_text(encoding="utf-8")
+    journal = json.loads(journal_text)
+    transaction = (
+        run_trash_module.TrashManager(
+            lambda: (parent.root,),
+            RunUsageLeaseRegistry(),
+        )
+        .snapshot()
+        .transactions[0]
+    )
+    assert sentinel not in journal_text
+    assert all(sentinel not in error for error in journal["errors"])
+    assert all(sentinel not in error for error in transaction.errors)
+    assert transaction.errors == ("move:OSError", "rollback:PermissionError")
+
+
+def test_rollback_stops_at_first_reverse_restore_failure(tmp_path, monkeypatch):
+    manager, parent, child, grandchild = manager_for_three_run_family(tmp_path)
+    plan = manager.plan(RunIdentity.from_entry(parent))
+    real_write = manager._write_portions
+    real_restore = manager._restore_member
+    restore_calls = []
+    failed_finalization = False
+
+    def fail_finalization(*args, **kwargs):
+        nonlocal failed_finalization
+        if not failed_finalization and kwargs.get("state") is run_trash_module.TrashState.TRASHED:
+            failed_finalization = True
+            raise OSError("simulated finalization failure")
+        return real_write(*args, **kwargs)
+
+    def fail_first_restore(member, portions):
+        restore_calls.append(member.identity.run_id)
+        if len(restore_calls) == 1:
+            raise OSError("simulated first rollback failure")
+        return real_restore(member, portions)
+
+    monkeypatch.setattr(manager, "_write_portions", fail_finalization)
+    monkeypatch.setattr(manager, "_restore_member", fail_first_restore)
+
+    with pytest.raises(run_trash_module.TrashTransactionError, match="recovery"):
+        manager.move(plan)
+
+    assert restore_calls == [parent.run_id]
+    journal = json.loads(
+        (parent.root / ".trash" / plan.transaction_id / "trash.json").read_text(encoding="utf-8")
+    )
+    assert journal["completed_restore_ids"] == []
+    discovery = run_trash_module.TrashManager(
+        lambda: (parent.root,),
+        RunUsageLeaseRegistry(),
+    ).snapshot()
+    assert discovery.diagnostics == ()
+    assert discovery.transactions[0].state is run_trash_module.TrashState.RECOVERY_REQUIRED
+
+
 def test_empty_parent_cleanup_failure_is_harmless(tmp_path, monkeypatch):
     manager, parent, child = manager_for_two_run_family(tmp_path)
     plan = manager.plan(RunIdentity.from_entry(parent))
@@ -405,6 +488,70 @@ def test_snapshot_merges_one_cross_root_transaction(tmp_path):
         assert len(journal["expected_roots"]) == 2
 
 
+@pytest.mark.parametrize("transition", ["progress", "state"])
+def test_cross_root_one_write_ahead_reconciles_and_recovers(tmp_path, transition):
+    manager, parent, child = manager_for_cross_root_family(tmp_path)
+    moved = manager.move(manager.plan(RunIdentity.from_entry(parent)))
+    move_ids = [member.identity.run_id for member in moved.members]
+    journals = [root / ".trash" / moved.transaction_id / "trash.json" for root in moved.roots]
+    documents = [json.loads(path.read_text(encoding="utf-8")) for path in journals]
+    if transition == "progress":
+        for document in documents:
+            document["state"] = "moving"
+        documents[0]["completed_move_ids"] = []
+        documents[1]["completed_move_ids"] = move_ids[:1]
+        expected_moves = tuple(move_ids[:1])
+    else:
+        documents[0]["state"] = "moving"
+        documents[1]["state"] = "trashed"
+        expected_moves = tuple(move_ids)
+    documents[0]["errors"] = ["move:OSError"]
+    documents[1]["errors"] = ["rollback:PermissionError", "move:OSError"]
+    for path, document in zip(journals, documents, strict=True):
+        run_trash_module.atomic_write_json(path, document)
+
+    recovering = run_trash_module.TrashManager(
+        lambda: (child.root, parent.root),
+        RunUsageLeaseRegistry(),
+    )
+    discovery = recovering.snapshot()
+
+    assert discovery.diagnostics == ()
+    assert len(discovery.transactions) == 1
+    transaction = discovery.transactions[0]
+    assert transaction.state is run_trash_module.TrashState.RECOVERY_REQUIRED
+    assert transaction.completed_move_ids == expected_moves
+    assert transaction.errors == ("move:OSError", "rollback:PermissionError")
+
+    recovering.recover(moved.transaction_id)
+
+    assert parent.run_dir.is_dir()
+    assert child.run_dir.is_dir()
+    assert recovering.snapshot().transactions == ()
+
+
+def test_cross_root_divergent_progress_remains_diagnostic(tmp_path):
+    manager, parent, child = manager_for_cross_root_family(tmp_path)
+    moved = manager.move(manager.plan(RunIdentity.from_entry(parent)))
+    move_ids = [member.identity.run_id for member in moved.members]
+    journals = [root / ".trash" / moved.transaction_id / "trash.json" for root in moved.roots]
+    documents = [json.loads(path.read_text(encoding="utf-8")) for path in journals]
+    for document in documents:
+        document["state"] = "moving"
+    documents[0]["completed_move_ids"] = move_ids[:1]
+    documents[1]["completed_move_ids"] = move_ids[1:]
+    for path, document in zip(journals, documents, strict=True):
+        run_trash_module.atomic_write_json(path, document)
+
+    discovery = run_trash_module.TrashManager(
+        lambda: (child.root, parent.root),
+        RunUsageLeaseRegistry(),
+    ).snapshot()
+
+    assert discovery.transactions == ()
+    assert discovery.diagnostics
+
+
 def test_rollback_failure_is_discoverable_as_recovery_required(
     tmp_path,
     monkeypatch,
@@ -439,8 +586,7 @@ def test_rollback_failure_is_discoverable_as_recovery_required(
     assert len(discovery.transactions) == 1
     transaction = discovery.transactions[0]
     assert transaction.state is run_trash_module.TrashState.RECOVERY_REQUIRED
-    assert any("original failure" in error for error in transaction.errors)
-    assert any("rollback failure" in error for error in transaction.errors)
+    assert transaction.errors == ("move:OSError", "rollback:OSError")
     assert parent.run_dir.is_dir()
     assert not child.run_dir.exists()
 

@@ -691,6 +691,7 @@ def build_trash_plan(
 _TRANSACTION_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
 _ROOT_DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
 _MANIFEST_DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
+_DURABLE_ERROR_PATTERN = re.compile(r"[a-z][a-z0-9_]*:[A-Za-z_][A-Za-z0-9_]*")
 _PORTION_FIELDS = frozenset(
     {
         "schema_version",
@@ -752,18 +753,14 @@ class _TrashPortion:
     total_size_bytes: int
     errors: tuple[str, ...]
 
-    def shared_contract(self) -> tuple[Any, ...]:
+    def immutable_contract(self) -> tuple[Any, ...]:
         return (
             self.transaction_id,
             self.deleted_at,
-            self.state,
             self.selected,
             self.expected_root_digests,
             self.edges,
-            self.completed_move_ids,
-            self.completed_restore_ids,
             self.total_size_bytes,
-            self.errors,
         )
 
 
@@ -1120,9 +1117,10 @@ def _deserialise_portion(
         raise ValueError("trash journal total size is invalid")
     errors_value = payload["errors"]
     if type(errors_value) is not list or any(
-        type(item) is not str or not item for item in errors_value
+        type(item) is not str or _DURABLE_ERROR_PATTERN.fullmatch(item) is None
+        for item in errors_value
     ):
-        raise ValueError("trash journal errors must be nonempty strings")
+        raise ValueError("trash journal errors must be machine-safe phase and type codes")
     return _TrashPortion(
         root=root,
         transaction_path=transaction_path,
@@ -1248,12 +1246,53 @@ def _validate_transaction_progress(
         raise ValueError("trash state has invalid completed restore IDs")
 
 
+def _reconcile_mutable_portions(
+    portions: tuple[_TrashPortion, ...],
+    members: tuple[TrashMember, ...],
+) -> tuple[TrashState, tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    for portion in portions:
+        _validate_transaction_progress(
+            portion.state,
+            members,
+            portion.completed_move_ids,
+            portion.completed_restore_ids,
+        )
+    move_ids = max(
+        (portion.completed_move_ids for portion in portions),
+        key=len,
+    )
+    if any(ids != move_ids[: len(ids)] for ids in (p.completed_move_ids for p in portions)):
+        raise ValueError("trash completed move progress diverges across portions")
+    restore_order = tuple(reversed(move_ids))
+    restore_ids = max(
+        (portion.completed_restore_ids for portion in portions),
+        key=len,
+    )
+    if any(
+        ids != restore_order[: len(ids)]
+        for ids in (portion.completed_restore_ids for portion in portions)
+    ):
+        raise ValueError("trash completed restore progress diverges across portions")
+
+    states = frozenset(portion.state for portion in portions)
+    if len(states) == 1:
+        state = next(iter(states))
+    elif states == {TrashState.MOVING, TrashState.TRASHED}:
+        state = TrashState.MOVING
+    elif states == {TrashState.RESTORING, TrashState.TRASHED}:
+        state = TrashState.RESTORING
+    else:
+        raise ValueError("trash transaction states diverge across portions")
+    errors = tuple(sorted({error for portion in portions for error in portion.errors}))
+    return state, move_ids, restore_ids, errors
+
+
 def _merge_portions(portions: Iterable[_TrashPortion]) -> TrashTransaction:
     values = tuple(portions)
     if not values:
         raise ValueError("trash transaction has no portions")
     first = values[0]
-    if any(portion.shared_contract() != first.shared_contract() for portion in values[1:]):
+    if any(portion.immutable_contract() != first.immutable_contract() for portion in values[1:]):
         raise ValueError("trash transaction portions disagree")
     roots_by_digest = {_root_digest(portion.root): portion.root for portion in values}
     if len(roots_by_digest) != len(values):
@@ -1271,16 +1310,13 @@ def _merge_portions(portions: Iterable[_TrashPortion]) -> TrashTransaction:
             raise ValueError("trash root-local members are unordered or incomplete")
     if sum(member.size_bytes for member in members) != first.total_size_bytes:
         raise ValueError("trash transaction member sizes disagree with the total")
-    _validate_transaction_progress(
-        first.state,
-        members,
-        first.completed_move_ids,
-        first.completed_restore_ids,
+    state, completed_move_ids, completed_restore_ids, errors = _reconcile_mutable_portions(
+        values, members
     )
     public_state = (
         TrashState.RECOVERY_REQUIRED
-        if first.state in {TrashState.MOVING, TrashState.RESTORING}
-        else first.state
+        if state in {TrashState.MOVING, TrashState.RESTORING}
+        else state
     )
     roots = tuple(sorted((portion.root for portion in values), key=_canonical_path_key))
     return TrashTransaction(
@@ -1290,10 +1326,10 @@ def _merge_portions(portions: Iterable[_TrashPortion]) -> TrashTransaction:
         roots=roots,
         state=public_state,
         deleted_at=first.deleted_at,
-        completed_move_ids=first.completed_move_ids,
-        completed_restore_ids=first.completed_restore_ids,
+        completed_move_ids=completed_move_ids,
+        completed_restore_ids=completed_restore_ids,
         total_size_bytes=first.total_size_bytes,
-        errors=first.errors,
+        errors=errors,
     )
 
 
@@ -1528,7 +1564,8 @@ class TrashManager:
 
     @staticmethod
     def _error_detail(prefix: str, error: BaseException) -> str:
-        return f"{prefix}: {type(error).__name__}: {error}"
+        phase = re.sub(r"[^a-z0-9]+", "_", prefix.casefold()).strip("_")
+        return f"{phase}:{type(error).__name__}"
 
     @staticmethod
     def _cleanup_live_parents(members: Iterable[TrashMember]) -> None:
@@ -1620,7 +1657,7 @@ class TrashManager:
                         restored.append(member)
                     except BaseException as rollback_error:
                         rollback_errors.append(self._error_detail("rollback", rollback_error))
-                        continue
+                        break
                     try:
                         self._write_portions(
                             current,
@@ -1635,6 +1672,7 @@ class TrashManager:
                         rollback_errors.append(
                             self._error_detail("rollback journal", journal_error)
                         )
+                        break
 
                 if not rollback_errors and len(restored) == len(completed):
                     try:
@@ -1881,7 +1919,7 @@ class TrashManager:
         portions, transaction = self._load_transaction_portions(transaction_id)
         if not portions:
             return transaction
-        raw_state = portions[0].state
+        raw_state, _, _, _ = _reconcile_mutable_portions(portions, transaction.members)
         if raw_state is TrashState.TRASHED:
             return transaction
         if raw_state not in {TrashState.MOVING, TrashState.RESTORING}:
