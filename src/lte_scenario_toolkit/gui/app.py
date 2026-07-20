@@ -12,7 +12,7 @@ import os
 import stat
 import sys
 from collections import OrderedDict
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -69,9 +69,17 @@ from .pages.history import (
     render_trash_page,
 )
 from .pages.scenarios import (
+    ScenarioCatalogView,
     get_job_coordinator,
+    render_scenario_preview_results,
     render_scenarios_page,
+    scenario_preview_requests,
     shutdown_job_coordinator,
+)
+from .scenario_previews import (
+    ScenarioPreviewRequest,
+    ScenarioPreviewResult,
+    build_scenario_previews,
 )
 from .settings import GuiSettingsError, GuiSettingsStore
 
@@ -220,6 +228,36 @@ def client_is_deleted(client: Any) -> bool:
         # keeps late worker completions from enqueueing messages to a dead
         # websocket.
         return True
+
+
+async def load_scenario_previews(
+    *,
+    client: Any,
+    holder: Any,
+    requests: Any,
+    cache_root: Path,
+    builder: Callable[..., Any],
+    render: Callable[[Any], Any],
+    cpu_bound: Callable[..., Any] | None = None,
+    is_current: Callable[[], bool] = lambda: True,
+) -> Any:
+    """Build catalog covers off-loop and mutate only the originating holder."""
+
+    if cpu_bound is None:
+        from nicegui import run
+
+        cpu_bound = run.cpu_bound
+    await client.connected()
+    if client_is_deleted(client) or not is_current():
+        return None
+    previews = await cpu_bound(builder, requests, cache_root)
+    if client_is_deleted(client) or not is_current():
+        return None
+    holder.clear()
+    rendered = render(previews)
+    if inspect.isawaitable(rendered):
+        await rendered
+    return previews
 
 
 async def run_trash_mutation(
@@ -706,6 +744,21 @@ def _resolve_allowlisted_file(
     raise ValueError(f"{label} is outside the allowlisted roots")
 
 
+def _resolve_scenario_preview_file(
+    path: str | os.PathLike[str],
+    repo_root: str | os.PathLike[str],
+) -> Path:
+    """Resolve one generated catalog cover from its dedicated PNG cache."""
+
+    root = Path(repo_root).expanduser().resolve(strict=True)
+    return _resolve_allowlisted_file(
+        path,
+        roots=(root / ".lte-data" / "cache" / "scenario-previews",),
+        suffixes=(".png",),
+        label="scenario preview asset",
+    )
+
+
 def create_app(
     catalog: DataCatalog | None = None,
     testing: bool = False,
@@ -724,6 +777,10 @@ def create_app(
     candidate_style_asset_builder: Callable[[CandidateSession, Any], Any]
     | None = None,
     online_tile_probe: Callable[[], bool] | None = None,
+    scenario_preview_builder: Callable[
+        [tuple[ScenarioPreviewRequest, ...], Path], list[ScenarioPreviewResult]
+    ]
+    | None = None,
     figure_source_options_provider: Callable[[], Mapping[str, str]] | None = None,
     trash_manager: TrashManager | None = None,
     usage_leases: RunUsageLeaseRegistry | None = None,
@@ -741,6 +798,8 @@ def create_app(
         raise ValueError("usage_leases must be a RunUsageLeaseRegistry")
     if trash_manager is not None and not isinstance(trash_manager, TrashManager):
         raise ValueError("trash_manager must be a TrashManager")
+    if scenario_preview_builder is not None and not callable(scenario_preview_builder):
+        raise ValueError("scenario_preview_builder must be callable")
     manager_leases = (
         None if trash_manager is None else getattr(trash_manager, "_leases", None)
     )
@@ -777,7 +836,9 @@ def create_app(
     ephemeral_roots_lock = Lock()
     map_assets = MapAssetService(repo_root)
     bundle_builder = candidate_bundle_builder or build_candidate_map_bundle
+    scenario_builder = scenario_preview_builder or build_scenario_previews
     static_asset_urls: dict[Path, str] = {}
+    scenario_preview_asset_urls: dict[Path, str] = {}
 
     if hasattr(app, "on_shutdown"):
         if uses_shared_coordinator:
@@ -864,6 +925,23 @@ def create_app(
             max_cache_age=3600,
         )
         static_asset_urls[resolved] = url
+        return url
+
+    def scenario_preview_asset_url(path: Path) -> str:
+        resolved = _resolve_scenario_preview_file(path, repo_root)
+        existing = scenario_preview_asset_urls.get(resolved)
+        if existing is not None:
+            return existing
+        url = app.add_static_file(
+            local_file=resolved,
+            url_path=(
+                f"/_scenario_preview_assets/"
+                f"{len(scenario_preview_asset_urls):08x}.png"
+            ),
+            strict=True,
+            max_cache_age=3600,
+        )
+        scenario_preview_asset_urls[resolved] = url
         return url
 
     def remember_output_root(root: str | os.PathLike[str]) -> None:
@@ -1694,31 +1772,74 @@ def create_app(
             ),
         )
 
-    @ui.page("/scenarios", **page_options)
-    def scenarios() -> None:
-        render_shell(
-            "/scenarios",
-            "nav.scenarios",
-            lambda translator: render_scenarios_page(
+    scenario_deliveries: dict[int, object] = {}
+
+    async def render_scenario_catalog() -> None:
+        view: ScenarioCatalogView | None = None
+
+        def catalog_body(translator: Translator) -> ScenarioCatalogView:
+            nonlocal view
+            view = render_scenarios_page(
                 ui,
                 translator,
                 runtime.catalog,
                 coordinator=runtime.coordinator,
-            ),
-        )
+            )
+            return view
+
+        render_shell("/scenarios", "nav.scenarios", catalog_body)
+        assert view is not None
+        client = ui.context.client
+        delivery_key = id(client)
+        delivery_token = object()
+        scenario_deliveries[delivery_key] = delivery_token
+
+        def is_current() -> bool:
+            return scenario_deliveries.get(delivery_key) is delivery_token
+
+        def render_results(results: Any) -> None:
+            render_scenario_preview_results(
+                view,
+                results if isinstance(results, Sequence) else (),
+                scenario_preview_asset_url,
+            )
+
+        try:
+            try:
+                requests = scenario_preview_requests(runtime.catalog)
+            except Exception:
+                await client.connected()
+                if not client_is_deleted(client) and is_current():
+                    view.clear()
+                    render_results(())
+                return
+            try:
+                await load_scenario_previews(
+                    client=client,
+                    holder=view,
+                    requests=requests,
+                    cache_root=(
+                        repo_root / ".lte-data" / "cache" / "scenario-previews"
+                    ),
+                    builder=scenario_builder,
+                    render=render_results,
+                    is_current=is_current,
+                )
+            except Exception:
+                if not client_is_deleted(client) and is_current():
+                    view.clear()
+                    render_results(())
+        finally:
+            if is_current():
+                scenario_deliveries.pop(delivery_key, None)
+
+    @ui.page("/scenarios", **page_options)
+    async def scenarios() -> None:
+        await render_scenario_catalog()
 
     @ui.page("/", **page_options)
-    def index() -> None:
-        render_shell(
-            "/scenarios",
-            "nav.scenarios",
-            lambda translator: render_scenarios_page(
-                ui,
-                translator,
-                runtime.catalog,
-                coordinator=runtime.coordinator,
-            ),
-        )
+    async def index() -> None:
+        await render_scenario_catalog()
 
     return app
 

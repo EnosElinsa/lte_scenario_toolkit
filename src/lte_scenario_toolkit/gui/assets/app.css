@@ -432,6 +432,11 @@ h3,
   gap: var(--lte-space-4);
 }
 
+.lte-scenario-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  max-width: 100%;
+}
+
 .lte-scenario-card,
 .lte-guidance-card,
 .lte-form-card,
@@ -514,7 +519,113 @@ h3,
   width: 100%;
   align-self: stretch;
   gap: var(--lte-space-3);
+  overflow: hidden;
   border-top: 3px solid var(--lte-frame);
+}
+
+.lte-scenario-cover-holder,
+.lte-scenario-cover {
+  width: 100%;
+  min-width: 0;
+}
+
+.lte-scenario-cover {
+  position: relative;
+  aspect-ratio: 19 / 9;
+  overflow: hidden;
+  background: #e9ece8;
+  border: 1px solid var(--lte-border);
+  border-radius: var(--lte-radius-sm);
+}
+
+.lte-scenario-cover__image {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.lte-scenario-cover__skeleton {
+  width: 100%;
+  height: 100%;
+  background:
+    linear-gradient(100deg, transparent 35%, rgb(255 255 255 / 58%) 50%, transparent 65%),
+    linear-gradient(rgb(11 48 50 / 4%) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(11 48 50 / 4%) 1px, transparent 1px),
+    #e9ece8;
+  background-size: 220% 100%, 28px 28px, 28px 28px, auto;
+  animation: lte-preview-skeleton 1.4s ease-in-out infinite;
+}
+
+.lte-scenario-cover__fallback {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  color: #7e8d8b;
+  font-size: 42px;
+}
+
+.lte-scenario-cover__kind {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  padding: 4px 8px;
+  color: #fff;
+  background: rgb(11 48 50 / 84%);
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.lte-scenario-cover__diagnostic {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  left: 8px;
+  max-height: 38px;
+  padding: 4px 7px;
+  overflow: hidden;
+  color: #fff;
+  background: rgb(85 45 32 / 82%);
+  border-radius: 6px;
+  font-size: 10px;
+  line-height: 15px;
+}
+
+.lte-scenario-dataset-summary,
+.lte-scenario-next-step {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  color: var(--lte-ink-muted);
+  font-size: 11px;
+}
+
+.lte-scenario-support-row {
+  justify-content: flex-end;
+  width: 100%;
+  margin-top: auto;
+}
+
+.lte-scenario-card > .lte-action-bar .q-btn {
+  width: 100%;
+}
+
+.lte-page-breadcrumb {
+  color: var(--lte-ink-muted);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.lte-scenario-inspector__content {
+  gap: var(--lte-space-3);
+}
+
+@keyframes lte-preview-skeleton {
+  from { background-position: 140% 0, 0 0, 0 0, 0 0; }
+  to { background-position: -100% 0, 0 0, 0 0, 0 0; }
 }
 
 .lte-card-title,
@@ -1211,6 +1322,7 @@ button:disabled,
 }
 
 @media (max-width: 980px) {
+  .lte-scenario-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .lte-command-bar {
     padding-right: max(16px, env(safe-area-inset-right));
     padding-left: max(16px, env(safe-area-inset-left));

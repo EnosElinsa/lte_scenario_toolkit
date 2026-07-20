@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import os
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Lock
 from typing import Any
 
@@ -11,12 +13,16 @@ from ...data_validation import validate_scenario_data
 from ...jobs import Job, JobBusyError, JobCoordinator
 from ..presentation import (
     ActionSpec,
+    MenuActionSpec,
     readiness_presentation,
     render_action_bar,
+    render_inspector_drawer,
+    render_overflow_menu,
     render_page_header,
     render_status_badge,
     render_technical_details,
 )
+from ..scenario_previews import ScenarioPreviewRequest, ScenarioPreviewResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +67,22 @@ class ValidationJobUpdate:
     done: bool
     result: ValidationResult | None = None
     error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ScenarioCatalogView:
+    """Live cover holders for one rendered scenario catalog."""
+
+    ui: Any
+    translator: Any
+    cards: tuple[ScenarioCard, ...]
+    preview_holders: tuple[Any, ...]
+
+    def clear(self) -> None:
+        """Clear only preview covers, preserving the shell and catalog controls."""
+
+        for holder in self.preview_holders:
+            holder.clear()
 
 
 _JOB_COORDINATOR: JobCoordinator | None = None
@@ -117,6 +139,44 @@ def scenario_cards(catalog: Any) -> tuple[ScenarioCard, ...]:
             )
         )
     return tuple(cards)
+
+
+def _catalog_preview_path(root: Path, value: object, label: str) -> Path:
+    if not isinstance(value, (str, os.PathLike)) or isinstance(value, bytes):
+        raise ValueError(f"{label} must be a repository-local path")
+    text = os.fspath(value)
+    if not isinstance(text, str) or "://" in text or "\x00" in text:
+        raise ValueError(f"{label} must be a repository-local path")
+    raw = Path(text).expanduser()
+    if ".." in raw.parts:
+        raise ValueError(f"{label} must not contain traversal components")
+    candidate = raw if raw.is_absolute() else root / raw
+    candidate = candidate.resolve(strict=False)
+    if not candidate.is_relative_to(root):
+        raise ValueError(f"{label} must stay inside the repository")
+    return candidate
+
+
+def scenario_preview_requests(catalog: Any) -> tuple[ScenarioPreviewRequest, ...]:
+    """Map declared catalog scenarios to repository-bounded preview requests."""
+
+    root = Path(catalog.root).expanduser().resolve(strict=True)
+    requests: list[ScenarioPreviewRequest] = []
+    for card in scenario_cards(catalog):
+        requests.append(
+            ScenarioPreviewRequest(
+                card.scenario_id,
+                card.display_name,
+                _catalog_preview_path(root, card.boundary_entrypoint, "boundary"),
+                allowed_root=root,
+                dem_path=(
+                    None
+                    if card.dem_entrypoint is None
+                    else _catalog_preview_path(root, card.dem_entrypoint, "DEM")
+                ),
+            )
+        )
+    return tuple(requests)
 
 
 def run_validation(
@@ -232,8 +292,8 @@ def render_scenarios_page(
     catalog: Any,
     *,
     coordinator: JobCoordinator | None = None,
-) -> None:
-    """Render scenario cards while keeping all worker code outside NiceGUI."""
+) -> ScenarioCatalogView:
+    """Render a map-first catalog and return its isolated preview holders."""
 
     active_coordinator = (
         get_job_coordinator() if coordinator is None else coordinator
@@ -241,11 +301,109 @@ def render_scenarios_page(
     cards = scenario_cards(catalog)
     ready_count = sum(card.can_run for card in cards)
     preparation_count = len(cards) - ready_count
+    preview_holders: list[Any] = []
+    inspector_content: Any | None = None
+    drawer: Any | None = None
+
+    def inspector_body() -> None:
+        nonlocal inspector_content
+        inspector_content = ui.column().classes(
+            "lte-scenario-inspector__content full-width"
+        )
+
+    def show_inspector(
+        card: ScenarioCard,
+        section: str,
+        *,
+        result: ValidationResult | None = None,
+        error: str | None = None,
+    ) -> None:
+        assert inspector_content is not None
+        assert drawer is not None
+        inspector_content.clear()
+        status = readiness_presentation(card.status)
+        with inspector_content:
+            with ui.row().classes("items-center justify-between no-wrap full-width"):
+                ui.label(card.display_name).classes("lte-card-title")
+                ui.button(
+                    icon="close",
+                    on_click=drawer.hide,
+                ).props(
+                    f'flat round aria-label="{translator.text("action.close")}"'
+                )
+            render_status_badge(ui, translator, status)
+            ui.label(
+                translator.text(
+                    "dataset.boundary",
+                    dataset_id=card.boundary_dataset_id,
+                    path=card.boundary_entrypoint,
+                )
+            ).classes("lte-technical-copy")
+            ui.label(
+                translator.text(
+                    "dataset.dem",
+                    dataset_id=card.dem_dataset_id or translator.text("value.none"),
+                    path=card.dem_entrypoint or translator.text("value.none"),
+                )
+            ).classes("lte-technical-copy")
+            ui.label(
+                translator.text(
+                    "dataset.profile",
+                    path=card.default_profile_path or translator.text("value.none"),
+                )
+            ).classes("lte-technical-copy")
+            if section == "commands":
+                ui.label(translator.text("guidance.commands")).classes(
+                    "lte-section-title"
+                )
+                ui.label(translator.text("guidance.replace_path")).classes(
+                    "lte-setup-guidance"
+                )
+                for command in (
+                    f"lte-data validate {card.scenario_id}",
+                    f"lte-data validate {card.scenario_id} --full-checksum",
+                    f"lte-data dem export {card.scenario_id} --dry-run",
+                    f"lte-data dem ingest {card.scenario_id} --tiles-dir '<path>'",
+                ):
+                    ui.code(command, language="powershell").classes("lte-cli-guidance")
+            elif section == "validation":
+                if result is not None:
+                    _render_validation_result(ui, translator, result)
+                elif error is not None:
+                    ui.label(translator.text("validation.failed")).classes(
+                        "lte-validation-result lte-validation-result--error"
+                    )
+                    ui.label(error).classes("lte-validation-message")
+                else:
+                    ui.spinner(size="sm")
+                    ui.label(translator.text("validation.running")).props(
+                        'role="status" aria-live="polite"'
+                    )
+            ui.label(
+                translator.text(
+                    "scenarios.next_step.ready"
+                    if card.can_run
+                    else "scenarios.next_step.preparation"
+                )
+            ).classes("lte-scenario-next-step")
+        drawer.show()
+
     with ui.column().classes("lte-page lte-scenarios-page"):
+        ui.label(translator.text("scenarios.breadcrumb")).classes(
+            "lte-page-breadcrumb"
+        )
         render_page_header(
             ui,
             translator.text("scenarios.title"),
             translator.text("scenarios.subtitle"),
+            actions=(
+                ActionSpec(
+                    "refresh",
+                    translator.text("action.refresh"),
+                    ui.navigate.reload,
+                    marker="scenarios-refresh",
+                ),
+            ),
         )
         with ui.card().classes("lte-summary-strip").mark("scenarios-summary"):
             ui.label(translator.text("scenarios.summary")).classes(
@@ -274,9 +432,26 @@ def render_scenarios_page(
                             marker
                         )
                         ui.label(label).classes("lte-summary-metric__label")
-        with ui.row().classes("lte-card-grid"):
+        drawer = render_inspector_drawer(
+            ui,
+            translator.text("scenarios.inspector.title"),
+            inspector_body,
+            marker="scenario-inspector",
+        )
+        with ui.element("div").classes("lte-card-grid lte-scenario-grid").mark(
+            "scenarios-grid"
+        ):
             for card in cards:
-                _render_scenario_card(ui, translator, catalog, card, active_coordinator)
+                preview_holders.append(
+                    _render_scenario_card(
+                        ui,
+                        translator,
+                        catalog,
+                        card,
+                        active_coordinator,
+                        show_inspector,
+                    )
+                )
 
         with ui.card().classes("lte-guidance-card"):
             ui.label(translator.text("guidance.title")).classes("lte-section-title")
@@ -291,6 +466,112 @@ def render_scenarios_page(
             ui.code("lte-data dem ingest --help", language="powershell").classes(
                 "lte-cli-guidance"
             )
+    return ScenarioCatalogView(
+        ui=ui,
+        translator=translator,
+        cards=cards,
+        preview_holders=tuple(preview_holders),
+    )
+
+
+def _render_preview_cover(
+    ui: Any,
+    translator: Any,
+    card: ScenarioCard,
+    result: ScenarioPreviewResult | None = None,
+    *,
+    asset_url: Callable[[Path], str] | None = None,
+    diagnostic: str | None = None,
+) -> None:
+    with ui.element("div").classes("lte-scenario-cover"):
+        if result is None:
+            ui.element("div").classes("lte-scenario-cover__skeleton").mark(
+                f"scenario-preview-loading-{card.scenario_id}"
+            ).props('role="status" aria-live="polite"')
+            kind_key = "scenarios.preview.loading"
+        else:
+            kind_key = f"scenarios.preview.{result.kind}"
+            try:
+                if asset_url is None:
+                    raise ValueError("preview asset URL is unavailable")
+                url = asset_url(result.path)
+                image = ui.image(url).classes("lte-scenario-cover__image").mark(
+                    f"scenario-preview-image-{card.scenario_id}"
+                )
+                image._props["alt"] = translator.text(
+                    "scenarios.preview.alt",
+                    scenario=card.display_name,
+                    kind=translator.text(kind_key),
+                )
+            except Exception as exc:
+                ui.icon("map").classes("lte-scenario-cover__fallback")
+                diagnostic = diagnostic or result.diagnostic or str(exc)
+                kind_key = "scenarios.preview.fallback"
+        ui.label(translator.text(kind_key)).classes(
+            "lte-scenario-cover__kind"
+        ).mark(f"scenario-preview-kind-{card.scenario_id}")
+        if diagnostic or (result is not None and result.diagnostic):
+            ui.label(diagnostic or result.diagnostic).classes(
+                "lte-scenario-cover__diagnostic"
+            ).props('role="status"')
+
+
+def render_scenario_preview_results(
+    view: ScenarioCatalogView,
+    results: Sequence[object],
+    asset_url: Callable[[Path], str],
+) -> None:
+    """Replace each cover independently so one bad result cannot block peers."""
+
+    for index, (card, holder) in enumerate(
+        zip(view.cards, view.preview_holders, strict=True)
+    ):
+        raw_result = results[index] if index < len(results) else None
+        result: ScenarioPreviewResult | None = None
+        try:
+            kind = raw_result.kind
+            path = raw_result.path
+            cache_hit = raw_result.cache_hit
+            diagnostic = raw_result.diagnostic
+            if kind not in {"terrain", "boundary", "fallback"}:
+                raise ValueError("invalid preview kind")
+            if not isinstance(path, (str, os.PathLike)) or isinstance(path, bytes):
+                raise ValueError("invalid preview path")
+            if type(cache_hit) is not bool:
+                raise ValueError("invalid preview cache flag")
+            if diagnostic is not None and not isinstance(diagnostic, str):
+                raise ValueError("invalid preview diagnostic")
+            result = ScenarioPreviewResult(
+                kind,
+                Path(path),
+                cache_hit,
+                diagnostic,
+            )
+        except (AttributeError, TypeError, ValueError):
+            pass
+        holder.clear()
+        with holder:
+            if result is not None:
+                _render_preview_cover(
+                    view.ui,
+                    view.translator,
+                    card,
+                    result,
+                    asset_url=asset_url,
+                )
+            else:
+                _render_preview_cover(
+                    view.ui,
+                    view.translator,
+                    card,
+                    ScenarioPreviewResult(
+                        "fallback",
+                        Path("missing-preview.png"),
+                        False,
+                        view.translator.text("scenarios.preview.failed"),
+                    ),
+                    asset_url=asset_url,
+                )
 
 
 def _render_scenario_card(
@@ -299,59 +580,46 @@ def _render_scenario_card(
     catalog: Any,
     card: ScenarioCard,
     coordinator: JobCoordinator,
-) -> None:
+    show_inspector: Callable[..., None],
+) -> Any:
     status = readiness_presentation(card.status)
     with ui.card().classes("lte-scenario-card").mark(
         f"scenario-card-{card.scenario_id}"
     ):
+        preview_holder = ui.element("div").classes(
+            "lte-scenario-cover-holder"
+        ).mark(f"scenario-preview-{card.scenario_id}")
+        with preview_holder:
+            _render_preview_cover(ui, translator, card)
         with ui.row().classes("items-center justify-between no-wrap full-width"):
             ui.label(card.display_name).classes("lte-card-title")
-            render_status_badge(
-                ui,
-                translator,
-                status,
-                marker=f"scenario-status-{card.scenario_id}",
-            )
+            with ui.row().classes("items-center no-wrap"):
+                render_status_badge(
+                    ui,
+                    translator,
+                    status,
+                    marker=f"scenario-status-{card.scenario_id}",
+                )
         if status.description_key is not None:
             ui.label(translator.text(status.description_key)).classes(
                 "lte-scenario-card__description"
             )
 
-        def render_dataset_details() -> None:
-            ui.label(card.scenario_id).classes("lte-card-id")
-            ui.label(
-                translator.text("technical.machine_status", status=card.status)
-            ).classes("lte-card-id")
-            ui.label(
-                translator.text(
-                    "dataset.boundary",
-                    dataset_id=card.boundary_dataset_id,
-                    path=card.boundary_entrypoint,
-                )
+        ui.label(
+            translator.text(
+                "scenarios.dataset_summary",
+                boundary=card.boundary_dataset_id,
+                dem=card.dem_dataset_id or translator.text("value.none"),
+                profile=(
+                    translator.text("scenarios.available")
+                    if card.default_profile_path
+                    else translator.text("scenarios.not_available")
+                ),
             )
-            ui.label(
-                translator.text(
-                    "dataset.dem",
-                    dataset_id=card.dem_dataset_id or translator.text("value.none"),
-                    path=card.dem_entrypoint or translator.text("value.none"),
-                )
-            )
-            ui.label(
-                translator.text(
-                    "dataset.profile",
-                    path=card.default_profile_path or translator.text("value.none"),
-                )
-            )
-
-        render_technical_details(
-            ui,
-            translator.text("dataset.details"),
-            render_dataset_details,
-            marker=f"scenario-technical-{card.scenario_id}",
-        )
-        validation_area = ui.column().classes("lte-validation-area full-width")
+        ).classes("lte-scenario-dataset-summary")
         validation_generation = {"value": 0}
         active_timer: dict[str, Any | None] = {"value": None}
+        menu_items: dict[str, Any] = {}
 
         def begin_validation_generation() -> int:
             previous = active_timer["value"]
@@ -359,7 +627,6 @@ def _render_scenario_card(
                 previous.deactivate()
                 active_timer["value"] = None
             validation_generation["value"] += 1
-            validation_area.clear()
             return validation_generation["value"]
 
         def validate_fast() -> None:
@@ -367,18 +634,14 @@ def _render_scenario_card(
             try:
                 result = run_validation(catalog, card.scenario_id)
             except Exception as exc:
-                with validation_area:
-                    ui.label(translator.text("validation.failed")).classes(
-                        "lte-validation-result lte-validation-result--error"
-                    )
-                    with ui.expansion(translator.text("validation.details")):
-                        ui.label(str(exc)).classes("lte-validation-message")
+                show_inspector(card, "validation", error=str(exc))
                 return
-            with validation_area:
-                _render_validation_result(ui, translator, result)
+            show_inspector(card, "validation", result=result)
 
         def validate_full() -> None:
             generation = begin_validation_generation()
+            fast_button = menu_items[f"scenario-validate-{card.scenario_id}"]
+            full_button = menu_items[f"scenario-checksum-{card.scenario_id}"]
             fast_button.set_enabled(False)
             full_button.set_enabled(False)
             try:
@@ -390,25 +653,14 @@ def _render_scenario_card(
             except JobBusyError as exc:
                 fast_button.set_enabled(True)
                 full_button.set_enabled(True)
-                with validation_area:
-                    ui.label(translator.text("error.job_busy")).classes(
-                        "lte-validation-result lte-validation-result--error"
-                    )
-                    with ui.expansion(translator.text("validation.details")):
-                        ui.label(str(exc)).classes("lte-validation-message")
+                show_inspector(card, "validation", error=str(exc))
                 return
             except Exception as exc:
                 fast_button.set_enabled(True)
                 full_button.set_enabled(True)
-                with validation_area:
-                    ui.label(translator.text("validation.failed")).classes(
-                        "lte-validation-result lte-validation-result--error"
-                    )
-                    with ui.expansion(translator.text("validation.details")):
-                        ui.label(str(exc)).classes("lte-validation-message")
+                show_inspector(card, "validation", error=str(exc))
                 return
-            with validation_area:
-                pending = ui.label(translator.text("validation.running"))
+            show_inspector(card, "validation")
 
             def collect() -> None:
                 if validation_generation["value"] != generation:
@@ -421,45 +673,14 @@ def _render_scenario_card(
                 active_timer["value"] = None
                 fast_button.set_enabled(True)
                 full_button.set_enabled(True)
-                pending.delete()
-                with validation_area:
-                    if update.result is not None:
-                        _render_validation_result(ui, translator, update.result)
-                    else:
-                        ui.label(translator.text("validation.failed")).classes(
-                            "lte-validation-result lte-validation-result--error"
-                        )
-                        if update.error:
-                            with ui.expansion(translator.text("validation.details")):
-                                ui.label(update.error).classes("lte-validation-message")
+                if update.result is not None:
+                    show_inspector(card, "validation", result=update.result)
+                else:
+                    show_inspector(card, "validation", error=update.error or "")
 
             timer = ui.timer(0.2, collect, active=False)
             active_timer["value"] = timer
             timer.activate()
-
-        with ui.expansion(translator.text("guidance.commands")).classes(
-            "lte-cli-commands full-width"
-        ).mark(f"scenario-setup-{card.scenario_id}") as setup_expansion:
-            ui.label(translator.text("guidance.replace_path")).classes(
-                "lte-setup-guidance"
-            )
-            ui.code(
-                f"lte-data validate {card.scenario_id}", language="powershell"
-            ).classes(
-                "lte-cli-guidance"
-            )
-            ui.code(
-                f"lte-data validate {card.scenario_id} --full-checksum",
-                language="powershell",
-            ).classes("lte-cli-guidance")
-            ui.code(
-                f"lte-data dem export {card.scenario_id} --dry-run",
-                language="powershell",
-            ).classes("lte-cli-guidance")
-            ui.code(
-                f"lte-data dem ingest {card.scenario_id} --tiles-dir '<path>'",
-                language="powershell",
-            ).classes("lte-cli-guidance")
 
         workflow_action = (
             ActionSpec(
@@ -473,43 +694,65 @@ def _render_scenario_card(
             else ActionSpec(
                 "workflow",
                 translator.text("action.view_setup"),
-                setup_expansion.open,
+                lambda: show_inspector(card, "commands"),
                 role="primary",
                 marker=f"scenario-guidance-{card.scenario_id}",
             )
         )
-        buttons = render_action_bar(
+        with ui.row().classes("lte-scenario-support-row"):
+            render_overflow_menu(
+                ui,
+                (
+                    MenuActionSpec(
+                        translator.text("action.validate"),
+                        "fact_check",
+                        validate_fast,
+                        marker=f"scenario-validate-{card.scenario_id}",
+                    ),
+                    MenuActionSpec(
+                        translator.text("action.full_checksum"),
+                        "verified",
+                        validate_full,
+                        marker=f"scenario-checksum-{card.scenario_id}",
+                    ),
+                    MenuActionSpec(
+                        translator.text("dataset.details"),
+                        "database",
+                        lambda: show_inspector(card, "details"),
+                        separator=True,
+                        marker=f"scenario-technical-{card.scenario_id}",
+                    ),
+                    MenuActionSpec(
+                        translator.text("guidance.commands"),
+                        "terminal",
+                        lambda: show_inspector(card, "commands"),
+                        marker=f"scenario-setup-{card.scenario_id}",
+                    ),
+                ),
+                label=translator.text("scenarios.more_actions"),
+                marker=f"scenario-overflow-{card.scenario_id}",
+                item_sink=menu_items,
+            )
+        render_action_bar(
             ui,
-            (
-                ActionSpec(
-                    "fast",
-                    translator.text("action.validate"),
-                    validate_fast,
-                    marker=f"scenario-validate-{card.scenario_id}",
-                ),
-                ActionSpec(
-                    "full",
-                    translator.text("action.full_checksum"),
-                    validate_full,
-                    marker=f"scenario-checksum-{card.scenario_id}",
-                ),
-                workflow_action,
-            ),
+            (workflow_action,),
         )
-        fast_button = buttons["fast"]
-        full_button = buttons["full"]
+    return preview_holder
 
 
 __all__ = [
+    "ScenarioCatalogView",
     "ScenarioCard",
     "ValidationDiagnostic",
     "ValidationJobUpdate",
     "ValidationResult",
     "get_job_coordinator",
     "poll_validation_job",
+    "render_scenario_preview_results",
     "render_scenarios_page",
     "run_validation",
     "scenario_cards",
+    "scenario_preview_requests",
     "shutdown_job_coordinator",
     "submit_full_checksum",
 ]

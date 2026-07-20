@@ -316,6 +316,7 @@ def render_overflow_menu(
     icon: str = "more_vert",
     label: str = "More actions",
     marker: str | None = None,
+    item_sink: dict[str, Any] | None = None,
 ) -> Any:
     """Render a trigger-owned overflow menu from semantic action specifications."""
 
@@ -339,6 +340,8 @@ def render_overflow_menu(
                 if not action.enabled:
                     item.props(add="disable aria-disabled=true")
                 _mark(item, action.marker)
+                if item_sink is not None and action.marker is not None:
+                    item_sink[action.marker] = item
                 if action.icon is not None:
                     with item:
                         ui.icon(action.icon).classes("lte-overflow-menu__icon")

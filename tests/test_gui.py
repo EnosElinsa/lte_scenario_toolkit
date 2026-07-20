@@ -47,6 +47,30 @@ def _gui_module(name: str):
         raise
 
 
+def _scenario_preview_fixture_builder(requests, cache_root):
+    from PIL import Image
+
+    from lte_scenario_toolkit.gui.scenario_previews import ScenarioPreviewResult
+
+    cache_root.mkdir(parents=True, exist_ok=True)
+    results = []
+    for index, request in enumerate(requests):
+        if index == 1:
+            results.append(RuntimeError("one preview failed"))
+            continue
+        path = cache_root / f"{request.scenario_id}.png"
+        Image.new("RGB", (24, 12), (30 + index, 70, 90)).save(path)
+        results.append(
+            ScenarioPreviewResult(
+                "terrain" if index == 0 else "boundary",
+                path,
+                False,
+                None,
+            )
+        )
+    return results
+
+
 def test_gui_test_dependencies_and_async_mode_are_declared():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
@@ -2060,6 +2084,60 @@ def test_scenario_cards_are_immutable_and_enable_only_ready_statuses(tmp_path):
     assert boundary_only.dem_entrypoint is None
 
 
+def test_scenario_preview_requests_map_catalog_paths_inside_repository(tmp_path):
+    from lte_scenario_toolkit.gui.pages.scenarios import scenario_preview_requests
+
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data/boundary.geojson").write_text("{}", encoding="utf-8")
+    (tmp_path / "data/dem.tif").write_bytes(b"dem")
+
+    requests = scenario_preview_requests(_Task13Catalog(tmp_path))
+
+    ready = requests[0]
+    assert ready.scenario_id == "ready-city"
+    assert ready.scenario_name == "Ready City"
+    assert ready.boundary_path == (tmp_path / "data/boundary.geojson").resolve()
+    assert ready.dem_path == (tmp_path / "data/dem.tif").resolve()
+    assert ready.allowed_root == tmp_path.resolve()
+    boundary_only = next(
+        request for request in requests if request.scenario_id == "boundary-only"
+    )
+    assert boundary_only.dem_path is None
+
+
+@pytest.mark.parametrize(
+    "entrypoint",
+    ("../outside.geojson", "https://example.invalid/boundary.geojson"),
+)
+def test_scenario_preview_requests_reject_arbitrary_catalog_paths(
+    tmp_path, entrypoint
+):
+    from lte_scenario_toolkit.gui.pages.scenarios import scenario_preview_requests
+
+    catalog = _Task13Catalog(tmp_path)
+    catalog.datasets_by_id["boundary"]["entrypoint"] = entrypoint
+
+    with pytest.raises(ValueError, match="repository-local|traversal|inside"):
+        scenario_preview_requests(catalog)
+
+
+def test_scenario_preview_requests_reject_symlink_escape(tmp_path):
+    from lte_scenario_toolkit.gui.pages.scenarios import scenario_preview_requests
+
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    (outside / "boundary.geojson").write_text("{}", encoding="utf-8")
+    try:
+        (tmp_path / "linked").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable")
+    catalog = _Task13Catalog(tmp_path)
+    catalog.datasets_by_id["boundary"]["entrypoint"] = "linked/boundary.geojson"
+
+    with pytest.raises(ValueError, match="inside"):
+        scenario_preview_requests(catalog)
+
+
 def test_run_validation_returns_immutable_diagnostics_without_printing(
     tmp_path, monkeypatch, capsys
 ):
@@ -2590,6 +2668,13 @@ async def test_scenario_routes_share_content_and_disable_nonready_actions(
             await user.should_see(marker=f"scenario-status-{scenario_id}")
             await user.should_see(marker=f"scenario-technical-{scenario_id}")
             await user.should_see(marker=f"scenario-setup-{scenario_id}")
+            assert len(user.find(marker=f"scenario-overflow-{scenario_id}").elements) == 1
+            workflow_marker = (
+                f"scenario-configure-{scenario_id}"
+                if catalog.scenario_status(scenario_id) == "ready"
+                else f"scenario-guidance-{scenario_id}"
+            )
+            assert len(user.find(marker=workflow_marker).elements) == 1
             await user.should_not_see(marker=f"scenario-run-{scenario_id}")
 
         assert len(user.find(marker="scenario-configure-ready-city").elements) == 1
@@ -2622,6 +2707,87 @@ async def test_scenario_routes_share_content_and_disable_nonready_actions(
     )
     await user.should_not_see(marker="picker-configure-pending-city")
     assert len(user.find(marker="picker-guidance-pending-city").elements) == 1
+
+
+async def test_scenario_catalog_maps_injected_preview_batch_with_local_fallback(
+    user, tmp_path, monkeypatch
+):
+    from nicegui import run
+
+    from lte_scenario_toolkit.gui.app import create_app
+
+    async def cpu_bound(builder, *args):
+        return await asyncio.to_thread(builder, *args)
+
+    monkeypatch.setattr(run, "cpu_bound", cpu_bound)
+
+    create_app(
+        catalog=_Task13Catalog(tmp_path),
+        profile_store=object(),
+        scenario_preview_builder=_scenario_preview_fixture_builder,
+        testing=True,
+    )
+
+    await user.open("/scenarios")
+
+    await user.should_see(
+        marker="scenario-preview-kind-ready-city", content="Terrain preview", retries=30
+    )
+    await user.should_see(
+        marker="scenario-preview-kind-pending-city", content="Preview unavailable"
+    )
+    await user.should_see(
+        marker="scenario-preview-kind-invalid-city", content="Boundary preview"
+    )
+    ready_image = next(
+        iter(user.find(marker="scenario-preview-image-ready-city").elements)
+    )
+    assert ready_image._props["alt"] == "Ready City Terrain preview"
+    await user.should_not_see(marker="scenario-preview-image-pending-city")
+
+
+async def test_collapsed_shell_keeps_scenario_catalog_route_renderable(
+    user, tmp_path, monkeypatch
+):
+    from nicegui import run
+
+    from lte_scenario_toolkit.gui.app import create_app
+    from lte_scenario_toolkit.gui.settings import GuiSettingsStore
+
+    async def cpu_bound(builder, *args):
+        return await asyncio.to_thread(builder, *args)
+
+    monkeypatch.setattr(run, "cpu_bound", cpu_bound)
+    GuiSettingsStore(tmp_path).save(
+        language="en",
+        output_roots=(),
+        navigation_collapsed=True,
+    )
+    create_app(
+        catalog=_Task13Catalog(tmp_path),
+        profile_store=object(),
+        scenario_preview_builder=_scenario_preview_fixture_builder,
+        testing=True,
+    )
+
+    await user.open("/")
+
+    navigation = next(iter(user.find(marker="shell-navigation").elements))
+    assert navigation._props["mini"] is True
+    await user.should_see(marker="scenarios-grid")
+    await user.should_see(marker="scenario-card-ready-city")
+
+
+def test_scenario_catalog_css_declares_three_two_one_column_layout():
+    css = (
+        ROOT / "src/lte_scenario_toolkit/gui/assets/app.css"
+    ).read_text(encoding="utf-8")
+
+    assert ".lte-scenario-grid" in css
+    assert "grid-template-columns: repeat(3, minmax(0, 1fr));" in css
+    assert "grid-template-columns: repeat(2, minmax(0, 1fr));" in css
+    assert ".lte-card-grid { grid-template-columns: minmax(0, 1fr); }" in css
+    assert "aspect-ratio: 19 / 9;" in css
 
 
 
@@ -4210,6 +4376,81 @@ def test_gui_file_route_resolver_rejects_symlink_escape(tmp_path):
             suffixes=(".png",),
             label="map asset",
         )
+
+
+def test_scenario_preview_file_route_is_limited_to_png_cache_leaf(tmp_path):
+    module = _gui_module("app")
+    preview_root = tmp_path / ".lte-data/cache/scenario-previews"
+    preview_root.mkdir(parents=True)
+    preview = preview_root / "chicago.png"
+    preview.write_bytes(b"png")
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"png")
+    wrong_suffix = preview_root / "details.json"
+    wrong_suffix.write_text("{}", encoding="utf-8")
+
+    assert module._resolve_scenario_preview_file(preview, tmp_path) == preview.resolve()
+    with pytest.raises(ValueError, match="traversal"):
+        module._resolve_scenario_preview_file(
+            preview_root / "nested/../chicago.png", tmp_path
+        )
+    with pytest.raises(ValueError, match="outside"):
+        module._resolve_scenario_preview_file(outside, tmp_path)
+    with pytest.raises(ValueError, match="regular .png"):
+        module._resolve_scenario_preview_file(wrong_suffix, tmp_path)
+
+
+def test_scenario_preview_file_route_rejects_symlinked_cache_file(tmp_path):
+    module = _gui_module("app")
+    preview_root = tmp_path / ".lte-data/cache/scenario-previews"
+    preview_root.mkdir(parents=True)
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"png")
+    linked = preview_root / "linked.png"
+    try:
+        linked.symlink_to(outside)
+    except OSError:
+        pytest.skip("file symlinks are unavailable")
+
+    with pytest.raises(ValueError, match="redirected"):
+        module._resolve_scenario_preview_file(linked, tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_scenario_preview_delivery_waits_for_connection_and_skips_deleted_client(
+    tmp_path,
+):
+    module = _gui_module("app")
+    events = []
+
+    class Client:
+        is_deleted = False
+
+        async def connected(self):
+            events.append("connected")
+
+    class Holder:
+        def clear(self):
+            events.append("cleared")
+
+    async def cpu_bound(builder, requests, cache_root):
+        events.append("cpu")
+        result = builder(requests, cache_root)
+        Client.is_deleted = True
+        return result
+
+    result = await module.load_scenario_previews(
+        client=Client(),
+        holder=Holder(),
+        requests=("request",),
+        cache_root=tmp_path,
+        builder=lambda requests, cache_root: [requests[0], cache_root],
+        render=lambda previews: events.append(("rendered", previews)),
+        cpu_bound=cpu_bound,
+    )
+
+    assert result is None
+    assert events == ["connected", "cpu"]
 
 
 def test_gui_file_route_resolver_rejects_redirected_allowlist_ancestor(
