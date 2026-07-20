@@ -1377,7 +1377,9 @@ def render_figures_page(
 
         with ui.element("footer").classes(
             "lte-figure-export lte-figure-export-dock full-width"
-        ).props('role=region aria-label="Figure export actions"').mark(
+        ).props(
+            f'role=region aria-label="{translator.text("figures.export_actions")}"'
+        ).mark(
             "figure-export-dock"
         ):
             with ui.row().classes("lte-figure-panel-header full-width"):
@@ -1616,6 +1618,29 @@ def render_figures_page(
                 control.disable()
             else:
                 control.enable()
+        refresh_local_enabled = not running and refresh_source_options is not None
+        open_source_enabled = (
+            not running
+            and valid_source
+            and isinstance(current.source, FigureSource)
+            and current.source.path is not None
+        )
+        for control, enabled in (
+            (refresh_local_button, refresh_local_enabled),
+            (open_source_button, open_source_enabled),
+        ):
+            if enabled:
+                control.enable()
+            else:
+                control.disable()
+        for marker, enabled in (
+            ("figure-refresh-local-menu", refresh_local_enabled),
+            ("figure-open-source-menu", open_source_enabled),
+            ("figure-current-selection", not running and current_session is not None),
+        ):
+            menu_item = source_menu_items.get(marker)
+            if menu_item is not None:
+                menu_item.set_enabled(enabled)
         for control in (refresh_button, export_button):
             if has_dem and not running:
                 control.enable()

@@ -8782,6 +8782,14 @@ async def test_figure_page_locks_all_controls_and_restores_rejected_edits(
         with user.client:
             source_element.set_value(str(completed_a))
         user.find(marker="figure-load-source").click()
+        source_menu_controls = {
+            marker: next(iter(user.find(marker=marker).elements))
+            for marker in (
+                "figure-refresh-local-menu",
+                "figure-open-source-menu",
+            )
+        }
+        assert all(control.enabled for control in source_menu_controls.values())
         user.find(marker="figure-refresh-preview").click()
         assert await asyncio.to_thread(entered.wait, 2)
         assert len(views) == 1
@@ -8794,6 +8802,12 @@ async def test_figure_page_locks_all_controls_and_restores_rejected_edits(
         enabled_while_blocked = {
             marker: element.enabled for marker, element in control_elements.items()
         }
+        enabled_while_blocked.update(
+            {
+                marker: element.enabled
+                for marker, element in source_menu_controls.items()
+            }
+        )
 
         with user.client:
             source_element.value = str(rejected_b)
@@ -8826,6 +8840,7 @@ async def test_figure_page_locks_all_controls_and_restores_rejected_edits(
         assert view.timer.active is False
         assert view.controller.state.phase == "ready"
         assert all(element.enabled for element in control_elements.values())
+        assert all(control.enabled for control in source_menu_controls.values())
     finally:
         release.set()
         if views:
@@ -9034,6 +9049,32 @@ async def test_figure_workstation_exposes_source_menu_and_export_dock(user, tmp_
         assert [element.text for element in primary] == ["Export Figures"]
         assert user.find(marker="figure-refresh-local").elements
         assert user.find(marker="figure-open-source").elements
+    finally:
+        coordinator.shutdown()
+
+
+async def test_figure_export_dock_aria_label_uses_active_language(user, tmp_path):
+    from nicegui import ui
+
+    from lte_scenario_toolkit.gui.i18n import Translator
+    from lte_scenario_toolkit.gui.pages.figures import render_figures_page
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    coordinator = JobCoordinator()
+
+    @ui.page("/figure-workstation-aria-zh")
+    def figure_workstation_aria_zh():
+        render_figures_page(ui, Translator("zh-CN"), tmp_path, coordinator)
+
+    try:
+        await user.open("/figure-workstation-aria-zh")
+        dock = next(iter(user.find(marker="figure-export-dock").elements))
+        assert dock.props["aria-label"] == Translator("zh-CN").text(
+            "figures.export_actions"
+        )
+        assert dock.props["aria-label"] != Translator("en").text(
+            "figures.export_actions"
+        )
     finally:
         coordinator.shutdown()
 
