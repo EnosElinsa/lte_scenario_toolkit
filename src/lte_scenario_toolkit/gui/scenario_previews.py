@@ -16,7 +16,7 @@ from PIL import Image, ImageDraw, ImageEnhance
 
 from ..map_assets import MapAssetService, MapStyle
 
-PREVIEW_STYLE_VERSION = "scenario-preview-v1"
+PREVIEW_STYLE_VERSION = "scenario-preview-v2"
 PREVIEW_SIZE = (760, 360)
 PreviewKind = Literal["terrain", "boundary", "fallback"]
 
@@ -355,6 +355,11 @@ def _load_metadata(destination: Path) -> tuple[PreviewKind, str | None, str | No
             return None
         if cache_policy not in {None, "normal", "fallback-only"}:
             return None
+        if (
+            cache_policy is None
+            and diagnostic == "Preview cache root is outside allowed root; using safe fallback."
+        ):
+            cache_policy = "fallback-only"
         return kind, _safe_metadata_diagnostic(diagnostic), cache_policy
     except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError):
         return None

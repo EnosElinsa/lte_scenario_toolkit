@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import pickle
 from pathlib import Path
@@ -245,6 +246,26 @@ def test_outside_cache_fallback_is_not_reused_by_internal_cache(tmp_path):
         _request(tmp_path, boundary_path=boundary)
     )
     assert outside_result.kind == "fallback"
+
+    internal = ScenarioPreviewService(tmp_path / ".lte-data" / "cache" / "scenario-previews").build(
+        _request(tmp_path, boundary_path=boundary)
+    )
+
+    assert internal.kind == "boundary"
+    assert internal.cache_hit is False
+
+
+def test_legacy_outside_cache_diagnostic_is_treated_as_fallback_only(tmp_path):
+    boundary = _write_boundary(tmp_path / "boundary.geojson")
+    outside_cache = tmp_path.parent / "legacy-outside-cache"
+    outside_cache.mkdir()
+    outside_result = ScenarioPreviewService(outside_cache).build(
+        _request(tmp_path, boundary_path=boundary)
+    )
+    metadata = outside_result.path.with_suffix(".json")
+    payload = json.loads(metadata.read_text(encoding="utf-8"))
+    payload.pop("cache_policy", None)
+    metadata.write_text(json.dumps(payload), encoding="utf-8")
 
     internal = ScenarioPreviewService(tmp_path / ".lte-data" / "cache" / "scenario-previews").build(
         _request(tmp_path, boundary_path=boundary)
