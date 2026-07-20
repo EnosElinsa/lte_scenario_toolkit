@@ -1434,6 +1434,34 @@ button:disabled,
 }
 
 @media (max-width: 760px) {
+  .lte-configure-page,
+  .lte-configure-workspace,
+  .lte-configure-form-column,
+  .lte-configure-run-summary,
+  .lte-configure-action-dock {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+  }
+
+  .lte-configure-workspace {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--lte-space-3);
+  }
+
+  .lte-configure-run-summary { position: static; }
+
+  .lte-configure-action-dock .lte-action-bar {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .lte-configure-action-dock .q-btn {
+    flex: 1 1 180px;
+    min-width: 44px;
+    min-height: 44px;
+  }
+
   .lte-command-bar {
     min-height: var(--lte-command-height);
     padding-right: max(10px, env(safe-area-inset-right));

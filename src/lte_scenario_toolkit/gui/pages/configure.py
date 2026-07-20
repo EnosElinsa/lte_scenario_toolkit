@@ -677,14 +677,15 @@ def render_configure_page(
             )
 
         with ui.row().classes("lte-configure-stepper").props(
-            'role="list" aria-label="Configuration workflow"'
+            'role="list" '
+            f'aria-label="{translator.text("configure.workflow.aria_label")}"'
         ).mark("configure-workflow-stepper"):
             data_step = ui.label(translator.text("configure.workflow.data")).classes(
-                "lte-configure-step lte-configure-step--complete"
+                "lte-configure-step"
             ).props('role="listitem"').mark("configure-step-data")
             profile_step = ui.label(
                 translator.text("configure.workflow.profile")
-            ).classes("lte-configure-step lte-configure-step--current").props(
+            ).classes("lte-configure-step").props(
                 'role="listitem"'
             ).mark("configure-step-profile")
             review_step = ui.label(
@@ -733,6 +734,23 @@ def render_configure_page(
                     )
                     next_step_summary = ui.label().mark("configure-summary-next-step")
 
+        def present_step(element: Any, step_key: str, state: str) -> None:
+            element.classes(
+                add=f"lte-configure-step--{state}",
+                remove=(
+                    "lte-configure-step--blocked lte-configure-step--complete "
+                    "lte-configure-step--current"
+                ),
+            )
+            element.props(remove="aria-current")
+            state_label = translator.text(
+                f"configure.workflow.state.{state}",
+                step=translator.text(step_key),
+            )
+            element.props(add=f'aria-label="{state_label}"')
+            if state == "current":
+                element.props(add="aria-current=step")
+
         def refresh_workflow_presentation() -> None:
             dirty = bool(form_values)
             blocked = model.selection_error is not None or model.status != "ready"
@@ -748,25 +766,26 @@ def render_configure_page(
                 translator.text("configure.dirty") if dirty else profile_state
             )
             next_step_summary.set_text(translator.text(next_key))
-            data_step.classes(
-                add="lte-configure-step--blocked" if blocked else "lte-configure-step--complete",
-                remove="lte-configure-step--blocked lte-configure-step--complete",
+
+            present_step(
+                data_step,
+                "configure.workflow.data",
+                "blocked" if blocked else "complete",
             )
-            profile_step.classes(
-                add="lte-configure-step--current" if dirty else "lte-configure-step--complete",
-                remove="lte-configure-step--current lte-configure-step--complete",
+            present_step(
+                profile_step,
+                "configure.workflow.profile",
+                "current" if dirty else "complete",
             )
-            review_step.classes(
-                add=(
-                    "lte-configure-step--blocked"
+            present_step(
+                review_step,
+                "configure.workflow.review",
+                (
+                    "blocked"
                     if blocked
-                    else "lte-configure-step--complete"
+                    else "complete"
                     if workflow_state["preflight_passed"]
-                    else "lte-configure-step--current"
-                ),
-                remove=(
-                    "lte-configure-step--blocked lte-configure-step--complete "
-                    "lte-configure-step--current"
+                    else "current"
                 ),
             )
 
@@ -1319,7 +1338,7 @@ def render_configure_page(
                     translator.text("action.confirm"), on_click=confirm_delete
                 ).mark("profile-delete-confirm")
 
-        def run_preflight() -> None:
+        def preflight_for_review(*, start_scan: bool) -> None:
             clear_form_errors()
             try:
                 candidate = current_profile()
@@ -1334,13 +1353,19 @@ def render_configure_page(
                 return
             workflow_state["preflight_passed"] = True
             refresh_workflow_presentation()
-            if on_preflight_success is None:
+            if not start_scan or on_preflight_success is None:
                 ui.notify(translator.text("preflight.passed"), type="positive")
                 return
             try:
                 on_preflight_success(outcome)
             except Exception as exc:
                 report_error(exc)
+
+        def validate_for_review() -> None:
+            preflight_for_review(start_scan=False)
+
+        def run_preflight() -> None:
+            preflight_for_review(start_scan=True)
 
         with management_area:
             management_items: dict[str, Any] = {}
@@ -1382,7 +1407,7 @@ def render_configure_page(
                     MenuActionSpec(
                         translator.text("configure.validate"),
                         None,
-                        run_preflight,
+                        validate_for_review,
                         separator=True,
                         enabled=model.can_start,
                         marker="profile-validate",

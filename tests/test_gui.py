@@ -2927,6 +2927,93 @@ async def test_configure_workbench_groups_profile_actions_and_run_review(user, t
         assert action.props[expected_prop] is True
 
 
+@pytest.mark.parametrize(
+    ("language", "workflow_label", "data_label", "review_label"),
+    (
+        ("en", "Configuration workflow", "Data: complete", "Review: current step"),
+        (
+            "zh-CN",
+            "\u914d\u7f6e\u5de5\u4f5c\u6d41\u7a0b",
+            "\u6570\u636e\uff1a\u5df2\u5b8c\u6210",
+            "\u590d\u6838\uff1a\u5f53\u524d\u6b65\u9aa4",
+        ),
+    ),
+)
+async def test_configure_stepper_exposes_localized_current_state(
+    user,
+    tmp_path,
+    language,
+    workflow_label,
+    data_label,
+    review_label,
+):
+    from lte_scenario_toolkit.gui.app import create_app
+    from lte_scenario_toolkit.gui.settings import GuiSettingsStore
+
+    class EmptyStore:
+        def discover(self, scenario_id):
+            return []
+
+    GuiSettingsStore(tmp_path).save(language=language, output_roots=())
+    create_app(
+        catalog=_Task13Catalog(tmp_path),
+        profile_store=EmptyStore(),
+        testing=True,
+    )
+    await user.open("/configure/without-default")
+
+    stepper = next(iter(user.find(marker="configure-workflow-stepper").elements))
+    data = next(iter(user.find(marker="configure-step-data").elements))
+    review = next(iter(user.find(marker="configure-step-review").elements))
+    assert stepper.props["role"] == "list"
+    assert stepper.props["aria-label"] == workflow_label
+    assert data.props["role"] == "listitem"
+    assert data.props["aria-label"] == data_label
+    assert review.props["aria-current"] == "step"
+    assert review.props["aria-label"] == review_label
+
+
+async def test_configure_overflow_validation_does_not_open_candidate_session(user, tmp_path):
+    from types import SimpleNamespace
+
+    from lte_scenario_toolkit.gui.app import create_app
+    from lte_scenario_toolkit.gui.pages.candidates import CandidateSessionRegistry
+
+    class EmptyStore:
+        def discover(self, scenario_id):
+            return []
+
+    class Service:
+        def preflight(self, profile, output_root):
+            return SimpleNamespace(profile=profile, output_root=output_root)
+
+    class RecordingRegistry(CandidateSessionRegistry):
+        def __init__(self):
+            super().__init__()
+            self.create_calls = []
+
+        def create(self, *args, **kwargs):
+            self.create_calls.append((args, kwargs))
+            return super().create(*args, **kwargs)
+
+    registry = RecordingRegistry()
+    create_app(
+        catalog=_Task13Catalog(tmp_path),
+        profile_store=EmptyStore(),
+        selection_service_factory=lambda _catalog: Service(),
+        candidate_registry=registry,
+        testing=True,
+    )
+    await user.open("/configure/without-default")
+
+    user.find(marker="profile-overflow").click()
+    user.find(marker="profile-validate").click()
+
+    await user.should_see("Preflight passed")
+    assert registry.create_calls == []
+    assert not any("/candidates/" in route for route in user.back_history)
+
+
 async def test_configure_workbench_smoke_renders_with_collapsed_shell(user, tmp_path):
     from lte_scenario_toolkit.gui.app import create_app
     from lte_scenario_toolkit.gui.settings import GuiSettingsStore
@@ -2971,6 +3058,28 @@ def test_configure_workbench_has_explicit_390px_overflow_safeguards():
     assert "flex-direction: column;" in narrow
     assert "min-width: 44px;" in narrow
     assert "overflow-x: clip;" in narrow
+
+
+def test_configure_workbench_stacks_and_wraps_before_phone_width():
+    css = (
+        ROOT / "src/lte_scenario_toolkit/gui/assets/app.css"
+    ).read_text(encoding="utf-8")
+
+    tablet = css[
+        css.index("@media (max-width: 760px)") : css.index("@media (max-width: 390px)")
+    ]
+    for selector in (
+        ".lte-configure-workspace",
+        ".lte-configure-run-summary",
+        ".lte-configure-action-dock .lte-action-bar",
+        ".lte-configure-action-dock .q-btn",
+    ):
+        assert selector in tablet
+    assert "grid-template-columns: minmax(0, 1fr);" in tablet
+    assert "position: static;" in tablet
+    assert "flex-wrap: wrap;" in tablet
+    assert "min-width: 0;" in tablet
+    assert "min-height: 44px;" in tablet
 
 
 async def test_scenario_page_new_copy_is_localized_after_language_switch(user, tmp_path):
