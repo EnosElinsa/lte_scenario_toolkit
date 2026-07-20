@@ -3756,6 +3756,35 @@ def test_candidate_state_layout_switch_preserves_identity_map_and_layers():
         switched.view = "map"
 
 
+def test_candidate_map_status_keys_cover_loading_empty_error_online_and_offline():
+    from lte_scenario_toolkit.gui.pages.candidates import (
+        CandidatePageState,
+        _candidate_status_keys,
+    )
+
+    assert _candidate_status_keys(CandidatePageState()) == (
+        "candidates.map_ready",
+        "candidates.source_offline",
+    )
+    assert _candidate_status_keys(CandidatePageState(phase="scanning")) == (
+        "candidates.map_loading",
+        "candidates.source_offline",
+    )
+    assert _candidate_status_keys(CandidatePageState(phase="failed")) == (
+        "candidates.map_error",
+        "candidates.source_offline",
+    )
+    empty = CandidatePageState(phase="completed", scan_completed=True)
+    assert _candidate_status_keys(empty) == (
+        "candidates.map_empty",
+        "candidates.source_offline",
+    )
+    assert _candidate_status_keys(empty.with_layer("online", True)) == (
+        "candidates.map_empty",
+        "candidates.source_online",
+    )
+
+
 def test_candidate_confirm_requires_authoritative_completed_result_and_selection():
     from lte_scenario_toolkit.gui.pages.candidates import CandidatePageState
 
@@ -5328,6 +5357,84 @@ async def test_candidate_workbench_presents_progress_and_technical_details(
     assert tuple(id(layer) for layer in map_element.layers) == layer_identities
 
 
+async def test_candidate_map_review_workspace_composes_map_inspector_dock_and_overflow(
+    user, tmp_path
+):
+    from dataclasses import replace
+
+    from nicegui import ElementFilter
+
+    from lte_scenario_toolkit.gui.app import create_app
+    from lte_scenario_toolkit.gui.pages.candidates import CandidateSessionRegistry
+
+    registry = CandidateSessionRegistry()
+    registry.add(
+        replace(
+            _task14_session(
+                tmp_path,
+                object(),
+                map_bundle=_task14_map_bundle(tmp_path),
+            ),
+            scan_result=_task14_scan_result(),
+        )
+    )
+    create_app(
+        catalog=_Task13Catalog(tmp_path),
+        profile_store=object(),
+        candidate_registry=registry,
+        testing=True,
+    )
+
+    await user.open("/candidates/session-1")
+
+    expected_classes = {
+        "candidate-review-workspace": "lte-candidate-review-workspace",
+        "candidate-map-panel": "lte-candidate-map-panel",
+        "candidate-inspector": "lte-candidate-review-inspector",
+        "candidate-action-dock": "lte-candidate-action-dock",
+        "candidate-overflow": "lte-overflow-menu__trigger",
+    }
+    for marker, class_name in expected_classes.items():
+        element = next(iter(user.find(marker=marker).elements))
+        assert class_name in element._classes
+
+    for marker in (
+        "candidate-counts",
+        "candidate-layer-controls",
+        "candidate-navigation",
+        "candidate-map-status",
+        "candidate-source-status",
+    ):
+        await user.should_see(marker=marker)
+
+    with user.client:
+        force_rescan = next(
+            iter(ElementFilter(marker="candidate-force", only_visible=False))
+        )
+        dock = next(
+            iter(ElementFilter(marker="candidate-action-dock", only_visible=False))
+        )
+    assert "lte-overflow-menu__item" in force_rescan._classes
+    assert any(
+        getattr(child, "_text", "") == "Force Rescan"
+        for child in force_rescan.default_slot.children
+    )
+    assert any(ancestor.__class__.__name__ == "Menu" for ancestor in force_rescan.ancestors())
+
+    primary_actions = [
+        element
+        for element in dock.descendants()
+        if "lte-action--primary" in getattr(element, "_classes", [])
+    ]
+    assert len(primary_actions) == 1
+    assert primary_actions[0].text == "Confirm Candidate"
+    assert "outline" in next(iter(user.find(marker="candidate-start").elements)).props
+    assert "flat" in next(iter(user.find(marker="candidate-cancel").elements)).props
+
+    await user.should_see("Offline map assets active")
+    await user.should_see("Map ready for candidate review")
+
+
 @pytest.mark.parametrize(
     ("language", "map_name", "selected_name", "filmstrip_name", "figure_name"),
     (
@@ -5439,7 +5546,10 @@ def test_candidate_workbench_css_is_bounded_and_mobile_safe():
         ROOT / "src/lte_scenario_toolkit/gui/assets/app.css"
     ).read_text(encoding="utf-8")
 
-    assert "grid-template-columns: minmax(0, 1fr) clamp(320px, 24vw, 360px);" in css
+    assert (
+        "grid-template-columns: minmax(0, 1.55fr) minmax(280px, 0.85fr);"
+        in css
+    )
     assert "grid-auto-flow: column;" in css
     assert "grid-auto-columns: clamp(220px, 22vw, 280px);" in css
     assert "overflow-x: auto;" in css
@@ -5447,10 +5557,15 @@ def test_candidate_workbench_css_is_bounded_and_mobile_safe():
     tablet = css.index("@media (max-width: 980px)")
     mobile = css.index("@media (max-width: 760px)")
     assert desktop < tablet < mobile
-    assert "grid-template-columns: 1fr" in css[tablet:mobile]
+    assert "lte-candidate-review-workspace" not in css[tablet:mobile]
     mobile_block = css[mobile:]
+    assert "grid-template-columns: minmax(0, 1fr)" in mobile_block
     assert "min-height: 420px" in mobile_block
+    assert ".lte-candidate-action-dock" in mobile_block
+    assert "flex-wrap: wrap" in mobile_block
     assert ".lte-filmstrip-grid { grid-template-columns" not in mobile_block
+    reduced_motion = css.index("@media (prefers-reduced-motion: reduce)")
+    assert ".lte-candidate-page *" in css[reduced_motion:]
 
 
 def test_candidate_workbench_has_explicit_390px_overflow_safeguards():
@@ -5465,17 +5580,18 @@ def test_candidate_workbench_has_explicit_390px_overflow_safeguards():
     for selector in (
         ".lte-web-selector-frame",
         ".lte-candidate-page",
-        ".lte-candidate-workspace",
-        ".lte-candidate-map-card",
+        ".lte-candidate-review-workspace",
+        ".lte-candidate-map-panel",
         ".lte-candidate-map-wrap",
-        ".lte-candidate-inspector",
+        ".lte-candidate-review-inspector",
+        ".lte-candidate-action-dock",
     ):
         assert selector in narrow
     assert "min-width: 0;" in narrow
     assert "max-width: 100%;" in narrow
     assert "overflow-x: clip;" in narrow
-    assert ".lte-candidate-toolbar-group" in narrow
-    assert "flex-direction: column;" in narrow
+    assert ".lte-candidate-action-dock .lte-action-bar" in narrow
+    assert "flex-wrap: wrap;" in narrow
     assert ".lte-candidate-id-input" in narrow
     assert "width: 100%;" in narrow
     assert ".lte-segmented-control .q-btn" in narrow

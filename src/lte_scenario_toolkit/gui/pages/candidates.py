@@ -26,7 +26,11 @@ from ...selection_service import (
     SelectionProgress,
 )
 from ..presentation import (
+    ActionSpec,
+    MenuActionSpec,
     cache_presentation,
+    render_action_bar,
+    render_overflow_menu,
     render_technical_details,
     scan_mode_presentation,
 )
@@ -442,6 +446,26 @@ class CandidatePageState:
 class CandidateProgressEvent:
     job_id: str
     progress: SelectionProgress
+
+
+def _candidate_status_keys(state: CandidatePageState) -> tuple[str, str]:
+    """Return localized map and source status keys for the rendered inspector."""
+
+    map_key = (
+        "candidates.map_loading"
+        if state.phase in {"starting", "cache", "scanning", "cancelling"}
+        else "candidates.map_error"
+        if state.phase == "failed"
+        else "candidates.map_empty"
+        if state.scan_completed and not state.candidates
+        else "candidates.map_ready"
+    )
+    source_key = (
+        "candidates.source_online"
+        if "online" in state.enabled_layers
+        else "candidates.source_offline"
+    )
+    return map_key, source_key
 
 
 def reduce_progress(
@@ -1666,124 +1690,12 @@ def render_candidate_page(
                     translator.text("candidates.view_filmstrip")
                 ).mark("candidate-view-filmstrip")
 
-        with ui.card().classes("lte-candidate-progress full-width"):
-            with ui.row().classes("items-center justify-between full-width"):
-                progress_phase = ui.label(
-                    translator.text("candidates.phase_idle")
-                ).classes("lte-section-title")
-                with ui.row().classes("lte-candidate-progress-count items-center"):
-                    progress_percent = ui.label("0%").classes(
-                        "lte-candidate-percent"
-                    ).mark("candidate-progress-percent")
-                    progress_numbers = ui.label("0 / 0").classes(
-                        "lte-candidate-metric"
-                    )
-            progress_bar = ui.linear_progress(
-                value=0.0,
-                size="8px",
-                show_value=False,
-            ).props("rounded color=teal")
-            with ui.row().classes(
-                "lte-candidate-progress-meta items-center justify-between full-width"
-            ):
-                found_label = ui.label(
-                    translator.text("candidates.found", count=0)
-                ).classes("lte-page-subtitle")
-                elapsed_label = ui.label(
-                    translator.text("candidates.elapsed", seconds="0.0")
-                ).classes("lte-page-subtitle")
-                cache_label = ui.label(
-                    translator.text(cache_presentation("none").label_key)
-                ).classes("lte-page-subtitle")
-            progress_error = ui.label("").classes(
-                "lte-validation-result lte-validation-result--error"
-            )
-            progress_error.set_visibility(False)
-
-        with ui.row().classes("lte-candidate-toolbar full-width"):
-            with ui.row().classes(
-                "lte-candidate-toolbar-group lte-candidate-toolbar-group--scan"
-            ):
-                start_button = ui.button(
-                    translator.text("action.start_scan")
-                ).mark("candidate-start")
-                cancel_button = ui.button(
-                    translator.text("action.cancel")
-                ).props("outline").mark("candidate-cancel")
-                force_button = ui.button(
-                    translator.text("candidates.force_rescan")
-                ).props("outline").mark("candidate-force")
-                if not allow_rescan:
-                    for button in (start_button, cancel_button, force_button):
-                        button.disable()
-                        button.set_visibility(False)
-            with ui.row().classes(
-                "lte-candidate-toolbar-group lte-candidate-toolbar-group--navigation"
-            ):
-                previous_button = ui.button(
-                    translator.text("candidates.previous")
-                ).props("flat").mark("candidate-previous")
-                next_button = ui.button(
-                    translator.text("candidates.next")
-                ).props("flat").mark("candidate-next")
-                candidate_id_input = ui.number(
-                    translator.text("candidates.candidate_number"),
-                    value=None,
-                    precision=0,
-                ).classes("lte-candidate-id-input").mark("candidate-id")
-                choose_id_button = ui.button(
-                    translator.text("candidates.select_number")
-                ).props("outline").mark("candidate-select-id")
-            with ui.row().classes(
-                "lte-candidate-toolbar-group lte-candidate-toolbar-group--confirmation"
-            ):
-                confirm_button = ui.button(
-                    translator.text("candidates.confirm_selection")
-                ).mark("candidate-confirm")
-
         with ui.element("section").classes(
-            "lte-candidate-workspace full-width"
-        ):
-            with ui.card().classes("lte-candidate-map-card"):
-                with ui.row().classes("items-center full-width lte-layer-controls"):
-                    dem_switch = ui.switch(
-                        translator.text("candidates.layer_dem"), value=True
-                    ).mark("candidate-layer-dem")
-                    boundary_switch = ui.switch(
-                        translator.text("candidates.layer_boundary"), value=True
-                    ).mark("candidate-layer-boundary")
-                    stations_switch = ui.switch(
-                        translator.text("candidates.layer_stations"), value=True
-                    ).mark("candidate-layer-stations")
-                    candidates_switch = ui.switch(
-                        translator.text("candidates.layer_candidates"), value=True
-                    ).mark("candidate-layer-candidates")
-                    online_switch = ui.switch(
-                        translator.text("candidates.layer_online"), value=False
-                    ).mark("candidate-layer-online")
-                    dem_opacity = ui.slider(
-                        min=0.1,
-                        max=1.0,
-                        step=0.05,
-                        value=controller.state.dem_opacity,
-                    ).props(
-                        f'aria-label="{translator.text("candidates.dem_opacity")}"'
-                    ).classes("lte-dem-opacity").mark("candidate-dem-opacity")
-                    dem_style_select = ui.select(
-                        {
-                            MapStyle.ELEVATION: translator.text(
-                                "candidates.style_elevation"
-                            ),
-                            MapStyle.HILLSHADE: translator.text(
-                                "candidates.style_hillshade"
-                            ),
-                            MapStyle.COMBINED: translator.text(
-                                "candidates.style_combined"
-                            ),
-                        },
-                        value=controller.state.dem_style,
-                        label=translator.text("candidates.dem_style"),
-                    ).classes("lte-dem-style").mark("candidate-dem-style")
+            "lte-candidate-workspace lte-candidate-review-workspace full-width"
+        ).mark("candidate-review-workspace"):
+            with ui.card().classes(
+                "lte-candidate-map-card lte-candidate-map-panel"
+            ).mark("candidate-map-panel"):
                 map_container = ui.column().classes("lte-candidate-map-wrap full-width")
                 with map_container:
                     left, bottom, right, top = bundle.map_bounds
@@ -1832,10 +1744,109 @@ def render_candidate_page(
                         ),
                     )
 
-            with ui.card().classes("lte-candidate-inspector"):
+            with ui.card().classes(
+                "lte-candidate-inspector lte-candidate-review-inspector"
+            ).mark("candidate-inspector"):
                 ui.label(translator.text("candidates.inspector")).classes(
                     "lte-section-title"
                 )
+
+                with ui.column().classes("lte-candidate-counts").mark(
+                    "candidate-counts"
+                ):
+                    with ui.row().classes("items-center justify-between full-width"):
+                        progress_phase = ui.label(
+                            translator.text("candidates.phase_idle")
+                        ).classes("lte-section-title")
+                        with ui.row().classes(
+                            "lte-candidate-progress-count items-center"
+                        ):
+                            progress_percent = ui.label("0%").classes(
+                                "lte-candidate-percent"
+                            ).mark("candidate-progress-percent")
+                            progress_numbers = ui.label("0 / 0").classes(
+                                "lte-candidate-metric"
+                            )
+                    progress_bar = ui.linear_progress(
+                        value=0.0,
+                        size="8px",
+                        show_value=False,
+                    ).props("rounded color=teal")
+                    with ui.row().classes(
+                        "lte-candidate-progress-meta items-center justify-between full-width"
+                    ):
+                        found_label = ui.label(
+                            translator.text("candidates.found", count=0)
+                        ).classes("lte-page-subtitle")
+                        elapsed_label = ui.label(
+                            translator.text("candidates.elapsed", seconds="0.0")
+                        ).classes("lte-page-subtitle")
+                        cache_label = ui.label(
+                            translator.text(cache_presentation("none").label_key)
+                        ).classes("lte-page-subtitle")
+                    progress_error = ui.label("").classes(
+                        "lte-validation-result lte-validation-result--error"
+                    )
+                    progress_error.set_visibility(False)
+
+                with ui.column().classes("lte-candidate-map-source-status"):
+                    map_status_label = ui.label(
+                        translator.text("candidates.map_ready")
+                    ).classes("lte-candidate-status").props(
+                        "role=status aria-live=polite"
+                    ).mark("candidate-map-status")
+                    source_status_label = ui.label(
+                        translator.text("candidates.source_offline")
+                    ).classes("lte-candidate-source-status").props(
+                        "role=status aria-live=polite"
+                    ).mark("candidate-source-status")
+
+                ui.label(translator.text("candidates.layers_title")).classes(
+                    "lte-section-title"
+                )
+                with ui.column().classes(
+                    "full-width lte-layer-controls"
+                ).props(
+                    f'role=group aria-label="{translator.text("candidates.layers_title")}"'
+                ).mark("candidate-layer-controls"):
+                    dem_switch = ui.switch(
+                        translator.text("candidates.layer_dem"), value=True
+                    ).mark("candidate-layer-dem")
+                    boundary_switch = ui.switch(
+                        translator.text("candidates.layer_boundary"), value=True
+                    ).mark("candidate-layer-boundary")
+                    stations_switch = ui.switch(
+                        translator.text("candidates.layer_stations"), value=True
+                    ).mark("candidate-layer-stations")
+                    candidates_switch = ui.switch(
+                        translator.text("candidates.layer_candidates"), value=True
+                    ).mark("candidate-layer-candidates")
+                    online_switch = ui.switch(
+                        translator.text("candidates.layer_online"), value=False
+                    ).mark("candidate-layer-online")
+                    dem_opacity = ui.slider(
+                        min=0.1,
+                        max=1.0,
+                        step=0.05,
+                        value=controller.state.dem_opacity,
+                    ).props(
+                        f'aria-label="{translator.text("candidates.dem_opacity")}"'
+                    ).classes("lte-dem-opacity").mark("candidate-dem-opacity")
+                    dem_style_select = ui.select(
+                        {
+                            MapStyle.ELEVATION: translator.text(
+                                "candidates.style_elevation"
+                            ),
+                            MapStyle.HILLSHADE: translator.text(
+                                "candidates.style_hillshade"
+                            ),
+                            MapStyle.COMBINED: translator.text(
+                                "candidates.style_combined"
+                            ),
+                        },
+                        value=controller.state.dem_style,
+                        label=translator.text("candidates.dem_style"),
+                    ).classes("lte-dem-style").mark("candidate-dem-style")
                 selected_title = ui.label(
                     translator.text("candidates.none_selected")
                 ).classes("lte-candidate-selected-title")
@@ -1854,6 +1865,29 @@ def render_candidate_page(
                 ).classes("lte-candidate-statistics")
                 stats_title.set_visibility(False)
                 stats_details.set_visibility(False)
+
+                ui.label(translator.text("candidates.navigation")).classes(
+                    "lte-section-title"
+                )
+                with ui.row().classes(
+                    "lte-candidate-navigation full-width"
+                ).props(
+                    f'role=group aria-label="{translator.text("candidates.navigation")}"'
+                ).mark("candidate-navigation"):
+                    previous_button = ui.button(
+                        translator.text("candidates.previous")
+                    ).props("flat").mark("candidate-previous")
+                    next_button = ui.button(
+                        translator.text("candidates.next")
+                    ).props("flat").mark("candidate-next")
+                    candidate_id_input = ui.number(
+                        translator.text("candidates.candidate_number"),
+                        value=None,
+                        precision=0,
+                    ).classes("lte-candidate-id-input").mark("candidate-id")
+                    choose_id_button = ui.button(
+                        translator.text("candidates.select_number")
+                    ).props("outline").mark("candidate-select-id")
 
                 technical_refs: dict[str, Any] = {}
 
@@ -1877,6 +1911,72 @@ def render_candidate_page(
         )
         filmstrip_container.set_visibility(False)
 
+        with ui.element("footer").classes(
+            "lte-action-dock lte-candidate-action-dock"
+        ).props(
+            f'role=region aria-label="{translator.text("candidates.action_dock")}"'
+        ).mark("candidate-action-dock"):
+            action_buttons = render_action_bar(
+                ui,
+                (
+                    ActionSpec(
+                        "back",
+                        translator.text("candidates.back_to_configure"),
+                        lambda: ui.navigate.to("/configure"),
+                        role="tertiary",
+                        marker="candidate-back",
+                    ),
+                    ActionSpec(
+                        "start",
+                        translator.text("action.start_scan"),
+                        lambda: start_scan(force=False),
+                        role="secondary",
+                        marker="candidate-start",
+                    ),
+                    ActionSpec(
+                        "cancel",
+                        translator.text("action.cancel"),
+                        lambda: cancel_scan(),
+                        role="tertiary",
+                        marker="candidate-cancel",
+                    ),
+                    ActionSpec(
+                        "confirm",
+                        translator.text("candidates.confirm_selection"),
+                        lambda: confirm_selection(),
+                        role="primary",
+                        marker="candidate-confirm",
+                    ),
+                ),
+                sticky=True,
+            )
+            start_button = action_buttons["start"]
+            cancel_button = action_buttons["cancel"]
+            confirm_button = action_buttons["confirm"]
+            force_button = None
+            overflow_trigger = None
+            if allow_rescan:
+                overflow_items: dict[str, Any] = {}
+                overflow_trigger = render_overflow_menu(
+                    ui,
+                    (
+                        MenuActionSpec(
+                            translator.text("candidates.force_rescan"),
+                            "refresh",
+                            lambda: start_scan(force=True),
+                            marker="candidate-force",
+                        ),
+                    ),
+                    label=translator.text("candidates.more_actions"),
+                    marker="candidate-overflow",
+                    item_sink=overflow_items,
+                )
+                force_button = overflow_items["candidate-force"]
+            if not allow_rescan:
+                for button in (start_button, cancel_button):
+                    button.disable()
+                    button.set_visibility(False)
+
     def notify_busy() -> None:
         ui.notify(translator.text("error.job_busy"), type="warning")
 
@@ -1887,7 +1987,13 @@ def render_candidate_page(
         cancel_button.set_enabled(
             allow_rescan and state.phase in {"starting", "cache", "scanning"}
         )
-        force_button.set_enabled(allow_rescan and not running and not any_job)
+        if force_button is not None:
+            force_button.set_enabled(allow_rescan and not running and not any_job)
+            has_completed_scan = (
+                state.scan_completed or controller.session.scan_result is not None
+            )
+            force_button.set_visibility(has_completed_scan)
+            overflow_trigger.set_visibility(has_completed_scan)
         previous_button.set_enabled(bool(state.candidates))
         next_button.set_enabled(bool(state.candidates))
         choose_id_button.set_enabled(bool(state.candidates))
@@ -2194,6 +2300,9 @@ def render_candidate_page(
         cache_label.set_text(
             translator.text(cache_presentation(state.cache_status).label_key)
         )
+        map_status_key, source_status_key = _candidate_status_keys(state)
+        map_status_label.set_text(translator.text(map_status_key))
+        source_status_label.set_text(translator.text(source_status_key))
         if state.dem_style_asset is not None:
             asset_path = str(state.dem_style_asset.path)
             if asset_path != last_dem_asset_path:
@@ -2586,13 +2695,9 @@ def render_candidate_page(
     map_element.on("map-layerremove", handle_layer_removed)
     map_view_button.on("click", lambda: switch_view("map"))
     filmstrip_view_button.on("click", lambda: switch_view("filmstrip"))
-    start_button.on("click", lambda: start_scan(force=False))
-    cancel_button.on("click", cancel_scan)
-    force_button.on("click", lambda: start_scan(force=True))
     previous_button.on("click", lambda: choose_relative(-1))
     next_button.on("click", lambda: choose_relative(1))
     choose_id_button.on("click", choose_direct)
-    confirm_button.on("click", confirm_selection)
     dem_switch.on_value_change(
         lambda event: toggle_simple_layer("dem", dem_layer, bool(event.value))
     )

@@ -965,7 +965,7 @@ h3,
 
 .lte-candidate-workspace {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) clamp(320px, 24vw, 360px);
+  grid-template-columns: minmax(0, 1.55fr) minmax(280px, 0.85fr);
   align-items: stretch;
   gap: var(--lte-space-4);
   min-width: 0;
@@ -981,7 +981,7 @@ h3,
 
 .lte-candidate-map-wrap,
 .lte-candidate-map {
-  min-height: 480px;
+  min-height: 560px;
   height: 100%;
 }
 
@@ -996,8 +996,9 @@ h3,
   flex: 0 0 auto;
   gap: var(--lte-space-2);
 }
-.lte-dem-opacity { width: 120px; }
-.lte-dem-style { width: 144px; }
+.lte-layer-controls .q-toggle { width: 100%; }
+.lte-dem-opacity,
+.lte-dem-style { width: 100%; }
 
 .lte-candidate-inspector {
   min-width: 0;
@@ -1005,6 +1006,69 @@ h3,
   overflow-y: auto;
   overscroll-behavior: contain;
   gap: var(--lte-space-3);
+}
+
+.lte-candidate-counts,
+.lte-candidate-map-source-status {
+  width: 100%;
+  gap: var(--lte-space-2);
+}
+
+.lte-candidate-counts {
+  padding-bottom: var(--lte-space-3);
+  border-bottom: 1px solid var(--lte-border);
+}
+
+.lte-candidate-status,
+.lte-candidate-source-status {
+  width: 100%;
+  padding: 9px 11px;
+  overflow-wrap: anywhere;
+  color: var(--lte-ink-muted);
+  background: var(--lte-accent-soft);
+  border-left: 3px solid var(--lte-accent);
+  border-radius: var(--lte-radius-sm);
+  font-size: 12px;
+}
+
+.lte-candidate-source-status {
+  background: #eef1ed;
+  border-left-color: var(--lte-frame);
+}
+
+.lte-candidate-navigation {
+  align-items: flex-end;
+  gap: var(--lte-space-2);
+  flex-wrap: wrap;
+}
+
+.lte-candidate-navigation .q-btn { min-height: 44px; }
+
+.lte-candidate-action-dock {
+  position: sticky;
+  z-index: 5;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-width: 0;
+  gap: var(--lte-space-2);
+  padding: 10px 12px;
+  background: rgb(242 241 235 / 96%);
+  border-top: 1px solid var(--lte-border);
+  backdrop-filter: blur(8px);
+}
+
+.lte-candidate-action-dock .lte-action-bar--sticky {
+  position: static;
+  padding: 0;
+  background: transparent;
+}
+
+.lte-candidate-action-dock .lte-overflow-menu__trigger {
+  flex: 0 0 auto;
+  min-width: 44px;
+  min-height: 44px;
 }
 
 .lte-candidate-toolbar {
@@ -1426,11 +1490,8 @@ button:disabled,
   }
   .lte-main { padding: 22px 18px 32px; }
   .lte-form-grid { grid-template-columns: 1fr !important; }
-  .lte-candidate-workspace { grid-template-columns: 1fr; }
   .lte-figure-workspace { grid-template-columns: 1fr; }
   .lte-history-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .lte-candidate-map-card { height: min(70vh, 700px); }
-  .lte-candidate-inspector { max-height: none; }
 }
 
 @media (max-width: 760px) {
@@ -1457,6 +1518,32 @@ button:disabled,
   }
 
   .lte-configure-action-dock .q-btn {
+    flex: 1 1 180px;
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  .lte-candidate-review-workspace {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--lte-space-3);
+  }
+
+  .lte-candidate-review-inspector { max-height: none; }
+
+  .lte-candidate-action-dock {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    flex-wrap: wrap;
+  }
+
+  .lte-candidate-action-dock .lte-action-bar {
+    flex: 1 1 100%;
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .lte-candidate-action-dock .q-btn {
     flex: 1 1 180px;
     min-width: 44px;
     min-height: 44px;
@@ -1607,6 +1694,16 @@ button:disabled,
     height: auto;
   }
 
+  .lte-layer-controls {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .lte-candidate-navigation { align-items: stretch; }
+
+  .lte-candidate-navigation .q-btn,
+  .lte-candidate-navigation .q-field { flex: 1 1 140px; }
+
   .lte-candidate-toolbar-group {
     flex: 1 1 100%;
     flex-wrap: wrap;
@@ -1641,6 +1738,12 @@ button:disabled,
 
   .lte-web-selector-frame,
   .lte-candidate-page,
+  .lte-candidate-review-workspace,
+  .lte-candidate-map-panel,
+  .lte-candidate-map-wrap,
+  .lte-candidate-map,
+  .lte-candidate-review-inspector,
+  .lte-candidate-action-dock,
   .lte-configure-page,
   .lte-configure-workspace,
   .lte-configure-form-column,
@@ -1660,10 +1763,14 @@ button:disabled,
   .lte-candidate-progress,
   .lte-candidate-toolbar,
   .lte-candidate-workspace,
+  .lte-candidate-review-workspace,
   .lte-candidate-map-card,
+  .lte-candidate-map-panel,
   .lte-candidate-map-wrap,
   .lte-candidate-map,
   .lte-candidate-inspector,
+  .lte-candidate-review-inspector,
+  .lte-candidate-action-dock,
   .lte-candidate-filmstrip {
     width: 100%;
     max-width: 100%;
@@ -1711,6 +1818,27 @@ button:disabled,
     width: 100%;
     max-width: 100%;
     min-width: 0;
+  }
+
+  .lte-layer-controls { grid-template-columns: minmax(0, 1fr); }
+
+  .lte-candidate-navigation,
+  .lte-candidate-action-dock,
+  .lte-candidate-action-dock .lte-action-bar {
+    align-items: stretch;
+    width: 100%;
+    min-width: 0;
+    flex-wrap: wrap;
+  }
+
+  .lte-candidate-navigation .q-btn,
+  .lte-candidate-navigation .q-field,
+  .lte-candidate-action-dock .q-btn {
+    width: 100%;
+    max-width: 100%;
+    min-width: 44px;
+    min-height: 44px;
+    flex: 1 1 100%;
   }
 
   .lte-candidate-workspace { grid-template-columns: minmax(0, 1fr); }
@@ -1764,6 +1892,10 @@ button:disabled,
   .lte-command-bar *,
   .lte-command-bar *::before,
   .lte-command-bar *::after,
+  .lte-candidate-page,
+  .lte-candidate-page *,
+  .lte-candidate-page *::before,
+  .lte-candidate-page *::after,
   .lte-scenario-cover__skeleton {
     scroll-behavior: auto !important;
     transition: none !important;
