@@ -198,6 +198,32 @@ def test_gui_css_defines_field_atlas_shell_and_mobile_touch_contract():
     assert "@media (prefers-reduced-motion: reduce)" in css
 
 
+def test_gui_css_keeps_the_workstation_shell_viewport_bounded_and_motion_safe():
+    css = (ROOT / "src/lte_scenario_toolkit/gui/assets/app.css").read_text(
+        encoding="utf-8"
+    )
+
+    assert "--lte-command-height: 58px;" in css
+    assert "height: 100dvh;" in css
+    assert "min-height: calc(100dvh - var(--lte-command-height));" in css
+    assert "box-sizing: border-box;" in css
+    assert ".lte-main" in css
+    assert "overflow-x: hidden;" in css
+    assert "overflow-y: auto;" in css
+    assert ".lte-rail-nav" in css
+    assert "@media (max-width: 980px)" in css
+    assert ".lte-navigation-rail.q-drawer--mobile.q-drawer--mini" in css
+    assert "width: 224px !important;" in css
+    assert "env(safe-area-inset-top)" in css
+    assert "env(safe-area-inset-bottom)" in css
+    assert "@media (prefers-reduced-motion: reduce)" in css
+
+    shell_menu = re.search(r"\.lte-shell-menu\s*\{(?P<body>[^}]+)\}", css)
+    assert shell_menu is not None
+    assert "min-width: 44px;" in shell_menu.group("body")
+    assert "min-height: 44px;" in shell_menu.group("body")
+
+
 def test_every_page_title_declares_level_one_heading_semantics():
     paths = (
         ROOT / "src/lte_scenario_toolkit/gui/presentation.py",
@@ -1699,6 +1725,33 @@ async def test_gui_shell_applies_navigation_mini_state_and_persists_rail_toggle(
 
     assert navigation.value is True
     assert module.GuiSettingsStore(tmp_path).load().navigation_collapsed is False
+
+
+async def test_gui_shell_keeps_the_mobile_overlay_control_separate_from_mini_mode(
+    tmp_path, user
+):
+    module = _gui_module("app")
+    module.GuiSettingsStore(tmp_path).save(
+        language="en",
+        output_roots=[],
+        navigation_collapsed=True,
+    )
+    module.create_app(catalog=SimpleNamespace(root=tmp_path.resolve()), testing=True)
+
+    await user.open("/")
+
+    navigation = next(iter(user.find(marker="shell-navigation").elements))
+    assert navigation._props["mini"] is True
+    assert str(navigation._props["width"]) == "224"
+    assert str(navigation._props["mini-width"]) == "68"
+    assert str(navigation._props["breakpoint"]) == "980"
+    assert navigation._props["show-if-above"] is True
+
+    user.find(marker="shell-menu").click()
+    await asyncio.sleep(0.05)
+
+    assert navigation.value is True
+    assert module.GuiSettingsStore(tmp_path).load().navigation_collapsed is True
 
 
 async def test_gui_shell_renders_and_switches_language_offline(
