@@ -2928,14 +2928,21 @@ async def test_configure_workbench_groups_profile_actions_and_run_review(user, t
 
 
 @pytest.mark.parametrize(
-    ("language", "workflow_label", "data_label", "review_label"),
+    ("language", "workflow_label", "data_label", "review_label", "pending_label"),
     (
-        ("en", "Configuration workflow", "Data: complete", "Review: current step"),
+        (
+            "en",
+            "Configuration workflow",
+            "Data: complete",
+            "Review: current step",
+            "Review: pending",
+        ),
         (
             "zh-CN",
             "\u914d\u7f6e\u5de5\u4f5c\u6d41\u7a0b",
             "\u6570\u636e\uff1a\u5df2\u5b8c\u6210",
             "\u590d\u6838\uff1a\u5f53\u524d\u6b65\u9aa4",
+            "\u590d\u6838\uff1a\u7b49\u5f85\u4e2d",
         ),
     ),
 )
@@ -2946,6 +2953,7 @@ async def test_configure_stepper_exposes_localized_current_state(
     workflow_label,
     data_label,
     review_label,
+    pending_label,
 ):
     from lte_scenario_toolkit.gui.app import create_app
     from lte_scenario_toolkit.gui.settings import GuiSettingsStore
@@ -2971,6 +2979,81 @@ async def test_configure_stepper_exposes_localized_current_state(
     assert data.props["aria-label"] == data_label
     assert review.props["aria-current"] == "step"
     assert review.props["aria-label"] == review_label
+
+    user.find(marker="profile-display-name").clear().type("Changed")
+    profile = next(iter(user.find(marker="configure-step-profile").elements))
+    assert profile.props["aria-current"] == "step"
+    assert "aria-current" not in review.props
+    assert review.props["aria-label"] == pending_label
+
+
+async def test_configure_stepper_has_one_current_step_after_validation_and_blocking(
+    user, tmp_path
+):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from lte_scenario_toolkit.gui.app import create_app
+
+    class EmptyStore:
+        def discover(self, scenario_id):
+            return []
+
+    class Service:
+        def preflight(self, profile, output_root):
+            return SimpleNamespace(profile=profile, output_root=output_root)
+
+    def current_step_markers():
+        return tuple(
+            marker
+            for marker in (
+                "configure-step-data",
+                "configure-step-profile",
+                "configure-step-review",
+            )
+            if next(iter(user.find(marker=marker).elements)).props.get("aria-current")
+            == "step"
+        )
+
+    create_app(
+        catalog=_Task13Catalog(tmp_path),
+        profile_store=EmptyStore(),
+        selection_service_factory=lambda _catalog: Service(),
+        testing=True,
+    )
+    await user.open("/configure/without-default")
+    assert current_step_markers() == ("configure-step-review",)
+
+    user.find(marker="profile-display-name").clear().type("Changed")
+    assert current_step_markers() == ("configure-step-profile",)
+
+    user.find(marker="profile-overflow").click()
+    user.find(marker="profile-validate").click()
+    await user.should_see("Preflight passed")
+    assert current_step_markers() == ("configure-step-profile",)
+    review = next(iter(user.find(marker="configure-step-review").elements))
+    assert review.props["aria-label"] == "Review: pending"
+
+    blocked_catalog = _Task13Catalog(tmp_path)
+    blocked_profile = replace(
+        _task13_profile(tmp_path),
+        scenario_id="pending-city",
+        source_path=tmp_path / "configs/pending.yaml",
+    )
+
+    class PendingStore:
+        def discover(self, scenario_id):
+            return [blocked_profile] if scenario_id == "pending-city" else []
+
+    create_app(
+        catalog=blocked_catalog,
+        profile_store=PendingStore(),
+        testing=True,
+    )
+    await user.open("/configure/pending-city")
+    assert current_step_markers() == ("configure-step-data",)
+    data = next(iter(user.find(marker="configure-step-data").elements))
+    assert data.props["aria-label"] == "Data: needs attention"
 
 
 async def test_configure_overflow_validation_does_not_open_candidate_session(user, tmp_path):

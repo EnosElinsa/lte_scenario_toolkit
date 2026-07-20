@@ -734,12 +734,18 @@ def render_configure_page(
                     )
                     next_step_summary = ui.label().mark("configure-summary-next-step")
 
-        def present_step(element: Any, step_key: str, state: str) -> None:
+        def present_step(
+            element: Any,
+            step_key: str,
+            state: str,
+            *,
+            current: bool = False,
+        ) -> None:
             element.classes(
                 add=f"lte-configure-step--{state}",
                 remove=(
                     "lte-configure-step--blocked lte-configure-step--complete "
-                    "lte-configure-step--current"
+                    "lte-configure-step--current lte-configure-step--pending"
                 ),
             )
             element.props(remove="aria-current")
@@ -748,7 +754,7 @@ def render_configure_page(
                 step=translator.text(step_key),
             )
             element.props(add=f'aria-label="{state_label}"')
-            if state == "current":
+            if current:
                 element.props(add="aria-current=step")
 
         def refresh_workflow_presentation() -> None:
@@ -756,10 +762,10 @@ def render_configure_page(
             blocked = model.selection_error is not None or model.status != "ready"
             if blocked:
                 next_key = "configure.next_step.blocked"
-            elif workflow_state["preflight_passed"]:
-                next_key = "configure.next_step.reviewed"
             elif dirty:
                 next_key = "configure.next_step.dirty"
+            elif workflow_state["preflight_passed"]:
+                next_key = "configure.next_step.reviewed"
             else:
                 next_key = "configure.next_step.ready"
             summary_profile_state.set_text(
@@ -767,27 +773,37 @@ def render_configure_page(
             )
             next_step_summary.set_text(translator.text(next_key))
 
-            present_step(
-                data_step,
-                "configure.workflow.data",
-                "blocked" if blocked else "complete",
-            )
-            present_step(
-                profile_step,
-                "configure.workflow.profile",
-                "current" if dirty else "complete",
-            )
-            present_step(
-                review_step,
-                "configure.workflow.review",
-                (
-                    "blocked"
-                    if blocked
-                    else "complete"
-                    if workflow_state["preflight_passed"]
-                    else "current"
-                ),
-            )
+            if blocked:
+                present_step(
+                    data_step,
+                    "configure.workflow.data",
+                    "blocked",
+                    current=True,
+                )
+                present_step(profile_step, "configure.workflow.profile", "pending")
+                present_step(review_step, "configure.workflow.review", "pending")
+            elif dirty:
+                present_step(data_step, "configure.workflow.data", "complete")
+                present_step(
+                    profile_step,
+                    "configure.workflow.profile",
+                    "current",
+                    current=True,
+                )
+                present_step(review_step, "configure.workflow.review", "pending")
+            else:
+                present_step(data_step, "configure.workflow.data", "complete")
+                present_step(profile_step, "configure.workflow.profile", "complete")
+                present_step(
+                    review_step,
+                    "configure.workflow.review",
+                    (
+                        "complete"
+                        if workflow_state["preflight_passed"]
+                        else "current"
+                    ),
+                    current=True,
+                )
 
         refresh_workflow_presentation()
 
