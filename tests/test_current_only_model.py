@@ -41,7 +41,11 @@ def test_gui_settings_are_written_without_a_schema_discriminator(tmp_path):
     store.save(language="en", output_roots=[])
 
     payload = json.loads(store.path.read_text(encoding="utf-8"))
-    assert payload == {"language": "en", "output_roots": []}
+    assert payload == {
+        "language": "en",
+        "output_roots": [],
+        "navigation_collapsed": False,
+    }
 
 
 def test_figures_reject_a_bare_csv_source_and_have_no_dem_attachment(tmp_path):

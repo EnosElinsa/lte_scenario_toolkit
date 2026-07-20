@@ -254,9 +254,9 @@ def test_translation_dictionaries_have_identical_keys_and_format_values():
     assert module.Translator("en").text("nav.collapse") == "Collapse navigation"
     assert module.Translator("en").text("nav.expand") == "Expand navigation"
     assert module.Translator("en").text("nav.more") == "More navigation options"
-    assert module.Translator("zh-CN").text("nav.collapse") == "收起导航"
-    assert module.Translator("zh-CN").text("nav.expand") == "展开导航"
-    assert module.Translator("zh-CN").text("nav.more") == "更多导航选项"
+    assert module.Translator("zh-CN").text("nav.collapse") == "\u6536\u8d77\u5bfc\u822a"
+    assert module.Translator("zh-CN").text("nav.expand") == "\u5c55\u5f00\u5bfc\u822a"
+    assert module.Translator("zh-CN").text("nav.more") == "\u66f4\u591a\u5bfc\u822a\u9009\u9879"
     assert module.Translator("en").text("job.running", name="Scan 1") == "Running Scan 1"
     assert module.Translator("en").text("shell.eyebrow") == "LTE / Operations"
     assert module.Translator("zh-CN").text("shell.eyebrow") == "LTE / \u4f5c\u4e1a\u53f0"
@@ -618,29 +618,52 @@ def test_gui_settings_navigation_preference_roundtrip_preserves_other_settings(t
     }
 
 
-def test_gui_settings_stale_schema_without_navigation_preference_loads_defaults(
+def test_gui_settings_legacy_schema_preserves_existing_preferences(
     tmp_path,
 ):
     module = _gui_module("settings")
     store = module.GuiSettingsStore(tmp_path)
+    output_root = (tmp_path / "outputs").resolve()
     store.path.parent.mkdir()
-    stale = {
+    legacy = {
         "language": "zh-CN",
-        "output_roots": [str((tmp_path / "outputs").resolve())],
+        "output_roots": [str(output_root)],
     }
-    store.path.write_text(json.dumps(stale), encoding="utf-8")
+    store.path.write_text(json.dumps(legacy), encoding="utf-8")
 
-    assert store.load() == module.GuiSettings()
-    assert json.loads(store.path.read_text(encoding="utf-8")) == stale
+    loaded = store.load()
 
     updated = store.update(navigation_collapsed=True)
 
-    assert updated == module.GuiSettings(navigation_collapsed=True)
+    assert loaded.language == "zh-CN"
+    assert loaded.output_roots == (output_root,)
+    assert loaded.navigation_collapsed is False
+    assert updated.language == "zh-CN"
+    assert updated.output_roots == (output_root,)
+    assert updated.navigation_collapsed is True
     assert json.loads(store.path.read_text(encoding="utf-8")) == {
-        "language": "en",
-        "output_roots": [],
+        "language": "zh-CN",
+        "output_roots": [str(output_root)],
         "navigation_collapsed": True,
     }
+
+
+def test_gui_settings_save_preserves_navigation_preference_when_omitted(tmp_path):
+    module = _gui_module("settings")
+    store = module.GuiSettingsStore(tmp_path)
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    store.save(
+        language="en",
+        output_roots=[first_root],
+        navigation_collapsed=True,
+    )
+
+    saved = store.save(language="zh-CN", output_roots=[second_root])
+
+    assert saved.language == "zh-CN"
+    assert saved.output_roots == (second_root.resolve(),)
+    assert saved.navigation_collapsed is True
 
 
 def test_gui_defaults_to_loopback_and_opens_browser():

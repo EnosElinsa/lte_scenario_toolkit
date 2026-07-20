@@ -89,16 +89,21 @@ class GuiSettingsStore:
         *,
         language: str,
         output_roots: Iterable[str | os.PathLike[str]],
-        navigation_collapsed: bool = False,
+        navigation_collapsed: bool | None = None,
     ) -> GuiSettings:
         """Validate, normalize, and atomically persist workstation settings."""
 
-        settings = self._validated_settings(
-            language,
-            output_roots,
-            navigation_collapsed,
-        )
         with _SETTINGS_WRITE_LOCK:
+            current = self.load()
+            settings = self._validated_settings(
+                language,
+                output_roots,
+                (
+                    current.navigation_collapsed
+                    if navigation_collapsed is None
+                    else navigation_collapsed
+                ),
+            )
             self._persist_locked(settings)
         return settings
 
@@ -150,8 +155,14 @@ class GuiSettingsStore:
     def _settings_from_document(self, document: object) -> GuiSettings:
         if not isinstance(document, dict):
             raise GuiSettingsError("GUI settings must be a JSON object")
-        expected = {"language", "output_roots", "navigation_collapsed"}
-        if set(document) != expected:
+        legacy_expected = {"language", "output_roots"}
+        expected = {*legacy_expected, "navigation_collapsed"}
+        keys = set(document)
+        if keys == legacy_expected:
+            navigation_collapsed = False
+        elif keys == expected:
+            navigation_collapsed = document["navigation_collapsed"]
+        else:
             raise GuiSettingsError(
                 "GUI settings must contain language, output_roots, and navigation_collapsed"
             )
@@ -163,7 +174,7 @@ class GuiSettingsStore:
         settings = self._validated_settings(
             document["language"],
             roots,
-            document["navigation_collapsed"],
+            navigation_collapsed,
         )
         return settings
 
