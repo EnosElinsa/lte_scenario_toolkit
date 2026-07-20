@@ -304,6 +304,11 @@ def render_scenarios_page(
     preview_holders: list[Any] = []
     inspector_content: Any | None = None
     drawer: Any | None = None
+    inspector_state: dict[str, Any] = {
+        "scenario_id": None,
+        "request_token": None,
+        "visible": False,
+    }
 
     def inspector_body() -> None:
         nonlocal inspector_content
@@ -311,26 +316,52 @@ def render_scenarios_page(
             "lte-scenario-inspector__content full-width"
         )
 
+    def set_inspector_visibility(event: Any) -> None:
+        value = getattr(event, "value", event)
+        inspector_state["visible"] = bool(value)
+
+    def close_inspector() -> None:
+        assert drawer is not None
+        inspector_state["visible"] = False
+        drawer.hide()
+
     def show_inspector(
         card: ScenarioCard,
         section: str,
         *,
         result: ValidationResult | None = None,
         error: str | None = None,
-    ) -> None:
+        request_token: object | None = None,
+        reveal: bool = True,
+    ) -> object | None:
         assert inspector_content is not None
         assert drawer is not None
+        token = object() if request_token is None else request_token
+        if reveal:
+            inspector_state.update(
+                scenario_id=card.scenario_id,
+                request_token=token,
+                visible=True,
+            )
+        elif not (
+            inspector_state["scenario_id"] == card.scenario_id
+            and inspector_state["request_token"] is token
+            and inspector_state["visible"]
+        ):
+            return None
         inspector_content.clear()
         status = readiness_presentation(card.status)
         with inspector_content:
             with ui.row().classes("items-center justify-between no-wrap full-width"):
-                ui.label(card.display_name).classes("lte-card-title")
+                ui.label(card.display_name).classes("lte-card-title").mark(
+                    "scenario-inspector-selected"
+                )
                 ui.button(
                     icon="close",
-                    on_click=drawer.hide,
+                    on_click=close_inspector,
                 ).props(
                     f'flat round aria-label="{translator.text("action.close")}"'
-                )
+                ).mark("scenario-inspector-close")
             render_status_badge(ui, translator, status)
             ui.label(
                 translator.text(
@@ -386,7 +417,9 @@ def render_scenarios_page(
                     else "scenarios.next_step.preparation"
                 )
             ).classes("lte-scenario-next-step")
-        drawer.show()
+        if reveal:
+            drawer.show()
+        return token
 
     with ui.column().classes("lte-page lte-scenarios-page"):
         ui.label(translator.text("scenarios.breadcrumb")).classes(
@@ -436,6 +469,7 @@ def render_scenarios_page(
             ui,
             translator.text("scenarios.inspector.title"),
             inspector_body,
+            on_value_change=set_inspector_visibility,
             marker="scenario-inspector",
         )
         with ui.element("div").classes("lte-card-grid lte-scenario-grid").mark(
@@ -660,7 +694,8 @@ def _render_scenario_card(
                 full_button.set_enabled(True)
                 show_inspector(card, "validation", error=str(exc))
                 return
-            show_inspector(card, "validation")
+            validation_token = show_inspector(card, "validation")
+            assert validation_token is not None
 
             def collect() -> None:
                 if validation_generation["value"] != generation:
@@ -674,9 +709,21 @@ def _render_scenario_card(
                 fast_button.set_enabled(True)
                 full_button.set_enabled(True)
                 if update.result is not None:
-                    show_inspector(card, "validation", result=update.result)
+                    show_inspector(
+                        card,
+                        "validation",
+                        result=update.result,
+                        request_token=validation_token,
+                        reveal=False,
+                    )
                 else:
-                    show_inspector(card, "validation", error=update.error or "")
+                    show_inspector(
+                        card,
+                        "validation",
+                        error=update.error or "",
+                        request_token=validation_token,
+                        reveal=False,
+                    )
 
             timer = ui.timer(0.2, collect, active=False)
             active_timer["value"] = timer

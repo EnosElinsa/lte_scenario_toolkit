@@ -2788,6 +2788,10 @@ def test_scenario_catalog_css_declares_three_two_one_column_layout():
     assert "grid-template-columns: repeat(2, minmax(0, 1fr));" in css
     assert ".lte-card-grid { grid-template-columns: minmax(0, 1fr); }" in css
     assert "aspect-ratio: 19 / 9;" in css
+    reduced_motion = css.split("@media (prefers-reduced-motion: reduce)", 1)[1]
+    assert ".lte-scenario-cover__skeleton" in reduced_motion
+    assert "animation: none !important;" in reduced_motion
+    assert "transition: none !important;" in reduced_motion
 
 
 
@@ -2934,6 +2938,113 @@ async def test_full_checksum_button_blocks_duplicate_timer_generation(
         release.set()
         await user.should_see("Validation passed", retries=10)
         assert all(element.enabled for element in checksum.elements)
+    finally:
+        release.set()
+        coordinator.shutdown()
+
+
+async def test_full_checksum_completion_does_not_replace_new_inspector_selection(
+    user, tmp_path, monkeypatch
+):
+    from lte_scenario_toolkit.gui.app import create_app
+    from lte_scenario_toolkit.gui.pages import scenarios
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    started = Event()
+    release = Event()
+    coordinator = JobCoordinator()
+
+    def validate(catalog, scenario_id, **kwargs):
+        started.set()
+        assert release.wait(2)
+        return scenarios.ValidationResult(
+            scenario_id=scenario_id,
+            status="ready",
+            ok=True,
+            messages=(),
+            full_checksum=True,
+        )
+
+    monkeypatch.setattr(scenarios, "run_validation", validate)
+    try:
+        create_app(
+            catalog=_Task13Catalog(tmp_path),
+            profile_store=object(),
+            coordinator=coordinator,
+            testing=True,
+        )
+        await user.open("/scenarios")
+
+        checksum = user.find(marker="scenario-checksum-ready-city")
+        checksum.click()
+        assert await asyncio.to_thread(started.wait, 1)
+        user.find(marker="scenario-technical-pending-city").click()
+        await user.should_see(
+            marker="scenario-inspector-selected", content="Pending City"
+        )
+
+        release.set()
+        for _ in range(20):
+            if all(element.enabled for element in checksum.elements):
+                break
+            await asyncio.sleep(0.05)
+
+        assert all(element.enabled for element in checksum.elements)
+        await user.should_see(
+            marker="scenario-inspector-selected", content="Pending City"
+        )
+    finally:
+        release.set()
+        coordinator.shutdown()
+
+
+async def test_full_checksum_completion_does_not_reopen_closed_inspector(
+    user, tmp_path, monkeypatch
+):
+    from lte_scenario_toolkit.gui.app import create_app
+    from lte_scenario_toolkit.gui.pages import scenarios
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    started = Event()
+    release = Event()
+    coordinator = JobCoordinator()
+
+    def validate(catalog, scenario_id, **kwargs):
+        started.set()
+        assert release.wait(2)
+        return scenarios.ValidationResult(
+            scenario_id=scenario_id,
+            status="ready",
+            ok=True,
+            messages=(),
+            full_checksum=True,
+        )
+
+    monkeypatch.setattr(scenarios, "run_validation", validate)
+    try:
+        create_app(
+            catalog=_Task13Catalog(tmp_path),
+            profile_store=object(),
+            coordinator=coordinator,
+            testing=True,
+        )
+        await user.open("/scenarios")
+
+        checksum = user.find(marker="scenario-checksum-ready-city")
+        checksum.click()
+        assert await asyncio.to_thread(started.wait, 1)
+        user.find(marker="scenario-inspector-close").click()
+        drawer = next(iter(user.find(marker="scenario-inspector").elements))
+        assert drawer.value is False
+
+        release.set()
+        for _ in range(20):
+            if all(element.enabled for element in checksum.elements):
+                break
+            await asyncio.sleep(0.05)
+
+        assert all(element.enabled for element in checksum.elements)
+        assert drawer.value is False
     finally:
         release.set()
         coordinator.shutdown()

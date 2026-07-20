@@ -1622,7 +1622,8 @@ button:disabled,
   .lte-command-bar,
   .lte-command-bar *,
   .lte-command-bar *::before,
-  .lte-command-bar *::after {
+  .lte-command-bar *::after,
+  .lte-scenario-cover__skeleton {
     scroll-behavior: auto !important;
     transition: none !important;
     animation: none !important;
