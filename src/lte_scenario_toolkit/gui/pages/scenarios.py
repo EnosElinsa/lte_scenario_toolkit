@@ -537,9 +537,13 @@ def _render_preview_cover(
                     scenario=card.display_name,
                     kind=translator.text(kind_key),
                 )
-            except Exception as exc:
+            except Exception:
                 ui.icon("map").classes("lte-scenario-cover__fallback")
-                diagnostic = diagnostic or result.diagnostic or str(exc)
+                diagnostic = (
+                    diagnostic
+                    or result.diagnostic
+                    or translator.text("scenarios.preview.failed")
+                )
                 kind_key = "scenarios.preview.fallback"
         ui.label(translator.text(kind_key)).classes(
             "lte-scenario-cover__kind"

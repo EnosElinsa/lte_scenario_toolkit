@@ -80,6 +80,7 @@ h3,
   max-width: 100%;
   box-sizing: border-box;
   overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .lte-navigation-rail.q-drawer--mini {
@@ -728,6 +729,14 @@ h3,
   min-height: 36px;
   border-radius: var(--lte-radius-sm);
   box-shadow: none;
+}
+
+.lte-overflow-menu__trigger,
+.lte-action-dock .q-btn,
+.lte-confirmation-dialog .q-btn,
+.lte-inspector-drawer .q-btn {
+  min-width: 44px;
+  min-height: 44px;
 }
 
 .lte-action--primary {
@@ -1444,6 +1453,7 @@ h3,
   max-width: 100%;
   padding: var(--lte-space-4);
   padding-bottom: calc(var(--lte-space-4) + env(safe-area-inset-bottom));
+  overflow-x: hidden;
   overflow-y: auto;
 }
 
@@ -2243,6 +2253,10 @@ button:disabled,
   .lte-figures-page *,
   .lte-figures-page *::before,
   .lte-figures-page *::after,
+  .lte-main,
+  .lte-main *,
+  .lte-main *::before,
+  .lte-main *::after,
   .lte-scenario-cover__skeleton {
     scroll-behavior: auto !important;
     transition: none !important;

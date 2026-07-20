@@ -255,6 +255,20 @@ def test_gui_css_keeps_the_workstation_shell_viewport_bounded_and_motion_safe():
     assert shell_menu is not None
     assert "min-width: 44px;" in shell_menu.group("body")
     assert "min-height: 44px;" in shell_menu.group("body")
+    overflow_trigger = re.search(
+        r"\.lte-overflow-menu__trigger,\s*"
+        r"\.lte-action-dock \.q-btn,\s*"
+        r"\.lte-confirmation-dialog \.q-btn,\s*"
+        r"\.lte-inspector-drawer \.q-btn\s*\{(?P<body>[^}]+)\}",
+        css,
+    )
+    assert overflow_trigger is not None
+    assert "min-width: 44px;" in overflow_trigger.group("body")
+    assert "min-height: 44px;" in overflow_trigger.group("body")
+    assert ".lte-action-dock .q-btn" in css
+    assert ".lte-confirmation-dialog .q-btn" in css
+    assert ".lte-inspector-drawer .q-btn" in css
+    assert ".lte-main *" in css
 
 
 def test_every_page_title_declares_level_one_heading_semantics():
@@ -346,6 +360,51 @@ def test_translation_dictionaries_have_identical_keys_and_format_values():
         )
         == "\u5185\u90e8\u72b6\u6001\uff1aready"
     )
+
+
+def test_history_toolbar_aria_labels_use_localized_keys():
+    source = (ROOT / "src/lte_scenario_toolkit/gui/pages/history.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "aria-label=Search runs" not in source
+    assert "aria-label=Refresh history" not in source
+    assert 'translator, "history.search"' in source
+    assert 'translator, "history.refresh"' in source
+
+
+def test_status_badges_expose_localized_status_semantics():
+    module = _gui_module("presentation")
+    elements = []
+
+    class Element:
+        def __init__(self):
+            self.props_calls = []
+
+        def classes(self, _value):
+            return self
+
+        def props(self, value=None, *, add=None, remove=None):
+            self.props_calls.append(value if value is not None else add)
+            return self
+
+        def mark(self, _marker):
+            return self
+
+    class Ui:
+        def badge(self, *_args, **_kwargs):
+            element = Element()
+            elements.append(element)
+            return element
+
+    module.render_status_badge(
+        Ui(),
+        module.Translator("en") if hasattr(module, "Translator") else _gui_module("i18n").Translator("en"),
+        module.PresentationSpec("status.ready"),
+    )
+
+    assert elements
+    assert any("role=status" in (props or "") for props in elements[0].props_calls)
 
 
 def test_presentation_spec_is_an_immutable_compact_value():

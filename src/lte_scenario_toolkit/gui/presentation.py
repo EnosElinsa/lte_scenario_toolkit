@@ -271,7 +271,10 @@ def render_status_badge(
 ) -> Any:
     """Render one localized, semantic status badge."""
 
-    badge = ui.badge(translator.text(presentation.label_key)).classes(
+    label = translator.text(presentation.label_key)
+    badge = ui.badge(label).props(
+        f'role=status aria-label="{label}"'
+    ).classes(
         f"lte-status-badge lte-status-badge--{presentation.tone}"
     )
     return _mark(badge, marker)

@@ -1601,9 +1601,15 @@ def render_trash_card(
                     count=card.artifact_count,
                 )
             ).classes("lte-history-summary-item")
+            ui.label(
+                _translated(
+                    translator,
+                    "history.trash_root_count",
+                    "{count} output roots",
+                    count=len(card.roots),
+                )
+            ).classes("lte-history-summary-item")
             ui.label(prefix).classes("lte-history-summary-item")
-        for root in card.roots:
-            ui.label(str(root)).classes("lte-history-summary-item")
 
         state = _trash_state(card.state)
         if state is TrashState.RECOVERY_REQUIRED:
@@ -1701,6 +1707,8 @@ def render_trash_card(
             )
 
         def render_details() -> None:
+            for root in card.roots:
+                ui.label(str(root)).classes("lte-technical-copy")
             transaction = card.transaction
             if isinstance(transaction, TrashTransaction):
                 for member in transaction.members:
@@ -2144,7 +2152,10 @@ def render_history_content(
                 ),
             ).classes("lte-history-search").mark("history-search")
             if hasattr(search, "props"):
-                search.props("type=search aria-label=Search runs")
+                search.props(
+                    "type=search "
+                    f'aria-label="{_translated(translator, "history.search", "Search runs")}"'
+                )
             status_filter = ui.select(
                 {
                     "all": _translated(translator, "history.filter_all", "All statuses"),
@@ -2161,7 +2172,8 @@ def render_history_content(
                 _translated(translator, "action.refresh", "Refresh"),
                 on_click=reload_history,
             ).classes("lte-history-refresh").props(
-                "aria-label=Refresh history"
+                "aria-label="
+                f'"{_translated(translator, "history.refresh", "Refresh history")}"'
             ).mark("history-content-refresh")
         if pending:
             ui.label(
