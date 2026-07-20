@@ -28,7 +28,7 @@ class PresentationSpec:
     description_key: str | None = None
 
 
-ActionRole = Literal["primary", "secondary", "danger"]
+ActionRole = Literal["primary", "secondary", "tertiary", "danger"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +41,19 @@ class ActionSpec:
     role: ActionRole = "secondary"
     enabled: bool = True
     marker: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MenuActionSpec:
+    """One semantic overflow-menu action, independent of page state."""
+
+    label: str
+    icon: str | None
+    handler: Callable[..., Any]
+    enabled: bool = True
+    separator: bool = False
+    marker: str | None = None
+    role: ActionRole = "secondary"
 
 
 _UNKNOWN: Final = PresentationSpec("status.unknown")
@@ -286,12 +299,118 @@ def render_action_bar(
                 button.props("outline")
             elif action.role == "danger":
                 button.props("outline color=negative")
+            elif action.role == "tertiary":
+                button.props("flat")
             else:
                 button.props("unelevated")
             button.set_enabled(action.enabled)
             _mark(button, action.marker)
             buttons[action.name] = button
     return buttons
+
+
+def render_overflow_menu(
+    ui: Any,
+    actions: Iterable[MenuActionSpec],
+    *,
+    icon: str = "more_vert",
+    label: str = "More actions",
+    marker: str | None = None,
+) -> Any:
+    """Render a trigger-owned overflow menu from semantic action specifications."""
+
+    trigger = _mark(
+        ui.button(icon=icon)
+        .props(add=f'flat round aria-haspopup=menu aria-label="{label}"')
+        .classes("lte-overflow-menu__trigger"),
+        marker,
+    )
+    with trigger:
+        with ui.menu().classes("lte-overflow-menu"):
+            for action in actions:
+                if action.separator:
+                    ui.separator().classes("lte-overflow-menu__separator")
+                item = ui.menu_item(
+                    action.label,
+                    on_click=action.handler if action.enabled else None,
+                ).classes("lte-overflow-menu__item")
+                if action.role == "danger":
+                    item.classes("lte-overflow-menu__item--danger text-negative")
+                if not action.enabled:
+                    item.props(add="disable aria-disabled=true")
+                _mark(item, action.marker)
+                if action.icon is not None:
+                    with item:
+                        ui.icon(action.icon).classes("lte-overflow-menu__icon")
+    return trigger
+
+
+def render_sticky_action_dock(
+    ui: Any,
+    actions: Iterable[ActionSpec],
+    *,
+    label: str = "Page actions",
+    marker: str | None = None,
+) -> dict[str, Any]:
+    """Render a semantic action region fixed to the current workflow surface."""
+
+    with _mark(
+        ui.element("footer")
+        .classes("lte-action-dock")
+        .props(add=f'role=region aria-label="{label}"'),
+        marker,
+    ):
+        return render_action_bar(ui, actions, sticky=True)
+
+
+def render_inspector_drawer(
+    ui: Any,
+    title: str,
+    render_content: Callable[[], Any],
+    *,
+    value: bool = False,
+    on_value_change: Callable[..., Any] | None = None,
+    marker: str | None = None,
+) -> Any:
+    """Render a detail drawer while leaving its open state to the caller."""
+
+    drawer = _mark(
+        ui.right_drawer(value=value, fixed=True, bordered=True).classes(
+            "lte-inspector-drawer"
+        ),
+        marker,
+    )
+    if on_value_change is not None:
+        drawer.on_value_change(on_value_change)
+    with drawer:
+        ui.label(title).classes("lte-inspector-drawer__title").props(
+            add="role=heading aria-level=2"
+        )
+        render_content()
+    return drawer
+
+
+def render_section_heading(
+    ui: Any,
+    title: str,
+    description: str | None = None,
+    actions: Iterable[ActionSpec] = (),
+    *,
+    marker: str | None = None,
+) -> Any:
+    """Render a reusable second-level section heading with optional actions."""
+
+    with _mark(ui.row().classes("lte-section-heading"), marker) as header:
+        with ui.column().classes("lte-section-heading__copy"):
+            ui.label(title).classes("lte-section-title").props(
+                add="role=heading aria-level=2"
+            )
+            if description:
+                ui.label(description).classes("lte-section-heading__description")
+        action_items = tuple(actions)
+        if action_items:
+            render_action_bar(ui, action_items)
+    return header
 
 
 def render_page_header(
@@ -371,6 +490,7 @@ def render_loading_state(
 __all__ = [
     "ActionRole",
     "ActionSpec",
+    "MenuActionSpec",
     "PresentationSpec",
     "StatusTone",
     "TRASH_ACTIONS_BY_STATE",
@@ -382,8 +502,12 @@ __all__ = [
     "readiness_presentation",
     "render_action_bar",
     "render_empty_state",
+    "render_inspector_drawer",
     "render_loading_state",
+    "render_overflow_menu",
     "render_page_header",
+    "render_section_heading",
+    "render_sticky_action_dock",
     "render_status_badge",
     "render_technical_details",
     "run_state_presentation",

@@ -315,6 +315,294 @@ def test_presentation_action_spec_is_immutable_and_defaults_to_secondary():
         action.enabled = False
 
 
+def test_presentation_tertiary_action_keeps_a_distinct_css_hook_and_flat_button():
+    module = _gui_module("presentation")
+    trace = []
+
+    class Element:
+        def __init__(self, kind, *args, **kwargs):
+            self.kind = kind
+            self.args = args
+            self.kwargs = kwargs
+            self.class_values = []
+            self.prop_calls = []
+            self.enabled = None
+
+        def classes(self, value):
+            self.class_values.append(value)
+            return self
+
+        def props(self, add=None, *, remove=None):
+            self.prop_calls.append((add, remove))
+            return self
+
+        def set_enabled(self, enabled):
+            self.enabled = enabled
+            return self
+
+        def mark(self, marker):
+            trace.append(("mark", self.kind, marker))
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Ui:
+        def row(self):
+            element = Element("row")
+            trace.append(("row", element))
+            return element
+
+        def button(self, *args, **kwargs):
+            element = Element("button", *args, **kwargs)
+            trace.append(("button", element))
+            return element
+
+    buttons = module.render_action_bar(
+        Ui(),
+        (
+            module.ActionSpec("inspect", "Inspect", lambda: None, role="tertiary"),
+        ),
+    )
+
+    button = buttons["inspect"]
+    assert "lte-action lte-action--tertiary" in button.class_values
+    assert ("flat", None) in button.prop_calls
+    assert button.enabled is True
+
+
+def test_menu_action_spec_is_an_immutable_typed_menu_contract():
+    module = _gui_module("presentation")
+
+    action = module.MenuActionSpec("Inspect", "search", lambda: None)
+
+    assert action.label == "Inspect"
+    assert action.icon == "search"
+    assert callable(action.handler)
+    assert action.enabled is True
+    assert action.separator is False
+    assert action.marker is None
+    assert action.role == "secondary"
+    assert not hasattr(action, "__dict__")
+    with pytest.raises(FrozenInstanceError):
+        action.enabled = False
+
+
+def test_render_overflow_menu_composes_accessible_semantic_actions():
+    module = _gui_module("presentation")
+    elements = []
+
+    class Element:
+        def __init__(self, kind, *args, **kwargs):
+            self.kind = kind
+            self.args = args
+            self.kwargs = kwargs
+            self.class_values = []
+            self.prop_calls = []
+            self.markers = []
+
+        def classes(self, value):
+            self.class_values.append(value)
+            return self
+
+        def props(self, add=None, *, remove=None):
+            self.prop_calls.append((add, remove))
+            return self
+
+        def mark(self, marker):
+            self.markers.append(marker)
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Ui:
+        def _element(self, kind, *args, **kwargs):
+            element = Element(kind, *args, **kwargs)
+            elements.append(element)
+            return element
+
+        def button(self, *args, **kwargs):
+            return self._element("button", *args, **kwargs)
+
+        def menu(self):
+            return self._element("menu")
+
+        def menu_item(self, *args, **kwargs):
+            return self._element("menu_item", *args, **kwargs)
+
+        def separator(self):
+            return self._element("separator")
+
+        def icon(self, *args, **kwargs):
+            return self._element("icon", *args, **kwargs)
+
+    def inspect():
+        return None
+
+    def purge():
+        return None
+    trigger = module.render_overflow_menu(
+        Ui(),
+        (
+            module.MenuActionSpec("Inspect", "search", inspect, marker="inspect"),
+            module.MenuActionSpec(
+                "Purge",
+                "delete",
+                purge,
+                enabled=False,
+                separator=True,
+                marker="purge",
+                role="danger",
+            ),
+        ),
+        marker="more-actions",
+    )
+
+    assert trigger.kind == "button"
+    assert trigger.kwargs == {"icon": "more_vert"}
+    assert trigger.markers == ["more-actions"]
+    assert (
+        'flat round aria-haspopup=menu aria-label="More actions"',
+        None,
+    ) in trigger.prop_calls
+
+    menu_items = [element for element in elements if element.kind == "menu_item"]
+    assert [(item.args, item.kwargs) for item in menu_items] == [
+        (("Inspect",), {"on_click": inspect}),
+        (("Purge",), {"on_click": None}),
+    ]
+    assert menu_items[0].markers == ["inspect"]
+    assert menu_items[1].markers == ["purge"]
+    assert "lte-overflow-menu__item--danger text-negative" in menu_items[1].class_values
+    assert ("disable aria-disabled=true", None) in menu_items[1].prop_calls
+    assert len([element for element in elements if element.kind == "separator"]) == 1
+    assert [element.args for element in elements if element.kind == "icon"] == [
+        ("search",),
+        ("delete",),
+    ]
+
+
+def test_shared_presentation_helpers_only_compose_callbacks_and_content():
+    module = _gui_module("presentation")
+    elements = []
+    rendered = []
+
+    class Element:
+        def __init__(self, kind, *args, **kwargs):
+            self.kind = kind
+            self.args = args
+            self.kwargs = kwargs
+            self.class_values = []
+            self.prop_calls = []
+            self.markers = []
+            self.value_callbacks = []
+
+        def classes(self, value):
+            self.class_values.append(value)
+            return self
+
+        def props(self, add=None, *, remove=None):
+            self.prop_calls.append((add, remove))
+            return self
+
+        def mark(self, marker):
+            self.markers.append(marker)
+            return self
+
+        def on_value_change(self, callback):
+            self.value_callbacks.append(callback)
+            return self
+
+        def set_enabled(self, _enabled):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Ui:
+        def _element(self, kind, *args, **kwargs):
+            element = Element(kind, *args, **kwargs)
+            elements.append(element)
+            return element
+
+        def element(self, *args, **kwargs):
+            return self._element("element", *args, **kwargs)
+
+        def row(self, *args, **kwargs):
+            return self._element("row", *args, **kwargs)
+
+        def column(self, *args, **kwargs):
+            return self._element("column", *args, **kwargs)
+
+        def label(self, *args, **kwargs):
+            return self._element("label", *args, **kwargs)
+
+        def button(self, *args, **kwargs):
+            return self._element("button", *args, **kwargs)
+
+        def right_drawer(self, *args, **kwargs):
+            return self._element("right_drawer", *args, **kwargs)
+
+    ui = Ui()
+    actions = (module.ActionSpec("apply", "Apply", lambda: None, role="primary"),)
+    buttons = module.render_sticky_action_dock(
+        ui,
+        actions,
+        label="Candidate actions",
+        marker="dock",
+    )
+    def drawer_callback():
+        return None
+    drawer = module.render_inspector_drawer(
+        ui,
+        "Details",
+        lambda: rendered.append("drawer-content"),
+        value=True,
+        on_value_change=drawer_callback,
+        marker="inspector",
+    )
+    heading = module.render_section_heading(
+        ui,
+        "Artifacts",
+        "Available outputs",
+        actions,
+        marker="artifacts-heading",
+    )
+
+    assert set(buttons) == {"apply"}
+    dock = next(
+        element
+        for element in elements
+        if element.kind == "element" and element.args == ("footer",)
+    )
+    assert dock.markers == ["dock"]
+    assert ('role=region aria-label="Candidate actions"', None) in dock.prop_calls
+    assert "lte-action-dock" in dock.class_values
+
+    assert drawer.kwargs == {"value": True, "fixed": True, "bordered": True}
+    assert drawer.markers == ["inspector"]
+    assert drawer.value_callbacks == [drawer_callback]
+    assert "lte-inspector-drawer" in drawer.class_values
+    assert rendered == ["drawer-content"]
+
+    assert heading.markers == ["artifacts-heading"]
+    assert "lte-section-heading" in heading.class_values
+    labels = [element for element in elements if element.kind == "label"]
+    title = next(label for label in labels if label.args == ("Artifacts",))
+    assert ("role=heading aria-level=2", None) in title.prop_calls
+    assert any(label.args == ("Available outputs",) for label in labels)
+
+
 def test_presentation_mappings_cover_current_gui_machine_values():
     module = _gui_module("presentation")
     spec = module.PresentationSpec
@@ -442,6 +730,28 @@ def test_presentation_mappings_fail_safe_for_unknown_values():
     ):
         assert mapping("future-machine-value") == unknown
         assert mapping(None) == unknown
+
+
+def test_trash_action_presentation_preserves_state_order_and_semantic_labels():
+    from lte_scenario_toolkit.run_trash import TrashState
+
+    module = _gui_module("presentation")
+
+    assert module.TRASH_ACTIONS_BY_STATE == {
+        TrashState.TRASHED: (module.TrashAction.RESTORE, module.TrashAction.PURGE),
+        TrashState.RECOVERY_REQUIRED: (module.TrashAction.RECOVER,),
+        TrashState.PURGE_FAILED: (module.TrashAction.PURGE,),
+    }
+    assert [
+        module.trash_action_presentation(action)
+        for action in module.TRASH_ACTIONS_BY_STATE[TrashState.TRASHED]
+    ] == [
+        module.PresentationSpec("trash.action.restore"),
+        module.PresentationSpec("trash.action.purge", "danger"),
+    ]
+    assert module.trash_action_presentation(module.TrashAction.RECOVER) == (
+        module.PresentationSpec("trash.action.recover", "warning")
+    )
 
 
 def test_trash_job_kinds_use_localizable_shared_job_gate():
