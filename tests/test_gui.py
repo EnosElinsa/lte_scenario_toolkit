@@ -438,6 +438,48 @@ def test_presentation_mappings_fail_safe_for_unknown_values():
         assert mapping(None) == unknown
 
 
+def test_trash_job_kinds_use_localizable_shared_job_gate():
+    from lte_scenario_toolkit.jobs import JobBusyError, JobCoordinator
+
+    module = _gui_module("presentation")
+    spec = module.PresentationSpec
+    assert {
+        value: module.job_kind_presentation(value)
+        for value in (
+            "history.trash_move",
+            "history.trash_restore",
+            "history.trash_purge",
+        )
+    } == {
+        "history.trash_move": spec("job.kind.history_trash_move", "active"),
+        "history.trash_restore": spec(
+            "job.kind.history_trash_restore",
+            "active",
+        ),
+        "history.trash_purge": spec("job.kind.history_trash_purge", "active"),
+    }
+
+    coordinator = JobCoordinator()
+    blocker = coordinator.start("figure-preview")
+    try:
+        with pytest.raises(JobBusyError):
+            coordinator.start("history.trash_move")
+    finally:
+        assert coordinator.finish(blocker.job_id) is True
+
+    for fails in (False, True):
+        job = coordinator.start("history.trash_restore")
+        try:
+            if fails:
+                raise RuntimeError("simulated callback failure")
+        except RuntimeError:
+            pass
+        finally:
+            assert coordinator.finish(job.job_id) is True
+        assert coordinator.snapshot().active is False
+    coordinator.shutdown()
+
+
 def test_presentation_translation_keys_are_complete_and_localized():
     i18n = _gui_module("i18n")
     presentation = _gui_module("presentation")
@@ -3262,6 +3304,9 @@ def test_candidate_session_registry_is_bounded_opaque_and_confirms_final_identit
     assert updated.scan_result is result
     assert confirmed.confirmed_flat_grid_id == 4
     assert confirmed.locked_candidate is result.candidates[1]
+    confirmed_sessions = getattr(registry, "confirmed_sessions", None)
+    assert callable(confirmed_sessions)
+    assert confirmed_sessions() == (confirmed,)
     with pytest.raises(ValueError, match="final scan"):
         registry.confirm(second.session_id, 4)
 
@@ -4783,6 +4828,7 @@ async def test_generation_page_uses_semantic_artifact_rows_and_live_partial_stat
             marker="generation-primary-error",
             content="Some artifacts could not be generated",
         )
+        assert registry.get("semantic-run") is None
         technical = next(iter(user.find(marker="generation-technical-copy").elements))
         assert "terrain.renderer_failed" in technical.content
         assert "terrain_png" in technical.content
@@ -5056,6 +5102,469 @@ def test_history_model_includes_partial_and_parent_runs(tmp_path):
     )
 
 
+def _task6_history_family(tmp_path):
+    """Build one published parent/child family for the History trash tests."""
+
+    from lte_scenario_toolkit.gui.pages.history import history_rows
+    from lte_scenario_toolkit.run_service import RunService
+
+    root = tmp_path / "results"
+    service = RunService(root)
+    parent = service.begin("city", "default", created_at="2026-07-16T10:00:00Z")
+    (parent.path / "scenario.csv").write_text("X,Y\n1,2\n", encoding="utf-8")
+    service.publish(parent, status="completed", artifacts=["scenario.csv"])
+    child = service.begin(
+        "city",
+        "default",
+        created_at="2026-07-16T10:00:01Z",
+        parent_run_id=parent.run_id,
+    )
+    (child.path / "terrain.png").write_bytes(b"figure")
+    service.publish(child, status="completed", artifacts=["terrain.png"])
+    rows = history_rows(service)
+    return root, service, parent, child, rows
+
+
+def test_published_parent_offers_one_whole_family_move_action(tmp_path):
+    from lte_scenario_toolkit.gui.pages.history import (
+        HistoryAction,
+        build_history_trash_plan,
+    )
+    from lte_scenario_toolkit.run_trash import RunUsageLeaseRegistry, TrashManager
+
+    root, _service, parent, child, rows = _task6_history_family(tmp_path)
+    row = next(item for item in rows if item.run_id == parent.run_id)
+    manager = TrashManager(lambda: (root,), RunUsageLeaseRegistry())
+
+    view = build_history_trash_plan(row, manager)
+
+    assert HistoryAction.MOVE_TO_TRASH in row.available_actions
+    assert view.run_count == 2
+    assert view.run_ids == (parent.run_id, child.run_id)
+    assert view.has_descendants is True
+    assert view.direct_descendant_count == 1
+    assert view.indirect_descendant_count == 0
+    assert "orphan" not in {action.value for action in view.actions}
+
+
+def test_pending_selection_does_not_render_move_to_trash(tmp_path):
+    from types import SimpleNamespace
+
+    from lte_scenario_toolkit.gui.pages.history import render_history_content
+
+    pending_session = SimpleNamespace(
+        session_id="pending-1",
+        profile_snapshot=SimpleNamespace(
+            scenario_id="city",
+            profile_id="default",
+        ),
+        locked_candidate=SimpleNamespace(flat_grid_id=7, point_count=3),
+    )
+
+    class Element:
+        def __init__(self, text=""):
+            self.text = text
+
+        def classes(self, *_args):
+            return self
+
+        def mark(self, marker):
+            markers.add(marker)
+            return self
+
+        def props(self, *_args):
+            return self
+
+        def clear(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Ui:
+        def __init__(self):
+            self.navigate = type("Navigate", (), {"reload": lambda: None})()
+
+        def __getattr__(self, name):
+            if name == "notify":
+                return lambda *_args, **_kwargs: None
+            return lambda *args, **kwargs: Element(str(args[0]) if args else "")
+
+    markers = set()
+    ui = Ui()
+    translator = _gui_module("i18n").Translator("en")
+    history = _gui_module("pages.history")
+    snapshot = history.HistorySnapshot(
+        (),
+        (),
+        (),
+        (tmp_path / ".lte-data/cache/history-index.json").absolute(),
+    )
+    render_history_content(ui, translator, Element(), snapshot, pending_selections=(pending_session,))
+
+    assert "history-pending-section" in markers
+    assert not any(marker.startswith("history-trash-move-pending-") for marker in markers)
+
+
+def test_move_dialog_lists_every_affected_run_and_requires_fresh_confirmation(tmp_path):
+    from lte_scenario_toolkit.gui.i18n import Translator
+    from lte_scenario_toolkit.gui.pages.history import (
+        HistoryTrashPlan,
+        TrashImpactRow,
+        render_move_to_trash_dialog,
+    )
+
+    class Element:
+        def __init__(self, text=""):
+            self.text = text
+
+        def classes(self, *_args):
+            return self
+
+        def mark(self, marker):
+            markers.add(marker)
+            return self
+
+        def props(self, *_args):
+            return self
+
+        def set_enabled(self, enabled):
+            enabled_values.append(enabled)
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Ui:
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: Element(" ".join(str(arg) for arg in args))
+
+    root = tmp_path / "results"
+    reference = object()
+    rows = tuple(
+        TrashImpactRow(
+            run_id=f"{index:032x}",
+            scenario_id="city",
+            profile_id="default",
+            local_created_at="2026-07-16T10:00:00+00:00",
+            run_kind="selection",
+            status="completed",
+            artifact_count=1,
+            size_bytes=1024,
+            root=root,
+            root_digest="a" * 64,
+        )
+        for index in range(1, 4)
+    )
+    plan = HistoryTrashPlan(
+        reference=reference,
+        selected_identity=object(),
+        run_ids=tuple(row.run_id for row in rows),
+        run_count=3,
+        total_size_bytes=4096,
+        roots=(root,),
+        has_descendants=True,
+        direct_descendant_count=2,
+        indirect_descendant_count=0,
+        graph_fingerprint="b" * 64,
+        plan_fingerprint="c" * 64,
+        impact_rows=rows,
+        actions=(),
+        trash_plan=object(),
+    )
+    markers = set()
+    enabled_values = []
+    render_move_to_trash_dialog(Ui(), Translator("en"), plan, on_confirm=lambda: None)
+
+    assert "history-trash-impact" in markers
+    assert "history-trash-confirm" in markers
+    assert "history-trash-orphan-option" not in markers
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_actions"),
+    [
+        ("trashed", ("restore", "purge")),
+        ("recovery_required", ("recover",)),
+        ("purge_failed", ("purge",)),
+    ],
+)
+def test_trash_card_actions_follow_transaction_state(state, expected_actions):
+    from lte_scenario_toolkit.gui.pages.history import (
+        TrashCard,
+        trash_card_actions,
+    )
+
+    card = TrashCard(
+        transaction_id="a" * 32,
+        state=state,
+        deleted_at="2026-07-16T10:00:00Z",
+        run_count=1,
+        size_bytes=10,
+        artifact_count=1,
+        scenario_profiles=("city / default",),
+        roots=(),
+        blockers=(),
+        enabled_actions=trash_card_actions(state),
+        transaction=object(),
+    )
+
+    assert tuple(action.value for action in card.available_actions) == expected_actions
+
+
+def test_history_published_card_renders_move_to_trash_overflow(tmp_path):
+    from lte_scenario_toolkit.gui.i18n import Translator
+    from lte_scenario_toolkit.gui.pages.history import (
+        HistorySnapshot,
+        render_history_content,
+    )
+    from lte_scenario_toolkit.run_trash import RunUsageLeaseRegistry, TrashManager
+
+    root, _service, parent, _child, rows = _task6_history_family(tmp_path)
+    row = next(item for item in rows if item.run_id == parent.run_id)
+    markers = set()
+
+    class Element:
+        def classes(self, *_args):
+            return self
+
+        def props(self, *_args):
+            return self
+
+        def mark(self, marker):
+            markers.add(marker)
+            return self
+
+        def set_enabled(self, *_args):
+            return self
+
+        def clear(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Ui:
+        def __getattr__(self, _name):
+            return lambda *_args, **_kwargs: Element()
+
+    manager = TrashManager(lambda: (root,), RunUsageLeaseRegistry())
+    render_history_content(
+        Ui(),
+        Translator("en"),
+        Element(),
+        HistorySnapshot((root.resolve(),), (row,), (), tmp_path / "index"),
+        trash_manager=manager,
+        on_move_to_trash=lambda _plan: None,
+    )
+
+    assert f"history-trash-overflow-{parent.run_id}" in markers
+    assert f"history-trash-move-{parent.run_id}" in markers
+
+
+def test_trash_card_restore_blocker_keeps_purge_enabled():
+    from lte_scenario_toolkit.gui.pages.history import (
+        TrashAction,
+        TrashCard,
+    )
+
+    card = TrashCard(
+        transaction_id="a" * 32,
+        state="trashed",
+        deleted_at="2026-07-16T10:00:00Z",
+        run_count=2,
+        size_bytes=4096,
+        artifact_count=3,
+        scenario_profiles=("city / default",),
+        roots=(),
+        blockers=("trash.restore.destination_occupied",),
+        enabled_actions=(TrashAction.PURGE,),
+    )
+
+    assert card.available_actions == (TrashAction.RESTORE, TrashAction.PURGE)
+    assert card.enabled_actions == (TrashAction.PURGE,)
+
+
+def test_permanent_delete_requires_exact_transaction_prefix():
+    from lte_scenario_toolkit.gui.pages.history import (
+        TrashCard,
+        permanent_delete_matches,
+    )
+
+    card = TrashCard(
+        transaction_id="abcdef0123456789abcdef0123456789",
+        state="trashed",
+        deleted_at="2026-07-16T10:00:00Z",
+        run_count=2,
+        size_bytes=4096,
+        artifact_count=3,
+        scenario_profiles=("city / default",),
+        roots=(),
+        blockers=(),
+        enabled_actions=(),
+    )
+
+    assert permanent_delete_matches(card, "abcdef01") is True
+    assert permanent_delete_matches(card, "ABCDEF01") is False
+    assert permanent_delete_matches(card, "abcdef0") is False
+
+
+def test_opaque_callback_body_type_error_is_not_retried():
+    from lte_scenario_toolkit.gui.pages.history import _invoke_opaque
+
+    calls = []
+
+    def callback(value):
+        calls.append(value)
+        raise TypeError("callback body failure")
+
+    with pytest.raises(TypeError, match="callback body failure"):
+        _invoke_opaque(callback, "opaque-plan")
+
+    assert calls == ["opaque-plan"]
+
+
+def test_move_to_trash_history_action_fails_closed_before_path_resolution(tmp_path):
+    from lte_scenario_toolkit.gui.pages.history import (
+        HistoryAction,
+        HistoryActionError,
+        resolve_history_action,
+    )
+
+    _root, _service, _parent, _child, rows = _task6_history_family(tmp_path)
+    row = rows[0]
+
+    with pytest.raises(HistoryActionError, match="TrashPlan|trash plan|build"):
+        resolve_history_action(row, HistoryAction.MOVE_TO_TRASH)
+
+
+def test_trash_cards_disable_conflicting_mutations_for_unsafe_blockers():
+    from types import SimpleNamespace
+
+    from lte_scenario_toolkit.gui.pages.history import (
+        TrashAction,
+        TrashSnapshot,
+        build_trash_cards,
+    )
+    from lte_scenario_toolkit.run_trash import TrashState
+
+    member = SimpleNamespace(
+        scenario_id="city",
+        profile_id="default",
+        artifact_count=1,
+        identity=SimpleNamespace(root=Path("C:/results"), run_id="a" * 32),
+        original_relative_path=Path("city/default/run"),
+    )
+
+    def transaction(state):
+        return SimpleNamespace(
+            transaction_id="b" * 32,
+            state=state,
+            deleted_at="2026-07-16T10:00:00Z",
+            members=(member,),
+            roots=(Path("C:/results"),),
+            total_size_bytes=10,
+            completed_move_ids=(member.identity.run_id,),
+            errors=(),
+        )
+
+    trashed = TrashSnapshot((transaction(TrashState.TRASHED),), ())
+    blocked = build_trash_cards(
+        trashed,
+        restore_blockers={
+            "b" * 32: ("trash.restore.root_unavailable",),
+        },
+    )[0]
+    occupied = build_trash_cards(
+        trashed,
+        restore_blockers={
+            "b" * 32: ("trash.restore.destination_occupied",),
+        },
+    )[0]
+    failed = TrashSnapshot((transaction(TrashState.PURGE_FAILED),), ())
+    retry = build_trash_cards(
+        failed,
+        restore_blockers={
+            "b" * 32: ("trash.restore.journal_invalid",),
+        },
+    )[0]
+
+    assert blocked.enabled_actions == ()
+    assert occupied.enabled_actions == (TrashAction.PURGE,)
+    assert retry.enabled_actions == (TrashAction.PURGE,)
+
+
+def test_trash_card_renders_state_actions_and_restore_blocker(tmp_path):
+    from lte_scenario_toolkit.gui.i18n import Translator
+    from lte_scenario_toolkit.gui.pages.history import (
+        TrashAction,
+        TrashCard,
+        render_trash_card,
+    )
+
+    markers = set()
+
+    class Element:
+        def classes(self, *_args):
+            return self
+
+        def props(self, *_args):
+            return self
+
+        def mark(self, marker):
+            markers.add(marker)
+            return self
+
+        def set_enabled(self, *_args):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Ui:
+        def __getattr__(self, _name):
+            return lambda *_args, **_kwargs: Element()
+
+    card = TrashCard(
+        transaction_id="abcdef0123456789abcdef0123456789",
+        state="trashed",
+        deleted_at="2026-07-16T10:00:00Z",
+        run_count=2,
+        size_bytes=4096,
+        artifact_count=3,
+        scenario_profiles=("city / default",),
+        roots=(tmp_path / "results",),
+        blockers=("trash.restore.destination_occupied",),
+        enabled_actions=(TrashAction.PURGE,),
+    )
+
+    render_trash_card(
+        Ui(),
+        Translator("en"),
+        card,
+        on_restore=lambda _id: None,
+        on_purge=lambda _id: None,
+        on_recover=lambda _id: None,
+    )
+
+    assert "trash-card-abcdef01" in markers
+    assert "trash-action-restore-abcdef01" in markers
+    assert "trash-action-purge-abcdef01" in markers
+    assert "trash-restore-blockers-abcdef01" in markers
+
+
 def test_history_partial_csv_never_becomes_its_own_figure_source(tmp_path):
     from lte_scenario_toolkit.figure_service import FigureSpec
     from lte_scenario_toolkit.gui.pages.history import (
@@ -5266,11 +5775,1061 @@ def test_figure_form_does_not_render_until_refresh():
 
     assert state.preview_path is None
     assert state.preview_stale is True
-    bounded = preview_spec(
+    preview = preview_spec(state.spec)
+    publication = preview_spec(
         replace(state.spec, preset="publication", dpi=600, max_pixels=5000)
     )
-    assert bounded.dpi == 120
-    assert bounded.max_pixels == 600
+    assert publication.dpi > preview.dpi
+    assert publication.max_pixels > preview.max_pixels
+    assert publication.dpi < 600
+    assert publication.max_pixels < 5000
+
+
+def test_figure_and_history_pages_accept_bounded_selection_sources():
+    import inspect
+
+    from lte_scenario_toolkit.gui.pages.figures import render_figures_page
+    from lte_scenario_toolkit.gui.pages.history import render_history_content
+
+    figure_parameters = inspect.signature(render_figures_page).parameters
+    history_parameters = inspect.signature(render_history_content).parameters
+
+    assert "source_options" in figure_parameters
+    assert "pending_selections" in history_parameters
+    assert "on_open_pending_figures" in history_parameters
+
+
+def test_history_figure_source_options_list_each_completed_selection_once(tmp_path):
+    from lte_scenario_toolkit.gui.pages import history
+    from lte_scenario_toolkit.run_service import RunService
+
+    service = RunService(tmp_path / "results")
+    source = service.begin("new-york-city", "new-york-default")
+    (source.path / "selection.csv").write_text("X,Y\n1,2\n", encoding="utf-8")
+    source_path = service.publish(
+        source,
+        status="completed",
+        artifacts=["selection.csv"],
+        metadata={"run_kind": "selection"},
+    )
+    derived = service.begin(
+        "new-york-city",
+        "new-york-default",
+        parent_run_id=source.run_id,
+    )
+    (derived.path / "terrain.png").write_bytes(b"png")
+    service.publish(
+        derived,
+        status="completed",
+        artifacts=["terrain.png"],
+        metadata={
+            "run_kind": "figure",
+            "source": {"path": str(source_path), "run_id": source.run_id},
+        },
+    )
+    snapshot = history.rebuild_history(tmp_path, (tmp_path / "results",))
+    build_options = getattr(history, "figure_source_options", None)
+
+    assert callable(build_options)
+    options = build_options(snapshot)
+    assert list(options) == [str(source_path.resolve())]
+    assert "new-york-city / new-york-default" in options[str(source_path.resolve())]
+
+
+async def test_figure_style_and_source_fields_are_selection_controls(user, tmp_path):
+    from nicegui import ui
+
+    from lte_scenario_toolkit.gui.i18n import Translator
+    from lte_scenario_toolkit.gui.pages.figures import render_figures_page
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    coordinator = JobCoordinator()
+    source = (tmp_path / "results/city/default/run-a").resolve()
+
+    @ui.page("/figure-selection-controls")
+    def figure_selection_controls():
+        render_figures_page(
+            ui,
+            Translator("en"),
+            tmp_path,
+            coordinator,
+            source_options={str(source): "City / Default"},
+        )
+
+    try:
+        await user.open("/figure-selection-controls")
+        source_control = next(iter(user.find(marker="figure-source-path").elements))
+        colormap_control = next(iter(user.find(marker="figure-colormap").elements))
+        station_control = next(iter(user.find(marker="figure-station-color").elements))
+
+        assert type(source_control).__name__ == "Select"
+        assert type(colormap_control).__name__ == "Select"
+        assert type(station_control).__name__ == "Select"
+        assert str(source) in source_control.options
+        assert "terrain" in colormap_control.options
+        assert "viridis" in colormap_control.options
+        assert "red" in station_control.options
+        assert "royalblue" in station_control.options
+    finally:
+        coordinator.shutdown()
+
+
+async def test_figures_route_discovers_completed_run_sources_without_path_typing(
+    user,
+    tmp_path,
+):
+    from types import SimpleNamespace
+
+    from lte_scenario_toolkit.gui.app import create_app
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.run_service import RunService
+
+    service = RunService(tmp_path / "results")
+    source = service.begin("new-york-city", "new-york-default")
+    (source.path / "selection.csv").write_text("X,Y\n1,2\n", encoding="utf-8")
+    source_path = service.publish(
+        source,
+        status="completed",
+        artifacts=["selection.csv"],
+        metadata={"run_kind": "selection"},
+    )
+    coordinator = JobCoordinator()
+    try:
+        create_app(
+            catalog=SimpleNamespace(root=tmp_path.resolve()),
+            coordinator=coordinator,
+            testing=True,
+        )
+        await user.open("/figures")
+        source_control = next(iter(user.find(marker="figure-source-path").elements))
+
+        assert str(source_path.resolve()) in source_control.options
+        assert (
+            "new-york-city / new-york-default"
+            in source_control.options[str(source_path.resolve())]
+        )
+    finally:
+        coordinator.shutdown()
+
+
+async def test_history_exposes_confirmed_unpublished_selection_with_safe_actions(
+    user,
+    tmp_path,
+):
+    from nicegui import ui
+
+    from lte_scenario_toolkit.gui.i18n import Translator
+    from lte_scenario_toolkit.gui.pages.history import (
+        HistorySnapshot,
+        render_history_content,
+        render_history_frame,
+    )
+
+    session = _task15_locked_session(
+        tmp_path,
+        object(),
+        session_id="new-york-pending",
+    )
+    opened = []
+    continued = []
+
+    @ui.page("/history-pending-selection")
+    def history_pending_selection():
+        translator = Translator("en")
+        holder = render_history_frame(ui, translator)
+        render_history_content(
+            ui,
+            translator,
+            holder,
+            HistorySnapshot(
+                roots=((tmp_path / "results").resolve(),),
+                rows=(),
+                diagnostics=(),
+                index_path=(tmp_path / ".lte-data/cache/history-index.json").absolute(),
+            ),
+            pending_selections=(session,),
+            on_open_pending_figures=opened.append,
+            on_continue_pending=continued.append,
+        )
+
+    await user.open("/history-pending-selection")
+
+    await user.should_see(marker="history-pending-new-york-pending")
+    await user.should_see("ready-city / default")
+    await user.should_see(
+        marker="history-pending-status-new-york-pending",
+        content="Not published",
+    )
+    user.find(marker="history-pending-open-new-york-pending").click()
+    user.find(marker="history-pending-continue-new-york-pending").click()
+    assert opened == ["new-york-pending"]
+    assert continued == ["new-york-pending"]
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_finishes_and_skips_deleted_client_render():
+    """A completed Trash worker must not send a result to a gone client."""
+
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    class DeletedClient:
+        is_deleted = True
+
+    async def fake_io_bound(worker, *args, **kwargs):
+        return worker(*args, **kwargs)
+
+    coordinator = JobCoordinator()
+    rendered: list[object] = []
+    try:
+        await app_module.run_trash_mutation(
+            client=DeletedClient(),
+            coordinator=coordinator,
+            kind="history.trash_restore",
+            worker=lambda: object(),
+            on_success=lambda value: rendered.append(value),
+            io_bound=fake_io_bound,
+        )
+        assert rendered == []
+        assert coordinator.snapshot().active is False
+    finally:
+        coordinator.shutdown()
+
+
+def test_client_is_deleted_accepts_bool_and_callable_flags():
+    from lte_scenario_toolkit.gui.app import client_is_deleted
+
+    assert client_is_deleted(SimpleNamespace(is_deleted=True)) is True
+    assert client_is_deleted(SimpleNamespace(is_deleted=False)) is False
+    assert client_is_deleted(SimpleNamespace(is_deleted=lambda: True)) is True
+    assert client_is_deleted(SimpleNamespace(is_deleted=lambda: False)) is False
+
+
+def test_trash_error_mapping_and_safe_structured_logging(monkeypatch, tmp_path):
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.gui.pages.history import HistoryActionError
+    from lte_scenario_toolkit.jobs import JobBusyError
+    from lte_scenario_toolkit.run_trash import (
+        RunLeaseConflictError,
+        TrashPlanStaleError,
+    )
+
+    class CapturedLogger:
+        def __init__(self):
+            self.messages: list[str] = []
+
+        def info(self, message, fields):
+            self.messages.append(f"{message} {fields}")
+
+        def warning(self, message, fields):
+            self.messages.append(f"{message} {fields}")
+
+    logger = CapturedLogger()
+    monkeypatch.setattr(app_module, "_LOGGER", logger)
+    assert (
+        app_module.trash_error_translation_key(
+            JobBusyError(
+                "busy",
+                active_job_id="a",
+                active_kind="x",
+                requested_kind="y",
+            ),
+            default="history.trash_error",
+        )
+        == "history.trash_busy"
+    )
+    assert app_module.trash_error_translation_key(
+        TrashPlanStaleError("changed"), default="history.trash_error"
+    ) == "history.trash_stale"
+    assert app_module.trash_error_translation_key(
+        RunLeaseConflictError("in use"), default="history.trash_error"
+    ) == "history.trash_lease_conflict"
+    assert app_module.trash_error_translation_key(
+        ValueError("original destination is occupied"),
+        default="history.trash_error",
+    ) == "history.trash_destination_occupied"
+    assert app_module.trash_error_translation_key(
+        ValueError("an expected root is unavailable"),
+        default="history.trash_error",
+    ) == "history.trash_root_unavailable"
+    assert app_module.trash_error_translation_key(
+        ValueError("trash journal is invalid"),
+        default="history.trash_error",
+    ) == "history.trash_journal_invalid"
+    assert app_module.trash_error_translation_key(
+        ValueError("transaction is not purgeable"),
+        default="history.trash_error",
+    ) == "history.trash_permanent_error"
+
+    try:
+        raise HistoryActionError("changed or is in use") from TrashPlanStaleError(
+            "changed"
+        )
+    except HistoryActionError as wrapped_stale:
+        assert app_module.trash_error_translation_key(
+            wrapped_stale,
+            default="history.trash_error",
+        ) == "history.trash_stale"
+
+    try:
+        raise HistoryActionError("changed or is in use") from RunLeaseConflictError(
+            "in use"
+        )
+    except HistoryActionError as wrapped_lease:
+        assert app_module.trash_error_translation_key(
+            wrapped_lease,
+            default="history.trash_error",
+        ) == "history.trash_lease_conflict"
+
+    app_module.log_trash_mutation(
+        "history.trash_move",
+        transaction_id="a" * 32,
+        state="trashed",
+        member_count=2,
+        roots=(tmp_path,),
+    )
+    assert logger.messages
+    rendered = logger.messages[-1]
+    assert str(tmp_path) not in rendered
+    assert "root_digests" in rendered
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_none_result_defers_finish_until_worker_done():
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    started = Event()
+    release = Event()
+    finished = Event()
+
+    def worker():
+        started.set()
+        assert release.wait(2)
+        finished.set()
+        return object()
+
+    async def canceled_io_bound(callback):
+        import threading
+
+        threading.Thread(target=callback, daemon=True).start()
+        assert await asyncio.to_thread(started.wait, 2)
+        return None
+
+    coordinator = JobCoordinator()
+    rendered: list[str] = []
+    try:
+        await app_module.run_trash_mutation(
+            client=SimpleNamespace(is_deleted=False),
+            coordinator=coordinator,
+            kind="history.trash_restore",
+            worker=worker,
+            on_success=lambda _value: rendered.append("success"),
+            on_refresh=lambda: rendered.append("refresh"),
+            io_bound=canceled_io_bound,
+        )
+        assert coordinator.snapshot().active is True
+        assert rendered == []
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 2)
+        for _ in range(20):
+            if not coordinator.snapshot().active:
+                break
+            await asyncio.sleep(0.01)
+        assert coordinator.snapshot().active is False
+    finally:
+        release.set()
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_none_result_handles_delayed_worker_start():
+    import threading
+
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    release = Event()
+    started = Event()
+
+    def worker():
+        started.set()
+        release.wait(2)
+
+    async def canceled_io_bound(callback):
+        threading.Thread(target=callback, daemon=True).start()
+        return None
+
+    coordinator = JobCoordinator()
+    try:
+        await app_module.run_trash_mutation(
+            client=SimpleNamespace(is_deleted=False),
+            coordinator=coordinator,
+            kind="history.trash_purge",
+            worker=worker,
+            io_bound=canceled_io_bound,
+        )
+        assert coordinator.snapshot().active is True
+        assert await asyncio.to_thread(started.wait, 2)
+        release.set()
+        for _ in range(20):
+            if not coordinator.snapshot().active:
+                break
+            await asyncio.sleep(0.01)
+        assert coordinator.snapshot().active is False
+    finally:
+        release.set()
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_pre_submit_cancel_releases_slot():
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    async def canceled_io_bound(_callback):
+        raise asyncio.CancelledError
+
+    coordinator = JobCoordinator()
+    try:
+        await app_module.run_trash_mutation(
+            client=SimpleNamespace(is_deleted=False),
+            coordinator=coordinator,
+            kind="history.trash_restore",
+            worker=lambda: object(),
+            io_bound=canceled_io_bound,
+        )
+        assert coordinator.snapshot().active is False
+    finally:
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_pre_submit_runtime_error_releases_slot():
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    async def failed_io_bound(_callback):
+        raise RuntimeError("bridge is unavailable")
+
+    coordinator = JobCoordinator()
+    try:
+        await app_module.run_trash_mutation(
+            client=SimpleNamespace(is_deleted=False),
+            coordinator=coordinator,
+            kind="history.trash_purge",
+            worker=lambda: object(),
+            io_bound=failed_io_bound,
+        )
+        assert coordinator.snapshot().active is False
+    finally:
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_executor_creation_failure_releases_slot(monkeypatch):
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    class BrokenExecutor:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("cannot start worker thread")
+
+    monkeypatch.setattr(app_module, "ThreadPoolExecutor", BrokenExecutor)
+    coordinator = JobCoordinator()
+    errors: list[type[BaseException]] = []
+    try:
+        await app_module.run_trash_mutation(
+            client=SimpleNamespace(is_deleted=False),
+            coordinator=coordinator,
+            kind="history.trash_move",
+            worker=lambda: object(),
+            on_error=lambda error: errors.append(type(error)),
+            io_bound=lambda callback: callback(),
+        )
+        assert errors == [RuntimeError]
+        assert coordinator.snapshot().active is False
+    finally:
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_bridge_failure_never_renders_mid_worker():
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    started = Event()
+    release = Event()
+    events: list[str] = []
+
+    def worker():
+        started.set()
+        assert release.wait(2)
+        return object()
+
+    async def failed_io_bound(_callback):
+        raise RuntimeError("bridge is unavailable")
+
+    coordinator = JobCoordinator()
+    try:
+        await app_module.run_trash_mutation(
+            client=SimpleNamespace(is_deleted=False),
+            coordinator=coordinator,
+            kind="history.trash_purge",
+            worker=worker,
+            on_refresh=lambda: events.append("refresh"),
+            on_error=lambda _error: events.append("error"),
+            io_bound=failed_io_bound,
+        )
+        assert started.wait(2)
+        assert events == []
+        assert coordinator.snapshot().active is True
+        release.set()
+        for _ in range(20):
+            if not coordinator.snapshot().active:
+                break
+            await asyncio.sleep(0.01)
+        assert coordinator.snapshot().active is False
+    finally:
+        release.set()
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_refresh_failure_does_not_relabel_committed_work():
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    async def fake_io_bound(callback):
+        return callback()
+
+    def failed_refresh():
+        events.append("refresh")
+        raise RuntimeError("render failed")
+
+    events: list[str] = []
+    coordinator = JobCoordinator()
+    result = object()
+    try:
+        returned = await app_module.run_trash_mutation(
+            client=SimpleNamespace(is_deleted=False),
+            coordinator=coordinator,
+            kind="history.trash_restore",
+            worker=lambda: result,
+            on_refresh=failed_refresh,
+            on_success=lambda _value: events.append("success"),
+            on_error=lambda _error: events.append("error"),
+            on_refresh_error=lambda _error: events.append("refresh_error"),
+            io_bound=fake_io_bound,
+        )
+        assert returned is result
+        assert events == ["refresh", "refresh_error"]
+        assert coordinator.snapshot().active is False
+    finally:
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_logging_failure_cannot_strand_job(monkeypatch):
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    async def fake_io_bound(callback):
+        return callback()
+
+    monkeypatch.setattr(
+        app_module._LOGGER,
+        "info",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("log failed")),
+    )
+    coordinator = JobCoordinator()
+    try:
+        await app_module.run_trash_mutation(
+            client=SimpleNamespace(is_deleted=False),
+            coordinator=coordinator,
+            kind="history.trash_restore",
+            worker=lambda: object(),
+            io_bound=fake_io_bound,
+        )
+        assert coordinator.snapshot().active is False
+    finally:
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_failure_and_refresh_failure_reports_both():
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    async def fake_io_bound(callback):
+        return callback()
+
+    def failed_refresh():
+        raise RuntimeError("refresh failed")
+
+    coordinator = JobCoordinator()
+    events: list[str] = []
+    try:
+        await app_module.run_trash_mutation(
+            client=SimpleNamespace(is_deleted=False),
+            coordinator=coordinator,
+            kind="history.trash_purge",
+            worker=lambda: (_ for _ in ()).throw(RuntimeError("purge failed")),
+            on_refresh=failed_refresh,
+            on_refresh_error=lambda _error: events.append("refresh_error"),
+            on_error=lambda _error: events.append("mutation_error"),
+            io_bound=fake_io_bound,
+        )
+        assert events == ["refresh_error", "mutation_error"]
+        assert coordinator.snapshot().active is False
+    finally:
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_outer_cancel_waits_for_submitted_worker():
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    started = Event()
+    release = Event()
+
+    def worker():
+        started.set()
+        assert release.wait(2)
+        return object()
+
+    async def bridge(callback):
+        return await asyncio.to_thread(callback)
+
+    coordinator = JobCoordinator()
+    client = SimpleNamespace(is_deleted=False)
+    task = asyncio.create_task(
+        app_module.run_trash_mutation(
+            client=client,
+            coordinator=coordinator,
+            kind="history.trash_restore",
+            worker=worker,
+            io_bound=bridge,
+        )
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        client.is_deleted = True
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert coordinator.snapshot().active is True
+        release.set()
+        await task
+        assert coordinator.snapshot().active is False
+    finally:
+        release.set()
+        if not task.done():
+            await task
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_cancel_suppresses_late_worker_error_callback():
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    started = Event()
+    release = Event()
+    errors: list[type[BaseException]] = []
+
+    def worker():
+        started.set()
+        assert release.wait(2)
+        raise RuntimeError("late worker failure")
+
+    async def bridge(callback):
+        return await asyncio.to_thread(callback)
+
+    coordinator = JobCoordinator()
+    task = asyncio.create_task(
+        app_module.run_trash_mutation(
+            client=SimpleNamespace(is_deleted=False),
+            coordinator=coordinator,
+            kind="history.trash_restore",
+            worker=worker,
+            on_error=lambda error: errors.append(type(error)),
+            io_bound=bridge,
+        )
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert coordinator.snapshot().active is True
+        release.set()
+        await task
+        assert errors == []
+        assert coordinator.snapshot().active is False
+    finally:
+        release.set()
+        if not task.done():
+            await task
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_refreshes_before_success():
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    async def fake_io_bound(worker):
+        return worker()
+
+    coordinator = JobCoordinator()
+    events: list[str] = []
+    try:
+        await app_module.run_trash_mutation(
+            client=SimpleNamespace(is_deleted=False),
+            coordinator=coordinator,
+            kind="history.trash_move",
+            worker=lambda: object(),
+            on_refresh=lambda: events.append("refresh"),
+            on_success=lambda _value: events.append("success"),
+            io_bound=fake_io_bound,
+        )
+        assert events == ["refresh", "success"]
+        assert coordinator.snapshot().active is False
+    finally:
+        coordinator.shutdown()
+
+
+@pytest.mark.parametrize(
+    "kind",
+    (
+        "history.trash_move",
+        "history.trash_restore",
+        "history.trash_purge",
+        "history.trash_recover",
+    ),
+)
+@pytest.mark.asyncio
+async def test_run_trash_mutation_finishes_each_operation_kind(kind):
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    async def fake_io_bound(worker):
+        return worker()
+
+    coordinator = JobCoordinator()
+    try:
+        await app_module.run_trash_mutation(
+            client=SimpleNamespace(is_deleted=False),
+            coordinator=coordinator,
+            kind=kind,
+            worker=lambda: object(),
+            io_bound=fake_io_bound,
+        )
+        assert coordinator.snapshot().active is False
+    finally:
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_finishes_on_error_and_blocks_second_job():
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobBusyError, JobCoordinator
+
+    class LiveClient:
+        is_deleted = False
+
+    gate = Event()
+    entered = Event()
+
+    async def fake_io_bound(worker, *args, **kwargs):
+        entered.set()
+        await asyncio.to_thread(gate.wait, 2)
+        return worker(*args, **kwargs)
+
+    coordinator = JobCoordinator()
+    errors: list[type[BaseException]] = []
+    try:
+        pending = asyncio.create_task(
+            app_module.run_trash_mutation(
+                client=LiveClient(),
+                coordinator=coordinator,
+                kind="history.trash_purge",
+                worker=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+                on_error=lambda error: errors.append(type(error)),
+                io_bound=fake_io_bound,
+            )
+        )
+        assert await asyncio.to_thread(entered.wait, 2)
+        with pytest.raises(JobBusyError):
+            coordinator.start("history.trash_restore")
+        gate.set()
+        await pending
+        assert errors == [RuntimeError]
+        assert coordinator.snapshot().active is False
+    finally:
+        gate.set()
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_trash_route_renders_loading_before_io(monkeypatch, tmp_path, user):
+    from nicegui import run
+
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.run_trash import RunUsageLeaseRegistry, TrashManager
+
+    events: list[str] = []
+    leases = RunUsageLeaseRegistry()
+    manager = TrashManager(lambda: (tmp_path / "results",), leases)
+    coordinator = JobCoordinator()
+
+    monkeypatch.setattr(
+        app_module,
+        "render_trash_loading",
+        lambda *args, **kwargs: events.append("loading") or object(),
+    )
+
+    async def fake_io_bound(worker, *args, **kwargs):
+        events.append("io")
+        return worker(*args, **kwargs)
+
+    monkeypatch.setattr(run, "io_bound", fake_io_bound)
+    monkeypatch.setattr(
+        app_module,
+        "render_trash_page",
+        lambda *args, **kwargs: events.append("render"),
+    )
+    try:
+        app_module.create_app(
+            catalog=SimpleNamespace(root=tmp_path.resolve()),
+            coordinator=coordinator,
+            trash_manager=manager,
+            usage_leases=leases,
+            testing=True,
+        )
+        await user.open("/history/trash")
+        for _ in range(20):
+            if len(events) >= 2:
+                break
+            await asyncio.sleep(0.05)
+        assert events[:2] == ["loading", "io"]
+    finally:
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ("/history", "/history/trash"))
+async def test_history_routes_treat_none_io_result_as_cancellation(
+    monkeypatch,
+    tmp_path,
+    user,
+    route,
+):
+    from nicegui import run
+
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.run_trash import RunUsageLeaseRegistry, TrashManager
+
+    leases = RunUsageLeaseRegistry()
+    manager = TrashManager(lambda: (tmp_path / "results",), leases)
+    rendered: list[str] = []
+
+    async def canceled_io_bound(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(run, "io_bound", canceled_io_bound)
+    monkeypatch.setattr(
+        app_module,
+        "render_history_page",
+        lambda *args, **kwargs: rendered.append("history"),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "render_trash_page",
+        lambda *args, **kwargs: rendered.append("trash"),
+    )
+    coordinator = JobCoordinator()
+    try:
+        app_module.create_app(
+            catalog=SimpleNamespace(root=tmp_path.resolve()),
+            coordinator=coordinator,
+            trash_manager=manager,
+            usage_leases=leases,
+            testing=True,
+        )
+        await user.open(route)
+        await asyncio.sleep(0.05)
+        assert rendered == []
+    finally:
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_trash_route_callbacks_use_transaction_id_and_confirmation(
+    monkeypatch, tmp_path, user
+):
+    from nicegui import run
+
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.run_trash import (
+        RunUsageLeaseRegistry,
+        TrashManager,
+        TrashMutationReceipt,
+    )
+
+    leases = RunUsageLeaseRegistry()
+    manager = TrashManager(lambda: (tmp_path / "results",), leases)
+    calls: list[tuple[str, tuple[object, ...]]] = []
+    manager.transaction = lambda value: SimpleNamespace(  # type: ignore[method-assign]
+        transaction_id=value,
+        state="trashed",
+        members=(),
+        roots=(),
+    )
+    manager.restore = lambda value: calls.append(("restore", (value,))) or TrashMutationReceipt(value, restored=True)  # type: ignore[method-assign]
+    manager.purge = lambda value, *, confirmation: calls.append(  # type: ignore[method-assign]
+        ("purge", (value, confirmation))
+    ) or TrashMutationReceipt(value, purged=True)
+    manager.recover = lambda value: calls.append(("recover", (value,))) or object()  # type: ignore[method-assign]
+    captured: dict[str, object] = {}
+
+    def capture_page(*args, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(app_module, "render_trash_page", capture_page)
+
+    async def fake_io_bound(worker, *args, **kwargs):
+        return worker(*args, **kwargs)
+
+    monkeypatch.setattr(run, "io_bound", fake_io_bound)
+    coordinator = JobCoordinator()
+    try:
+        app_module.create_app(
+            catalog=SimpleNamespace(root=tmp_path.resolve()),
+            coordinator=coordinator,
+            trash_manager=manager,
+            usage_leases=leases,
+            testing=True,
+        )
+        await user.open("/history/trash")
+        for _ in range(20):
+            if "on_restore" in captured:
+                break
+            await asyncio.sleep(0.05)
+        transaction_id = "a" * 32
+        await captured["on_restore"](transaction_id)  # type: ignore[index,operator]
+        await captured["on_purge"](transaction_id, "typed")  # type: ignore[index,operator]
+        await captured["on_recover"](transaction_id)  # type: ignore[index,operator]
+        assert calls == [
+            ("restore", (transaction_id,)),
+            ("purge", (transaction_id, "typed")),
+            ("recover", (transaction_id,)),
+        ]
+    finally:
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_create_app_passes_shared_trash_dependencies_to_figures(
+    monkeypatch, tmp_path, user
+):
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.run_trash import RunUsageLeaseRegistry, TrashManager
+
+    captured: list[dict[str, object]] = []
+    leases = RunUsageLeaseRegistry()
+    manager = TrashManager(lambda: (tmp_path / "configured",), leases)
+    coordinator = JobCoordinator()
+    from lte_scenario_toolkit.gui.settings import GuiSettingsStore
+
+    GuiSettingsStore(tmp_path).update(
+        add_output_roots=(tmp_path / "configured",)
+    )
+
+    def fake_render_figures(*args, **kwargs):
+        captured.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(app_module, "render_figures_page", fake_render_figures)
+    try:
+        app_module.create_app(
+            catalog=SimpleNamespace(root=tmp_path.resolve()),
+            coordinator=coordinator,
+            trash_manager=manager,
+            usage_leases=leases,
+            testing=True,
+        )
+        await user.open("/figures")
+        assert captured
+        assert captured[0]["usage_leases"] is leases
+        roots_provider = captured[0]["run_roots"]
+        assert callable(roots_provider)
+        assert (tmp_path / "results").resolve() in tuple(roots_provider())
+        assert (tmp_path / "configured").resolve() in tuple(roots_provider())
+    finally:
+        coordinator.shutdown()
+
+
+def test_figure_reserved_cpu_close_defers_job_release_until_abandon(tmp_path):
+    from lte_scenario_toolkit.gui.pages.figures import FigureController
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    coordinator = JobCoordinator()
+    controller = FigureController(tmp_path, coordinator)
+    try:
+        job = controller._reserve("figure-export")
+        controller.close()
+        assert coordinator.snapshot().active is True
+
+        controller.abandon_cpu_export(job)
+        assert coordinator.snapshot().active is False
+    finally:
+        controller.close()
+        coordinator.shutdown()
+
+
+async def test_app_history_prioritizes_current_confirmed_selection(user, tmp_path):
+    from types import SimpleNamespace
+
+    from lte_scenario_toolkit.gui.app import create_app
+    from lte_scenario_toolkit.gui.pages.candidates import CandidateSessionRegistry
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    registry = CandidateSessionRegistry()
+    registry.add(
+        _task15_locked_session(
+            tmp_path,
+            object(),
+            session_id="new-york-current",
+        )
+    )
+    coordinator = JobCoordinator()
+    try:
+        create_app(
+            catalog=SimpleNamespace(root=tmp_path.resolve()),
+            candidate_registry=registry,
+            coordinator=coordinator,
+            testing=True,
+        )
+        await user.open("/history")
+
+        await user.should_see(
+            marker="history-pending-new-york-current",
+            retries=15,
+        )
+        await user.should_see("ready-city / default")
+        user.find(marker="history-pending-open-new-york-current").click()
+        for _ in range(20):
+            if user.back_history and user.back_history[-1].startswith("/figures/"):
+                break
+            await asyncio.sleep(0.05)
+        assert user.back_history[-1].startswith("/figures/")
+    finally:
+        coordinator.shutdown()
 
 
 
@@ -5297,6 +6856,22 @@ def test_preview_cache_is_explicit_and_style_changes_only_mark_stale(tmp_path):
     changed = rendered.with_dpi(200)
     assert changed.preview_path == expected
     assert changed.preview_stale is True
+
+
+def test_station_visibility_renderer_invalidates_v2_preview_cache(
+    tmp_path,
+    monkeypatch,
+):
+    from lte_scenario_toolkit.gui.pages import figures
+
+    source = _task15_figure_source(tmp_path)
+    spec = figures.FigurePageState.for_source(source).spec
+    current = figures.preview_cache_path(tmp_path, source, spec)
+
+    monkeypatch.setattr(figures, "PREVIEW_CACHE_VERSION", "figure-preview-v2")
+    legacy = figures.preview_cache_path(tmp_path, source, spec)
+
+    assert current != legacy
 
 
 def test_figure_controller_invalidate_source_clears_all_exportable_state(tmp_path):
@@ -5418,18 +6993,24 @@ async def test_figure_page_invalidates_old_source_on_edit_and_failed_load(
         create_app(
             catalog=SimpleNamespace(root=tmp_path.resolve()),
             coordinator=coordinator,
+            figure_source_options_provider=lambda: {
+                str(completed_a): "Completed A",
+                str(missing_b): "Missing B",
+            },
             testing=True,
         )
         await user.open("/figures")
-        source_field = user.find(marker="figure-source-path")
-        source_field.clear().type(str(completed_a))
+        source_field = next(iter(user.find(marker="figure-source-path").elements))
+        with user.client:
+            source_field.set_value(str(completed_a.resolve()))
         user.find(marker="figure-load-source").click()
 
         await user.should_see(marker="figure-source-ready", content="Rectangle 1")
         assert next(iter(user.find(marker="figure-refresh-preview").elements)).enabled
         assert next(iter(user.find(marker="figure-export").elements)).enabled
 
-        source_field.clear().type(str(missing_b))
+        with user.client:
+            source_field.set_value(str(missing_b.resolve()))
 
         await user.should_see(marker="figure-source-dirty", content="Load to continue")
         await user.should_not_see(marker="figure-source-ready")
@@ -5482,20 +7063,21 @@ async def test_figure_primary_source_error_is_localized_and_raw_detail_is_collap
             Translator("zh-CN"),
             tmp_path,
             coordinator,
+            source_options={str(tmp_path / "missing-run"): "Missing run"},
         )
 
     try:
         await user.open("/figures-human-errors")
-        source = user.find(marker="figure-source-path")
-        source.clear().type(str(tmp_path / "missing-run"))
+        source = next(iter(user.find(marker="figure-source-path").elements))
+        with user.client:
+            source.set_value(str((tmp_path / "missing-run").resolve()))
         user.find(marker="figure-load-source").click()
 
         await user.should_see(
             marker="figure-source-error",
             content=(
-                "\u65e0\u6cd5\u52a0\u8f7d\u8be5\u56fe\u8868\u6765\u6e90\u3002"
-                "\u8bf7\u68c0\u67e5\u8def\u5f84\u4ee5\u53ca\u8fd0\u884c\u662f\u5426"
-                "\u5df2\u5b8c\u6210\uff0c\u7136\u540e\u91cd\u8bd5\u3002"
+                "\u65e0\u6cd5\u52a0\u8f7d\u6240\u9009\u56fe\u8868\u6765\u6e90\u3002"
+                "\u8bf7\u5237\u65b0\u8fd0\u884c\u5217\u8868\u540e\u91cd\u8bd5\u3002"
             ),
         )
         primary = next(iter(user.find(marker="figure-source-error").elements))
@@ -5655,19 +7237,27 @@ async def test_figure_page_locks_all_controls_and_restores_rejected_edits(
     from lte_scenario_toolkit.figure_service import FigureService
     from lte_scenario_toolkit.gui import app as app_module
     from lte_scenario_toolkit.gui.pages import figures
+    from lte_scenario_toolkit.gui.settings import GuiSettingsStore
     from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.run_service import RunService
 
     entered = Event()
     release = Event()
-    completed_a = (
-        tmp_path / "source-runs" / "city" / "default" / "completed-a"
+    source_root = (tmp_path / "source-runs").resolve()
+    source_service = RunService(source_root)
+    source_run = source_service.begin("city", "default")
+    (source_run.path / "scenario.csv").write_text("X,Y\n1,2\n", encoding="utf-8")
+    completed_a = source_service.publish(
+        source_run,
+        status="completed",
+        artifacts=["scenario.csv"],
     ).resolve()
     rejected_b = (tmp_path / "rejected-b").resolve()
     source = replace(
         _task15_figure_source(tmp_path),
         path=completed_a,
         source_kind="run",
-        run_id="a" * 32,
+        run_id=source_run.run_id,
     )
     views = []
     actual_render = app_module.render_figures_page
@@ -5689,14 +7279,18 @@ async def test_figure_page_locks_all_controls_and_restores_rejected_edits(
     monkeypatch.setattr(FigureService, "preview", staticmethod(delayed_preview))
     monkeypatch.setattr(figures, "_valid_preview", lambda path: path.is_file())
     coordinator = JobCoordinator()
+    GuiSettingsStore(tmp_path).update(add_output_roots=(source_root,))
     try:
         app_module.create_app(
             catalog=SimpleNamespace(root=tmp_path.resolve()),
             coordinator=coordinator,
+            figure_source_options_provider=lambda: {
+                str(completed_a): "Completed A",
+                str(rejected_b): "Rejected B",
+            },
             testing=True,
         )
         await user.open("/figures")
-        source_interaction = user.find(marker="figure-source-path")
         control_markers = (
             "figure-source-path",
             "figure-load-source",
@@ -5723,7 +7317,8 @@ async def test_figure_page_locks_all_controls_and_restores_rejected_edits(
         source_element = control_elements["figure-source-path"]
         preset_element = control_elements["figure-preset"]
         dpi_element = control_elements["figure-dpi"]
-        source_interaction.clear().type(str(completed_a))
+        with user.client:
+            source_element.set_value(str(completed_a))
         user.find(marker="figure-load-source").click()
         user.find(marker="figure-refresh-preview").click()
         assert await asyncio.to_thread(entered.wait, 2)
@@ -5776,6 +7371,89 @@ async def test_figure_page_locks_all_controls_and_restores_rejected_edits(
         coordinator.shutdown()
 
 
+async def test_figure_page_runs_final_export_in_a_cpu_bound_process(
+    tmp_path,
+    monkeypatch,
+    user,
+):
+    import pickle
+    from dataclasses import replace
+
+    from nicegui import run, ui
+
+    from lte_scenario_toolkit.gui.i18n import Translator
+    from lte_scenario_toolkit.gui.pages import figures
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    source_path = (tmp_path / "completed-source").resolve()
+    source = replace(
+        _task15_figure_source(tmp_path),
+        path=source_path,
+        source_kind="run",
+        run_id="a" * 32,
+    )
+    output_root = (tmp_path / "results").resolve()
+    published = output_root / "city" / "default" / "published"
+    published.mkdir(parents=True)
+    cpu_calls = []
+    remembered = []
+    views = []
+
+    async def fake_cpu_bound(callback, *args, **kwargs):
+        pickle.dumps((callback, args, kwargs))
+        cpu_calls.append((callback, args, kwargs))
+        request = args[0]
+        return figures._FigureJobResult(
+            "export",
+            request.revision,
+            path=published,
+            phase="completed",
+        )
+
+    monkeypatch.setattr(run, "cpu_bound", fake_cpu_bound)
+    monkeypatch.setattr(figures, "load_figure_source", lambda _path: source)
+    coordinator = JobCoordinator()
+
+    @ui.page("/figure-cpu-export")
+    def figure_cpu_export():
+        views.append(
+            figures.render_figures_page(
+                ui,
+                Translator("en"),
+                tmp_path,
+                coordinator,
+                initial_source=source_path,
+                source_options={str(source_path): "Completed source"},
+                output_root=output_root,
+                on_published=remembered.append,
+            )
+        )
+
+    try:
+        await user.open("/figure-cpu-export")
+        await user.should_see(marker="figure-source-ready", content="Rectangle 1")
+
+        user.find(marker="figure-export").click()
+        for _ in range(30):
+            if cpu_calls:
+                break
+            await asyncio.sleep(0.05)
+
+        assert len(cpu_calls) == 1
+        callback, args, kwargs = cpu_calls[0]
+        assert callback is figures._render_figure_export
+        assert len(args) == 1
+        assert kwargs == {}
+        await user.should_see(str(published))
+        assert remembered == [published]
+        assert views[0].controller.state.run_path == published
+        assert coordinator.snapshot().active is False
+    finally:
+        if views:
+            views[0].timer.cancel(with_current_invocation=True)
+        coordinator.shutdown()
+
+
 async def test_figure_page_shows_loaded_no_dem_reason_and_no_legacy_controls(
     tmp_path,
     monkeypatch,
@@ -5795,10 +7473,17 @@ async def test_figure_page_shows_loaded_no_dem_reason_and_no_legacy_controls(
         create_app(
             catalog=SimpleNamespace(root=tmp_path.resolve()),
             coordinator=coordinator,
+            figure_source_options_provider=lambda: {
+                str(completed): "Completed without DEM"
+            },
             testing=True,
         )
         await user.open("/figures")
-        user.find(marker="figure-source-path").clear().type(str(completed))
+        source_control = next(
+            iter(user.find(marker="figure-source-path").elements)
+        )
+        with user.client:
+            source_control.set_value(str(completed.resolve()))
         user.find(marker="figure-load-source").click()
 
         await user.should_see(marker="figure-source-ready", content="Rectangle 1")

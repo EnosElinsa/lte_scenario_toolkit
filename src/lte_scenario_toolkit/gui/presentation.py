@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Final, Literal
+
+from ..run_trash import TrashState
 
 StatusTone = Literal[
     "neutral",
@@ -112,6 +115,42 @@ _RUN_STATES: Final = {
     "partial": PresentationSpec("status.partial", "warning"),
 }
 
+
+class TrashAction(str, Enum):
+    """User actions supported by one transactional Trash state."""
+
+    RESTORE = "restore"
+    PURGE = "purge"
+    RECOVER = "recover"
+
+
+TRASH_ACTIONS_BY_STATE: Final = {
+    TrashState.TRASHED: (TrashAction.RESTORE, TrashAction.PURGE),
+    TrashState.RECOVERY_REQUIRED: (TrashAction.RECOVER,),
+    TrashState.PURGE_FAILED: (TrashAction.PURGE,),
+}
+
+
+_TRASH_STATES: Final = {
+    TrashState.TRASHED.value: PresentationSpec("trash.state.trashed", "success"),
+    TrashState.RECOVERY_REQUIRED.value: PresentationSpec(
+        "trash.state.recovery_required", "warning"
+    ),
+    TrashState.PURGE_FAILED.value: PresentationSpec(
+        "trash.state.purge_failed", "danger"
+    ),
+    TrashState.MOVING.value: PresentationSpec("trash.state.moving", "active"),
+    TrashState.RESTORING.value: PresentationSpec("trash.state.restoring", "active"),
+    TrashState.PURGING.value: PresentationSpec("trash.state.purging", "active"),
+}
+
+
+_TRASH_ACTIONS: Final = {
+    TrashAction.RESTORE.value: PresentationSpec("trash.action.restore"),
+    TrashAction.PURGE.value: PresentationSpec("trash.action.purge", "danger"),
+    TrashAction.RECOVER.value: PresentationSpec("trash.action.recover", "warning"),
+}
+
 _JOB_KINDS: Final = {
     "validation.full_checksum": PresentationSpec(
         "job.kind.full_checksum",
@@ -124,6 +163,18 @@ _JOB_KINDS: Final = {
     "figure-source": PresentationSpec("job.kind.figure_source", "active"),
     "figure-preview": PresentationSpec("job.kind.figure_preview", "active"),
     "figure-export": PresentationSpec("job.kind.figure_export", "active"),
+    "history.trash_move": PresentationSpec(
+        "job.kind.history_trash_move",
+        "active",
+    ),
+    "history.trash_restore": PresentationSpec(
+        "job.kind.history_trash_restore",
+        "active",
+    ),
+    "history.trash_purge": PresentationSpec(
+        "job.kind.history_trash_purge",
+        "active",
+    ),
 }
 
 
@@ -170,6 +221,20 @@ def run_state_presentation(value: object) -> PresentationSpec:
     """Present a published run state."""
 
     return _present(value, _RUN_STATES)
+
+
+def trash_state_presentation(value: object) -> PresentationSpec:
+    """Present a Trash state and fail closed for unknown values."""
+
+    token = value.value if isinstance(value, Enum) else value
+    return _present(token, _TRASH_STATES)
+
+
+def trash_action_presentation(value: object) -> PresentationSpec:
+    """Present a Trash action and fail closed for unknown values."""
+
+    token = value.value if isinstance(value, Enum) else value
+    return _present(token, _TRASH_ACTIONS)
 
 
 def job_kind_presentation(value: object) -> PresentationSpec:
@@ -308,6 +373,8 @@ __all__ = [
     "ActionSpec",
     "PresentationSpec",
     "StatusTone",
+    "TRASH_ACTIONS_BY_STATE",
+    "TrashAction",
     "artifact_label_presentation",
     "artifact_state_presentation",
     "cache_presentation",
@@ -321,4 +388,6 @@ __all__ = [
     "render_technical_details",
     "run_state_presentation",
     "scan_mode_presentation",
+    "trash_action_presentation",
+    "trash_state_presentation",
 ]

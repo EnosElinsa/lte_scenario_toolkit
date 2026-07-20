@@ -901,6 +901,17 @@ class CandidateSessionRegistry:
                 self._sessions.move_to_end(session_id)
             return session
 
+    def confirmed_sessions(self) -> tuple[CandidateSession, ...]:
+        """Return current un-published selections, newest first, without reordering."""
+
+        with self._lock:
+            return tuple(
+                session
+                for session in reversed(self._sessions.values())
+                if session.confirmed_flat_grid_id is not None
+                and session.locked_candidate is not None
+            )
+
     def pin(self, session_id: str) -> CandidateSession:
         """Prevent one page-owned session from being evicted while it is active."""
 

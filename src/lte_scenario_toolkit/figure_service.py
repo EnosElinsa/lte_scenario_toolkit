@@ -240,18 +240,22 @@ class FigureSpec:
             raise ValueError("Figure max_pixels must be a positive integer")
         return self
 
-    def resolved_title(self, rectangle_size_m: float, point_count: int) -> str:
-        if self.title is not None:
-            return self.title
-        if self.preset == "publication":
-            return {1000: "DCMOP1", 2000: "DCMOP2", 3000: "DCMOP3"}.get(
-                int(rectangle_size_m),
-                f"{rectangle_size_m:g}m",
-            )
-        return (
-            f"Terrain | {rectangle_size_m:g}m x {rectangle_size_m:g}m | "
-            f"{point_count} stations"
-        )
+    def resolved_title(
+        self,
+        rectangle_size_m: float,
+        point_count: int,
+    ) -> str | None:
+        """Return only an explicit non-blank title.
+
+        Rectangle dimensions and station counts are already encoded by the axes,
+        legend, and run metadata. Inventing a title from those values made an empty
+        title field behave differently from every other optional style field.
+        """
+
+        del rectangle_size_m, point_count
+        if self.title is None:
+            return None
+        return self.title.strip() or None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -9,6 +9,38 @@ from typing import Any
 
 import numpy as np
 
+_PUBLICATION_FONT = "Times New Roman"
+_STATIC_SURFACE_SAMPLE_LIMITS = {
+    "preview": 160,
+    "publication": 400,
+}
+
+
+def _surface_sample_counts(z: np.ndarray, preset: str) -> tuple[int, int]:
+    """Choose an explicit mesh density instead of Matplotlib's 50x50 default."""
+
+    rows, columns = z.shape
+    limit = _STATIC_SURFACE_SAMPLE_LIMITS[preset]
+    return min(rows, limit), min(columns, limit)
+
+
+def _vertical_z_aspect(
+    z_range: float,
+    rectangle_size: float,
+    vertical_exaggeration: float,
+) -> float:
+    """Preserve the physical vertical scale and apply only the requested factor."""
+
+    return z_range / rectangle_size * vertical_exaggeration
+
+
+def _vertical_exaggeration_note(vertical_exaggeration: float) -> str | None:
+    """Disclose any non-unit vertical scale used by the exported figure."""
+
+    if math.isclose(vertical_exaggeration, 1.0):
+        return None
+    return f"Vertical exaggeration: {vertical_exaggeration:g}x"
+
 
 def _geometry_line_segments(geometry) -> list[np.ndarray]:
     """Return two-dimensional line segments without invoking GeoPandas plotting."""
@@ -248,9 +280,13 @@ def render_3d_terrain(
         )
     )
     z_range = max(float(np.nanmax(arrays["z"]) - np.nanmin(arrays["z"])), 0.1)
-    z_aspect = max(
-        spec.vertical_exaggeration * z_range / rectangle_size,
-        0.01,
+    z_aspect = _vertical_z_aspect(
+        z_range,
+        rectangle_size,
+        spec.vertical_exaggeration,
+    )
+    vertical_exaggeration_note = _vertical_exaggeration_note(
+        spec.vertical_exaggeration
     )
     valid_points = np.isfinite(arrays["point_z"])
     offset = z_range * 0.02
@@ -261,59 +297,156 @@ def render_3d_terrain(
     outputs: list[Path] = []
 
     if png_path is not None or eps_path is not None:
+        import matplotlib
         from matplotlib.backends.backend_agg import FigureCanvasAgg
         from matplotlib.figure import Figure
+        from matplotlib.ticker import MaxNLocator
 
         static_parent = png_path.parent if png_path is not None else eps_path.parent
         static_parent.mkdir(parents=True, exist_ok=True)
-        figure = Figure(figsize=(14, 10))
-        FigureCanvasAgg(figure)
-        try:
-            axis = figure.add_subplot(111, projection="3d")
-            surface = axis.plot_surface(
-                arrays["x"],
-                arrays["y"],
-                arrays["z"],
-                cmap=spec.colormap,
-                alpha=0.85,
-                linewidth=0,
-                antialiased=True,
-            )
-            axis.scatter(
-                arrays["point_x"][valid_points],
-                arrays["point_y"][valid_points],
-                arrays["point_z"][valid_points] + offset,
-                c=spec.station_color,
-                s=spec.station_size,
-                label=f"Stations ({int(valid_points.sum())})",
-            )
-            axis.set_xlabel("X (m)")
-            axis.set_ylabel("Y (m)")
-            axis.set_zlabel("Elevation (m)")
-            axis.set_title(
-                title,
-                fontfamily="Times New Roman" if spec.preset == "publication" else None,
-            )
-            axis.view_init(elev=spec.elevation_angle, azim=spec.azimuth)
-            axis.set_box_aspect((1, 1, z_aspect))
-            if valid_points.any():
-                axis.legend()
-            figure.colorbar(surface, ax=axis, shrink=0.5, label="Elevation (m)")
-            if png_path is not None:
-                png_path.parent.mkdir(parents=True, exist_ok=True)
-                figure.savefig(png_path, dpi=spec.dpi, bbox_inches="tight")
-                outputs.append(png_path)
-            if eps_path is not None:
-                eps_path.parent.mkdir(parents=True, exist_ok=True)
-                figure.savefig(
-                    eps_path,
-                    format="eps",
-                    dpi=spec.dpi,
-                    bbox_inches="tight",
+        publication = spec.preset == "publication"
+        rc_parameters = {
+            "font.family": _PUBLICATION_FONT,
+            "font.size": 9,
+            "axes.labelsize": 9,
+            "axes.titlesize": 10,
+            "xtick.labelsize": 8,
+            "ytick.labelsize": 8,
+            "legend.fontsize": 8,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        } if publication else {
+            "font.size": 9,
+            "axes.labelsize": 9,
+            "axes.titlesize": 10,
+            "xtick.labelsize": 8,
+            "ytick.labelsize": 8,
+            "legend.fontsize": 8,
+        }
+        with matplotlib.rc_context(rc_parameters):
+            figure = Figure(figsize=(8.0, 6.0), facecolor="white")
+            FigureCanvasAgg(figure)
+            try:
+                axis = figure.add_subplot(
+                    111,
+                    projection="3d",
+                    computed_zorder=False,
                 )
-                outputs.append(eps_path)
-        finally:
-            figure.clear()
+                row_count, column_count = _surface_sample_counts(
+                    arrays["z"],
+                    spec.preset,
+                )
+                surface = axis.plot_surface(
+                    arrays["x"],
+                    arrays["y"],
+                    arrays["z"],
+                    cmap=spec.colormap,
+                    alpha=1.0,
+                    linewidth=0,
+                    antialiased=True,
+                    rcount=row_count,
+                    ccount=column_count,
+                    rasterized=True,
+                    zorder=1,
+                )
+                axis.scatter(
+                    arrays["point_x"][valid_points],
+                    arrays["point_y"][valid_points],
+                    arrays["point_z"][valid_points] + offset,
+                    c=spec.station_color,
+                    s=spec.station_size,
+                    edgecolors="white",
+                    linewidths=0.45,
+                    depthshade=False,
+                    alpha=1.0,
+                    label=f"Stations ({int(valid_points.sum())})",
+                    zorder=10,
+                )
+                axis.set_xlabel("X (m)", labelpad=8)
+                axis.set_ylabel("Y (m)", labelpad=8)
+                axis.set_zlabel("Z (m)", labelpad=7)
+                if title is not None:
+                    axis.set_title(title, pad=12)
+                axis.view_init(elev=spec.elevation_angle, azim=spec.azimuth)
+                axis.set_proj_type("ortho")
+                axis.set_box_aspect((1, 1, z_aspect), zoom=1.05)
+                axis.set_xlim(0.0, rectangle_size)
+                axis.set_ylim(0.0, rectangle_size)
+                axis.zaxis.set_major_locator(MaxNLocator(nbins=5, min_n_ticks=3))
+                axis.tick_params(axis="x", pad=1)
+                axis.tick_params(axis="y", pad=1)
+                axis.tick_params(axis="z", pad=2)
+                for tick_label in axis.get_zticklabels():
+                    tick_label.set_visible(False)
+                if vertical_exaggeration_note is not None:
+                    axis.text2D(
+                        0.02,
+                        0.98,
+                        vertical_exaggeration_note,
+                        transform=axis.transAxes,
+                        ha="left",
+                        va="top",
+                        fontsize=7,
+                        color="0.25",
+                    )
+                for pane in (
+                    axis.xaxis.pane,
+                    axis.yaxis.pane,
+                    axis.zaxis.pane,
+                ):
+                    pane.set_facecolor((0.98, 0.98, 0.98, 1.0))
+                    pane.set_edgecolor((0.75, 0.75, 0.75, 1.0))
+                    pane.set_alpha(1.0)
+                axis.grid(
+                    True,
+                    linewidth=0.35,
+                    color=(0.68, 0.68, 0.68, 1.0),
+                    alpha=1.0,
+                )
+                if valid_points.any():
+                    axis.legend(
+                        loc="upper right",
+                        bbox_to_anchor=(0.98, 0.88),
+                        frameon=False,
+                        borderaxespad=0.4,
+                        handletextpad=0.5,
+                    )
+                colorbar = figure.colorbar(
+                    surface,
+                    ax=axis,
+                    shrink=0.72,
+                    aspect=28,
+                    fraction=0.04,
+                    pad=0.08,
+                )
+                colorbar.set_label("Elevation (m)", labelpad=8)
+                colorbar.ax.tick_params(labelsize=8, pad=2)
+                figure.subplots_adjust(
+                    left=0.02,
+                    right=0.88,
+                    bottom=0.05,
+                    top=0.96,
+                )
+                save_options = {
+                    "dpi": spec.dpi,
+                    "bbox_inches": "tight",
+                    "pad_inches": 0.08,
+                    "facecolor": "white",
+                }
+                if png_path is not None:
+                    png_path.parent.mkdir(parents=True, exist_ok=True)
+                    figure.savefig(png_path, **save_options)
+                    outputs.append(png_path)
+                if eps_path is not None:
+                    eps_path.parent.mkdir(parents=True, exist_ok=True)
+                    figure.savefig(
+                        eps_path,
+                        format="eps",
+                        **save_options,
+                    )
+                    outputs.append(eps_path)
+            finally:
+                figure.clear()
 
     if html_path is not None:
         import plotly.graph_objects as go
@@ -324,6 +457,7 @@ def render_3d_terrain(
             y=arrays["y"],
             z=arrays["z"],
             colorscale=_plotly_colorscale(spec.colormap),
+            colorbar={"title": "Elevation (m)"},
             opacity=0.9,
             name="Terrain",
         )
@@ -342,10 +476,41 @@ def render_3d_terrain(
         figure = go.Figure(data=[surface, stations])
         figure.update_layout(
             title=title,
+            font={
+                "family": (
+                    "Times New Roman"
+                    if spec.preset == "publication"
+                    else "Arial"
+                ),
+                "size": 13,
+            },
+            template="plotly_white",
+            margin={"l": 20, "r": 20, "t": 48 if title else 20, "b": 20},
+            annotations=(
+                []
+                if vertical_exaggeration_note is None
+                else [
+                    {
+                        "text": vertical_exaggeration_note,
+                        "xref": "paper",
+                        "yref": "paper",
+                        "x": 0.01,
+                        "y": 0.99,
+                        "showarrow": False,
+                        "xanchor": "left",
+                        "yanchor": "top",
+                        "font": {"size": 11, "color": "#444444"},
+                    }
+                ]
+            ),
             scene={
                 "xaxis_title": "X (m)",
                 "yaxis_title": "Y (m)",
-                "zaxis_title": "Elevation (m)",
+                "zaxis": {
+                    "title": "Z (m)",
+                    "nticks": 5,
+                    "showticklabels": False,
+                },
                 "aspectmode": "manual",
                 "aspectratio": {"x": 1, "y": 1, "z": z_aspect},
                 "camera": _plotly_camera(
