@@ -40,7 +40,6 @@ _ARTIFACT_FORMATS = {
 _GENERATION_PHASES = {
     "ready": PresentationSpec("generate.phase.ready"),
     "running": PresentationSpec("generate.phase.running", "active"),
-    "cancelling": PresentationSpec("generate.phase.cancelling", "warning"),
     "completed": PresentationSpec("generate.phase.completed", "success"),
     "partial": PresentationSpec("generate.phase.partial", "warning"),
     "error": PresentationSpec("generate.phase.error", "danger"),
@@ -57,10 +56,6 @@ def generation_action_roles(
 
     if phase == "ready":
         return (("generate", "primary"),)
-    if phase == "running":
-        return (("cancel", "secondary"),)
-    if phase == "cancelling":
-        return (("cancel", "tertiary"),)
     if phase == "completed":
         if can_open_figures:
             return (("open_figures", "primary"), ("open_history", "secondary"))
@@ -77,7 +72,7 @@ def generation_current_step(phase: object) -> str:
 
     if phase == "ready":
         return "inputs"
-    if phase in {"running", "cancelling"}:
+    if phase == "running":
         return "generate"
     return "artifacts"
 
@@ -404,30 +399,6 @@ class GenerationController:
         self.coordinator.finish(active.job_id)
         return state
 
-    def cancel(self) -> bool:
-        """Request cooperative cancellation for this controller's active job."""
-
-        with self._lock:
-            job = self._job
-            if (
-                self._closed
-                or job is None
-                or job.future is None
-                or job.future.done()
-                or self._state.phase not in {"running", "cancelling"}
-            ):
-                return False
-            if self._state.phase == "cancelling":
-                return False
-            job_id = job.job_id
-        if not self.coordinator.cancel(job_id):
-            return False
-        with self._lock:
-            if self._job is not None and self._job.job_id == job_id:
-                self._state = replace(self._state, phase="cancelling")
-                return True
-        return False
-
     def close(self) -> None:
         with self._lock:
             self._closed = True
@@ -711,7 +682,7 @@ def render_generate_page(
         for token in artifact_status_holders:
             render_artifact_status(token, state.artifact_status(token))
         refresh_actions(state)
-        if state.phase in {"running", "cancelling"}:
+        if state.phase == "running":
             return
         timer.deactivate()
         if submit is not None:
@@ -759,12 +730,6 @@ def render_generate_page(
         if technical_details is not None and hasattr(technical_details, "set_value"):
             technical_details.set_value(True)
 
-    def request_cancel() -> None:
-        if controller.cancel():
-            state = controller.state
-            render_phase(state.phase)
-            refresh_actions(state)
-
     def retry_generation() -> None:
         ui.navigate.reload()
 
@@ -776,14 +741,12 @@ def render_generate_page(
         action_dock_holder.clear()
         callbacks: dict[str, Callable[[], None]] = {
             "generate": start,
-            "cancel": request_cancel,
             "open_history": open_history,
             "inspect": inspect_details,
             "retry": retry_generation,
         }
         labels = {
             "generate": translator.text("generate.action"),
-            "cancel": translator.text("generate.action.cancel"),
             "open_history": translator.text("action.open_history"),
             "inspect": translator.text("action.inspect"),
             "retry": translator.text("generate.action.retry"),
@@ -800,10 +763,8 @@ def render_generate_page(
                         labels[name],
                         callbacks[name],
                         role=role,
-                        enabled=not (name == "cancel" and state.phase == "cancelling"),
                         marker={
                             "generate": "generation-submit",
-                            "cancel": "generation-cancel",
                             "open_figures": "generation-open-figures",
                             "open_history": "generation-open-history",
                             "inspect": "generation-inspect",

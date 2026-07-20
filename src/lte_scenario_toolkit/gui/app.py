@@ -542,6 +542,7 @@ async def run_trash_mutation(
 class _FigureRouteRequest:
     source: Path | None = None
     session_id: str | None = None
+    session: CandidateSession | None = None
     output_root: Path | None = None
     formats: tuple[str, ...] = ()
     figure_spec: FigureSpec | None = None
@@ -549,7 +550,10 @@ class _FigureRouteRequest:
     parent_run_path: Path | None = None
 
     def __post_init__(self) -> None:
-        if (self.source is None) == (self.session_id is None):
+        has_session = self.session_id is not None or self.session is not None
+        if (self.source is None and not has_session) or (
+            self.source is not None and has_session
+        ):
             raise ValueError("figure route request requires one source or session")
 
 
@@ -1178,6 +1182,7 @@ def create_app(
             return
         def remember_generation_run(path: Path) -> None:
             remember_output_root(session.preflight.output_root)
+            sessions.discard(session.session_id)
 
         render_generate_page(
             ui,
@@ -1189,7 +1194,10 @@ def create_app(
             on_open_figures=lambda: ui.navigate.to(
                 "/figures/"
                 + figure_requests.add(
-                    _FigureRouteRequest(session_id=session.session_id)
+                    _FigureRouteRequest(
+                        session_id=session.session_id,
+                        session=session,
+                    )
                 )
             ),
         )
@@ -1213,11 +1221,9 @@ def create_app(
     def request_figure_session(
         request: _FigureRouteRequest | None,
     ) -> CandidateSession | None:
-        session = (
-            None
-            if request is None or request.session_id is None
-            else sessions.get(request.session_id)
-        )
+        session = None if request is None else request.session
+        if session is None and request is not None and request.session_id is not None:
+            session = sessions.get(request.session_id)
         try:
             if session is not None:
                 generation_model(session)

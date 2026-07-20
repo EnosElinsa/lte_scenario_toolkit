@@ -6133,6 +6133,7 @@ async def test_generation_page_uses_semantic_artifact_rows_and_live_partial_stat
         user.find(marker="generation-submit").click()
         assert await asyncio.to_thread(entered.wait, 2)
         await user.should_see(marker="generation-phase", content="Generating artifacts")
+        await user.should_not_see(marker="generation-cancel")
         assert generate_step.props["aria-current"] == "step"
         assert generate_step.props["aria-label"] == "Generate: in progress"
         assert "aria-current" not in inputs_step.props
@@ -6178,7 +6179,7 @@ async def test_generation_page_uses_semantic_artifact_rows_and_live_partial_stat
             marker="generation-primary-error",
             content="Some artifacts could not be generated",
         )
-        assert registry.get("semantic-run") is not None
+        assert registry.get("semantic-run") is None
         technical = next(iter(user.find(marker="generation-technical-copy").elements))
         assert "terrain.renderer_failed" in technical.content
         assert "terrain_png" in technical.content
@@ -6424,7 +6425,7 @@ def test_generation_settings_failure_is_a_warning_and_generation_is_one_shot(
     ("phase", "can_open_figures", "expected"),
     [
         ("ready", True, (("generate", "primary"),)),
-        ("running", True, (("cancel", "secondary"),)),
+        ("running", True, ()),
         (
             "completed",
             True,
@@ -6447,7 +6448,6 @@ def test_generation_workspace_action_roles_follow_the_run_state(
     [
         ("ready", "inputs"),
         ("running", "generate"),
-        ("cancelling", "generate"),
         ("completed", "artifacts"),
         ("partial", "artifacts"),
         ("error", "artifacts"),
@@ -6508,42 +6508,26 @@ def test_generation_workspace_uses_progressive_structure_and_compact_css():
         "generate.step.inputs",
         "generate.step.generate",
         "generate.step.artifacts",
-        "generate.action.cancel",
         "action.inspect",
         "generate.action.retry",
     ):
         assert key in translations
     assert "@media (max-width: 760px)" in stylesheet
     assert "@media (max-width: 390px)" in stylesheet
+    assert "generation-cancel" not in page
+    assert "generate.action.cancel" not in translations
+    assert "generate.phase.cancelling" not in translations
 
 
-def test_generation_controller_requests_cancellation_for_its_own_active_job(tmp_path):
-    from threading import Event
-
+def test_generation_controller_exposes_no_uninterruptible_cancel_promise(tmp_path):
     from lte_scenario_toolkit.gui.pages.generate import GenerationController
     from lte_scenario_toolkit.jobs import JobCoordinator
 
-    entered = Event()
-    release = Event()
-
-    class Service:
-        def export(self, *args, **kwargs):
-            entered.set()
-            assert release.wait(2)
-            raise RuntimeError("stopped after cancellation request")
-
     coordinator = JobCoordinator()
-    controller = GenerationController(_task15_locked_session(tmp_path, Service()), coordinator)
+    controller = GenerationController(_task15_locked_session(tmp_path, object()), coordinator)
     try:
-        job = controller.start(("csv",))
-        assert entered.wait(2)
-        assert controller.cancel() is True
-        assert controller.state.phase == "cancelling"
-        assert job.cancel_event.is_set()
+        assert not hasattr(controller, "cancel")
     finally:
-        release.set()
-        if controller.job is not None and controller.job.future is not None:
-            controller.job.future.result(timeout=2)
         controller.close()
         coordinator.shutdown()
 
@@ -9754,6 +9738,7 @@ async def test_offline_candidate_to_history_flow(user, tmp_path, monkeypatch):
     import urllib.request
 
     from lte_scenario_toolkit.gui.app import create_app
+    from lte_scenario_toolkit.gui.pages.candidates import CandidateSessionRegistry
     from lte_scenario_toolkit.gui.settings import GuiSettingsStore
     from lte_scenario_toolkit.run_service import RunService
 
@@ -9836,11 +9821,13 @@ async def test_offline_candidate_to_history_flow(user, tmp_path, monkeypatch):
             )
 
     service = Service()
+    registry = CandidateSessionRegistry(max_sessions=1)
     create_app(
         catalog=_Task13Catalog(tmp_path),
         profile_store=EmptyStore(),
         selection_service_factory=lambda _catalog: service,
         candidate_bundle_builder=lambda _session, _assets: _task14_map_bundle(tmp_path),
+        candidate_registry=registry,
         testing=True,
     )
     output_root = (tmp_path / "results").resolve()
@@ -9871,6 +9858,7 @@ async def test_offline_candidate_to_history_flow(user, tmp_path, monkeypatch):
     user.find(marker="generation-submit").click()
     await user.should_see(marker="generation-phase", content="All artifacts generated")
     await user.should_see(marker="generation-open-figures")
+    assert registry.confirmed_sessions() == ()
     user.find(marker="generation-open-figures").click()
     await user.should_see("Figure source")
     await user.should_see("Use Current Selection")
