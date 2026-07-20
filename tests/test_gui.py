@@ -2875,6 +2875,103 @@ async def test_configure_route_renders_complete_form_and_blocks_nonready_direct_
         assert all(not element.enabled for element in user.find(marker=marker).elements)
 
 
+async def test_configure_workbench_groups_profile_actions_and_run_review(user, tmp_path):
+    from lte_scenario_toolkit.gui.app import create_app
+
+    class EmptyStore:
+        def discover(self, scenario_id):
+            return []
+
+    create_app(
+        catalog=_Task13Catalog(tmp_path),
+        profile_store=EmptyStore(),
+        testing=True,
+    )
+    await user.open("/configure/without-default")
+
+    for marker in (
+        "configure-workflow-stepper",
+        "configure-step-data",
+        "configure-step-profile",
+        "configure-step-review",
+        "configure-workspace",
+        "configure-run-summary",
+        "profile-overflow",
+        "profile-management-actions",
+        "configure-action-dock",
+    ):
+        await user.should_see(marker=marker)
+
+    overflow = next(iter(user.find(marker="profile-overflow").elements))
+    assert overflow.props["aria-label"] == "Profile actions"
+    user.find(marker="profile-overflow").click()
+    for marker in (
+        "profile-copy",
+        "profile-rename",
+        "profile-set-default",
+        "profile-delete",
+        "profile-validate",
+    ):
+        await user.should_see(marker=marker)
+
+    dock = next(iter(user.find(marker="configure-action-dock").elements))
+    assert dock.tag == "footer"
+    for marker, role in (
+        ("profile-discard", "tertiary"),
+        ("profile-save", "secondary"),
+        ("profile-start-scan", "primary"),
+    ):
+        action = next(iter(user.find(marker=marker).elements))
+        expected_prop = {"tertiary": "flat", "secondary": "outline", "primary": "unelevated"}[role]
+        assert action.props[expected_prop] is True
+
+
+async def test_configure_workbench_smoke_renders_with_collapsed_shell(user, tmp_path):
+    from lte_scenario_toolkit.gui.app import create_app
+    from lte_scenario_toolkit.gui.settings import GuiSettingsStore
+
+    class EmptyStore:
+        def discover(self, scenario_id):
+            return []
+
+    GuiSettingsStore(tmp_path).save(
+        language="en",
+        output_roots=(),
+        navigation_collapsed=True,
+    )
+    create_app(
+        catalog=_Task13Catalog(tmp_path),
+        profile_store=EmptyStore(),
+        testing=True,
+    )
+
+    await user.open("/configure/without-default")
+
+    navigation = next(iter(user.find(marker="shell-navigation").elements))
+    assert navigation._props["mini"] is True
+    await user.should_see(marker="configure-workflow-stepper")
+    await user.should_see(marker="configure-action-dock")
+
+
+def test_configure_workbench_has_explicit_390px_overflow_safeguards():
+    css = (
+        ROOT / "src/lte_scenario_toolkit/gui/assets/app.css"
+    ).read_text(encoding="utf-8")
+
+    narrow = css[css.index("@media (max-width: 390px)") :]
+    for selector in (
+        ".lte-configure-workspace",
+        ".lte-configure-run-summary",
+        ".lte-configure-stepper",
+        ".lte-configure-action-dock",
+    ):
+        assert selector in narrow
+    assert "grid-template-columns: minmax(0, 1fr);" in narrow
+    assert "flex-direction: column;" in narrow
+    assert "min-width: 44px;" in narrow
+    assert "overflow-x: clip;" in narrow
+
+
 async def test_scenario_page_new_copy_is_localized_after_language_switch(user, tmp_path):
     from lte_scenario_toolkit.gui.app import create_app
 

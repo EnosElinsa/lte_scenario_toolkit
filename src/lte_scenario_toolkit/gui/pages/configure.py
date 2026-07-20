@@ -19,10 +19,14 @@ from ...profiles import (
 from ...selection_service import SelectionError
 from ..presentation import (
     ActionSpec,
+    MenuActionSpec,
     readiness_presentation,
     render_action_bar,
+    render_overflow_menu,
     render_page_header,
+    render_section_heading,
     render_status_badge,
+    render_sticky_action_dock,
 )
 
 PROFILE_SELECTION_MESSAGE = (
@@ -642,6 +646,7 @@ def render_configure_page(
         field_elements: dict[str, Any] = {}
         switch_target: dict[str, str | None] = {"value": None}
         safety_controls: list[Any] = []
+        workflow_state = {"preflight_passed": False}
 
         options = dict(model.profile_choices)
         options["__new__"] = translator.text("configure.new_profile")
@@ -667,9 +672,105 @@ def render_configure_page(
                 dirty_label = ui.label(profile_state).classes(
                     "lte-dirty-indicator"
                 ).mark("configure-profile-state")
-            management_area = ui.column().classes(
-                "lte-profile-management full-width"
+            management_area = ui.row().classes("lte-profile-management").mark(
+                "profile-management-actions"
             )
+
+        with ui.row().classes("lte-configure-stepper").props(
+            'role="list" aria-label="Configuration workflow"'
+        ).mark("configure-workflow-stepper"):
+            data_step = ui.label(translator.text("configure.workflow.data")).classes(
+                "lte-configure-step lte-configure-step--complete"
+            ).props('role="listitem"').mark("configure-step-data")
+            profile_step = ui.label(
+                translator.text("configure.workflow.profile")
+            ).classes("lte-configure-step lte-configure-step--current").props(
+                'role="listitem"'
+            ).mark("configure-step-profile")
+            review_step = ui.label(
+                translator.text("configure.workflow.review")
+            ).classes("lte-configure-step").props('role="listitem"').mark(
+                "configure-step-review"
+            )
+
+        with ui.row().classes("lte-configure-workspace").mark(
+            "configure-workspace"
+        ):
+            form_column = ui.column().classes("lte-configure-form-column")
+            with ui.card().classes("lte-configure-run-summary").mark(
+                "configure-run-summary"
+            ):
+                render_section_heading(ui, translator.text("configure.summary"))
+                with ui.column().classes("lte-configure-summary-list"):
+                    ui.label(translator.text("configure.summary.scenario")).classes(
+                        "lte-configure-summary-label"
+                    )
+                    ui.label(model.display_name).mark("configure-summary-scenario")
+                    ui.label(translator.text("configure.summary.profile")).classes(
+                        "lte-configure-summary-label"
+                    )
+                    ui.label(profile.display_name).mark("configure-summary-profile")
+                    ui.label(translator.text("configure.summary.data")).classes(
+                        "lte-configure-summary-label"
+                    )
+                    ui.label(profile.points_dataset_id).mark("configure-summary-data")
+                    ui.label(translator.text("configure.summary.readiness")).classes(
+                        "lte-configure-summary-label"
+                    )
+                    render_status_badge(
+                        ui,
+                        translator,
+                        readiness_presentation(model.status),
+                        marker="configure-summary-readiness",
+                    )
+                    summary_profile_state = ui.label(profile_state).classes(
+                        "lte-dirty-indicator"
+                    ).mark(
+                        "configure-summary-profile-state"
+                    )
+                    ui.label(translator.text("configure.summary.next_step")).classes(
+                        "lte-configure-summary-label"
+                    )
+                    next_step_summary = ui.label().mark("configure-summary-next-step")
+
+        def refresh_workflow_presentation() -> None:
+            dirty = bool(form_values)
+            blocked = model.selection_error is not None or model.status != "ready"
+            if blocked:
+                next_key = "configure.next_step.blocked"
+            elif workflow_state["preflight_passed"]:
+                next_key = "configure.next_step.reviewed"
+            elif dirty:
+                next_key = "configure.next_step.dirty"
+            else:
+                next_key = "configure.next_step.ready"
+            summary_profile_state.set_text(
+                translator.text("configure.dirty") if dirty else profile_state
+            )
+            next_step_summary.set_text(translator.text(next_key))
+            data_step.classes(
+                add="lte-configure-step--blocked" if blocked else "lte-configure-step--complete",
+                remove="lte-configure-step--blocked lte-configure-step--complete",
+            )
+            profile_step.classes(
+                add="lte-configure-step--current" if dirty else "lte-configure-step--complete",
+                remove="lte-configure-step--current lte-configure-step--complete",
+            )
+            review_step.classes(
+                add=(
+                    "lte-configure-step--blocked"
+                    if blocked
+                    else "lte-configure-step--complete"
+                    if workflow_state["preflight_passed"]
+                    else "lte-configure-step--current"
+                ),
+                remove=(
+                    "lte-configure-step--blocked lte-configure-step--complete "
+                    "lte-configure-step--current"
+                ),
+            )
+
+        refresh_workflow_presentation()
 
         def navigate_to_profile(selected_id: str) -> None:
             ui.navigate.to(_profile_route(scenario_id, selected_id))
@@ -726,12 +827,16 @@ def render_configure_page(
 
         def changed(event, field_name: str) -> None:
             form_values[field_name] = event.value
+            workflow_state["preflight_passed"] = False
             dirty_label.set_text(translator.text("configure.dirty"))
             dirty_label.classes(add="lte-dirty-indicator--dirty")
             clear_form_errors(field_name)
+            refresh_workflow_presentation()
 
-        with ui.card().classes("lte-form-card"):
-            ui.label(translator.text("configure.basic")).classes("lte-section-title")
+        with form_column:
+            form_card = ui.card().classes("lte-form-card")
+        with form_card:
+            render_section_heading(ui, translator.text("configure.basic"))
             with ui.grid(columns=2).classes("lte-form-grid"):
                 profile_id = ui.input(
                     translator.text("field.profile_id"), value=profile.profile_id
@@ -814,10 +919,12 @@ def render_configure_page(
                         lambda event: changed(event, "scan_mode")
                     )
 
-        with ui.card().classes("lte-output-card").mark("configure-output"):
-            ui.label(translator.text("configure.output")).classes(
-                "lte-section-title"
+        with form_column:
+            output_card = ui.card().classes("lte-output-card").mark(
+                "configure-output"
             )
+        with output_card:
+            render_section_heading(ui, translator.text("configure.output"))
             with ui.row().classes("lte-output-row"):
                 output_root = ui.input(
                     translator.text("field.output_root"),
@@ -842,14 +949,17 @@ def render_configure_page(
                     if selected:
                         output_root.value = selected
                         form_values["output_root"] = selected
+                        workflow_state["preflight_passed"] = False
                         dirty_label.set_text(translator.text("configure.dirty"))
                         dirty_label.classes(add="lte-dirty-indicator--dirty")
+                        refresh_workflow_presentation()
 
                 ui.button(
                     translator.text("action.browse"), on_click=browse
                 ).props("outline").mark("profile-browse")
 
-        error_area = ui.column().classes("lte-form-errors full-width")
+        with form_column:
+            error_area = ui.column().classes("lte-form-errors full-width")
 
         def clear_form_errors(field_name: str | None = None) -> None:
             error_area.clear()
@@ -1218,8 +1328,12 @@ def render_configure_page(
                 return
             outcome = start_scan_preflight(selection_service, candidate)
             if not outcome.ok:
+                workflow_state["preflight_passed"] = False
+                refresh_workflow_presentation()
                 report_preflight_error(outcome)
                 return
+            workflow_state["preflight_passed"] = True
+            refresh_workflow_presentation()
             if on_preflight_success is None:
                 ui.notify(translator.text("preflight.passed"), type="positive")
                 return
@@ -1229,33 +1343,34 @@ def render_configure_page(
                 report_error(exc)
 
         with management_area:
-            management_buttons = render_action_bar(
+            management_items: dict[str, Any] = {}
+            render_overflow_menu(
                 ui,
                 (
-                    ActionSpec(
-                        "copy",
+                    MenuActionSpec(
                         translator.text("action.copy"),
+                        None,
                         copy_dialog.open,
                         enabled=persisted_actions_enabled,
                         marker="profile-copy",
                     ),
-                    ActionSpec(
-                        "rename",
+                    MenuActionSpec(
                         translator.text("action.rename"),
+                        None,
                         rename_dialog.open,
                         enabled=persisted_actions_enabled,
                         marker="profile-rename",
                     ),
-                    ActionSpec(
-                        "default",
+                    MenuActionSpec(
                         translator.text("action.set_default"),
+                        None,
                         default_dialog.open,
                         enabled=persisted_actions_enabled and not model.is_default,
                         marker="profile-set-default",
                     ),
-                    ActionSpec(
-                        "delete",
+                    MenuActionSpec(
                         translator.text("action.delete"),
+                        None,
                         delete_dialog.open,
                         role="danger",
                         enabled=(
@@ -1264,43 +1379,55 @@ def render_configure_page(
                         ),
                         marker="profile-delete",
                     ),
+                    MenuActionSpec(
+                        translator.text("configure.validate"),
+                        None,
+                        run_preflight,
+                        separator=True,
+                        enabled=model.can_start,
+                        marker="profile-validate",
+                    ),
                 ),
-                marker="profile-management-actions",
+                label=translator.text("configure.profile_actions"),
+                marker="profile-overflow",
+                item_sink=management_items,
             )
-        copy_button = management_buttons["copy"]
-        rename_button = management_buttons["rename"]
-        default_button = management_buttons["default"]
-        delete_button = management_buttons["delete"]
+        copy_button = management_items["profile-copy"]
+        rename_button = management_items["profile-rename"]
+        default_button = management_items["profile-set-default"]
+        delete_button = management_items["profile-delete"]
 
         writes_enabled = model.selection_error is None and model.status == "ready"
-        workflow_buttons = render_action_bar(
-            ui,
-            (
-                ActionSpec(
-                    "discard",
-                    translator.text("action.discard"),
-                    ui.navigate.reload,
-                    marker="profile-discard",
+        with ui.element("div").classes("full-width").mark("configure-action-bar"):
+            workflow_buttons = render_sticky_action_dock(
+                ui,
+                (
+                    ActionSpec(
+                        "discard",
+                        translator.text("action.discard"),
+                        ui.navigate.reload,
+                        role="tertiary",
+                        marker="profile-discard",
+                    ),
+                    ActionSpec(
+                        "save",
+                        translator.text("action.save"),
+                        request_save,
+                        enabled=writes_enabled,
+                        marker="profile-save",
+                    ),
+                    ActionSpec(
+                        "start",
+                        translator.text("action.start_scan"),
+                        run_preflight,
+                        role="primary",
+                        enabled=model.can_start,
+                        marker="profile-start-scan",
+                    ),
                 ),
-                ActionSpec(
-                    "save",
-                    translator.text("action.save"),
-                    request_save,
-                    enabled=writes_enabled,
-                    marker="profile-save",
-                ),
-                ActionSpec(
-                    "start",
-                    translator.text("action.start_scan"),
-                    run_preflight,
-                    role="primary",
-                    enabled=model.can_start,
-                    marker="profile-start-scan",
-                ),
-            ),
-            sticky=True,
-            marker="configure-action-bar",
-        )
+                label=translator.text("configure.profile_actions"),
+                marker="configure-action-dock",
+            )
         _discard = workflow_buttons["discard"]
         save = workflow_buttons["save"]
         start = workflow_buttons["start"]

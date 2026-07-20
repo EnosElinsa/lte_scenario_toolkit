@@ -339,6 +339,8 @@ def render_overflow_menu(
                     item.classes("lte-overflow-menu__item--danger text-negative")
                 if not action.enabled:
                     item.props(add="disable aria-disabled=true")
+                    if hasattr(item, "set_enabled"):
+                        item.set_enabled(False)
                 _mark(item, action.marker)
                 if item_sink is not None and action.marker is not None:
                     item_sink[action.marker] = item

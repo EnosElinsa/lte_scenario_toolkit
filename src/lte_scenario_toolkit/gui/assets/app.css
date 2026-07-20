@@ -797,8 +797,83 @@ h3,
   font-size: 11px;
 }
 
-.lte-configure-page { max-width: 1040px; }
+.lte-configure-page { max-width: 1180px; }
 .lte-profile-select { width: min(420px, 100%); }
+
+.lte-configure-stepper {
+  display: flex;
+  width: 100%;
+  gap: 0;
+  margin: 2px 0 var(--lte-space-1);
+  overflow: hidden;
+  border: 1px solid var(--lte-border);
+  border-radius: var(--lte-radius-sm);
+  background: #f4f5f0;
+}
+
+.lte-configure-step {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 9px 12px 9px 31px;
+  color: var(--lte-ink-muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.lte-configure-step::before {
+  position: absolute;
+  top: 9px;
+  left: 11px;
+  display: grid;
+  width: 16px;
+  height: 16px;
+  place-items: center;
+  color: #fff;
+  content: "";
+  background: #9aa6a3;
+  border-radius: 50%;
+}
+
+.lte-configure-step--complete { color: #245849; background: #e4f1eb; }
+.lte-configure-step--complete::before { content: "\2713"; background: var(--lte-success); }
+.lte-configure-step--current { color: #0d4c50; background: #dcefed; }
+.lte-configure-step--current::before { content: ""; background: var(--lte-accent); }
+.lte-configure-step--blocked { color: #7b2b2b; background: #f8e5e5; }
+.lte-configure-step--blocked::before { content: "!"; background: var(--lte-danger); }
+
+.lte-configure-workspace {
+  display: grid;
+  width: 100%;
+  grid-template-columns: minmax(0, 1fr) clamp(268px, 27vw, 330px);
+  align-items: start;
+  gap: var(--lte-space-4);
+  min-width: 0;
+}
+
+.lte-configure-form-column { min-width: 0; }
+
+.lte-configure-run-summary {
+  position: sticky;
+  top: var(--lte-space-3);
+  width: 100%;
+  min-width: 0;
+  gap: var(--lte-space-3);
+  border-top: 3px solid var(--lte-accent);
+}
+
+.lte-configure-summary-list { gap: 3px; }
+.lte-configure-summary-label {
+  margin-top: var(--lte-space-2);
+  color: var(--lte-ink-muted);
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.lte-configure-summary-label:first-child { margin-top: 0; }
+.lte-configure-run-summary .lte-section-heading { margin-bottom: 0; }
+.lte-configure-run-summary .lte-status-badge { align-self: flex-start; }
 
 .lte-profile-header,
 .lte-output-card {
@@ -1537,7 +1612,13 @@ button:disabled,
   .lte-generation-artifact-status { grid-column: 2; }
 
   .lte-web-selector-frame,
-  .lte-candidate-page {
+  .lte-candidate-page,
+  .lte-configure-page,
+  .lte-configure-workspace,
+  .lte-configure-form-column,
+  .lte-configure-run-summary,
+  .lte-configure-stepper,
+  .lte-configure-action-dock {
     width: 100%;
     max-width: 100%;
     min-width: 0;
@@ -1605,6 +1686,38 @@ button:disabled,
   }
 
   .lte-candidate-workspace { grid-template-columns: minmax(0, 1fr); }
+
+  .lte-configure-workspace {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--lte-space-3);
+  }
+
+  .lte-configure-run-summary { position: static; }
+
+  .lte-configure-stepper {
+    flex-direction: column;
+    gap: 1px;
+  }
+
+  .lte-configure-step {
+    width: 100%;
+    min-width: 44px;
+    min-height: 44px;
+    padding-top: 12px;
+    padding-bottom: 12px;
+  }
+
+  .lte-configure-action-dock,
+  .lte-configure-action-dock .lte-action-bar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .lte-configure-action-dock .q-btn {
+    width: 100%;
+    min-width: 44px;
+    min-height: 44px;
+  }
 
   .lte-filmstrip-grid {
     grid-auto-flow: column;
