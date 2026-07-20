@@ -60,6 +60,7 @@ class GuiSettings:
 
     language: str = DEFAULT_LANGUAGE
     output_roots: tuple[Path, ...] = ()
+    navigation_collapsed: bool = False
 
 
 class GuiSettingsStore:
@@ -88,10 +89,15 @@ class GuiSettingsStore:
         *,
         language: str,
         output_roots: Iterable[str | os.PathLike[str]],
+        navigation_collapsed: bool = False,
     ) -> GuiSettings:
         """Validate, normalize, and atomically persist workstation settings."""
 
-        settings = self._validated_settings(language, output_roots)
+        settings = self._validated_settings(
+            language,
+            output_roots,
+            navigation_collapsed,
+        )
         with _SETTINGS_WRITE_LOCK:
             self._persist_locked(settings)
         return settings
@@ -101,6 +107,7 @@ class GuiSettingsStore:
         *,
         language: str | None = None,
         add_output_roots: Iterable[str | os.PathLike[str]] = (),
+        navigation_collapsed: bool | None = None,
     ) -> GuiSettings:
         """Atomically merge one preference change with the latest file contents."""
 
@@ -115,6 +122,11 @@ class GuiSettingsStore:
             settings = self._validated_settings(
                 current.language if language is None else language,
                 (*current.output_roots, *additions),
+                (
+                    current.navigation_collapsed
+                    if navigation_collapsed is None
+                    else navigation_collapsed
+                ),
             )
             self._persist_locked(settings)
         return settings
@@ -131,32 +143,42 @@ class GuiSettingsStore:
         payload = {
             "language": settings.language,
             "output_roots": [str(path) for path in settings.output_roots],
+            "navigation_collapsed": settings.navigation_collapsed,
         }
         self._atomic_write(payload)
 
     def _settings_from_document(self, document: object) -> GuiSettings:
         if not isinstance(document, dict):
             raise GuiSettingsError("GUI settings must be a JSON object")
-        expected = {"language", "output_roots"}
+        expected = {"language", "output_roots", "navigation_collapsed"}
         if set(document) != expected:
             raise GuiSettingsError(
-                "GUI settings must contain language and output_roots"
+                "GUI settings must contain language, output_roots, and navigation_collapsed"
             )
         roots = document["output_roots"]
         if not isinstance(roots, list):
             raise GuiSettingsError("GUI output_roots must be a JSON array")
         if any(not isinstance(root, str) or not Path(root).is_absolute() for root in roots):
             raise GuiSettingsError("GUI output roots must be absolute paths")
-        settings = self._validated_settings(document["language"], roots)
+        settings = self._validated_settings(
+            document["language"],
+            roots,
+            document["navigation_collapsed"],
+        )
         return settings
 
     def _validated_settings(
         self,
         language: object,
         output_roots: Iterable[object],
+        navigation_collapsed: object,
     ) -> GuiSettings:
         if not isinstance(language, str) or language not in SUPPORTED_LANGUAGES:
             raise GuiSettingsError(f"Unsupported GUI language: {language!r}")
+        if type(navigation_collapsed) is not bool:
+            raise GuiSettingsError(
+                "GUI navigation_collapsed must be a boolean"
+            )
         if isinstance(output_roots, (str, bytes)):
             raise GuiSettingsError("GUI output_roots must be a path collection")
         try:
@@ -196,7 +218,11 @@ class GuiSettingsStore:
             if identity not in seen:
                 seen.add(identity)
                 normalized.append(path)
-        return GuiSettings(language=language, output_roots=tuple(normalized))
+        return GuiSettings(
+            language=language,
+            output_roots=tuple(normalized),
+            navigation_collapsed=navigation_collapsed,
+        )
 
     def _validate_storage_path(self) -> None:
         settings_dir = self.path.parent

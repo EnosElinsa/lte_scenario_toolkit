@@ -806,6 +806,12 @@ def create_app(
                 return
             ui.navigate.reload()
 
+        def change_navigation_collapsed(collapsed: bool) -> None:
+            try:
+                store.update(navigation_collapsed=collapsed)
+            except GuiSettingsError as exc:
+                ui.notify(str(exc), type="negative")
+
         content = render_app_shell(
             ui,
             translator,
@@ -813,6 +819,8 @@ def create_app(
             page_context=translator.text(page_context_key),
             get_job_snapshot=runtime.coordinator.snapshot,
             on_language_change=change_language,
+            navigation_collapsed=settings.navigation_collapsed,
+            on_navigation_toggle=change_navigation_collapsed,
         )
         with content:
             return body(translator)

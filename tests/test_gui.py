@@ -251,6 +251,12 @@ def test_translation_dictionaries_have_identical_keys_and_format_values():
     assert set(module.TRANSLATIONS) == {"en", "zh-CN"}
     assert set(module.TRANSLATIONS["en"]) == set(module.TRANSLATIONS["zh-CN"])
     assert module.Translator("zh-CN").text("nav.scenarios") == "\u573a\u666f"
+    assert module.Translator("en").text("nav.collapse") == "Collapse navigation"
+    assert module.Translator("en").text("nav.expand") == "Expand navigation"
+    assert module.Translator("en").text("nav.more") == "More navigation options"
+    assert module.Translator("zh-CN").text("nav.collapse") == "收起导航"
+    assert module.Translator("zh-CN").text("nav.expand") == "展开导航"
+    assert module.Translator("zh-CN").text("nav.more") == "更多导航选项"
     assert module.Translator("en").text("job.running", name="Scan 1") == "Running Scan 1"
     assert module.Translator("en").text("shell.eyebrow") == "LTE / Operations"
     assert module.Translator("zh-CN").text("shell.eyebrow") == "LTE / \u4f5c\u4e1a\u53f0"
@@ -578,8 +584,63 @@ def test_gui_settings_are_local_and_atomic(tmp_path):
         (tmp_path / "outputs").resolve(),
         (tmp_path / "other").resolve(),
     )
+    assert loaded.navigation_collapsed is False
     assert (tmp_path / ".lte-data/gui-settings.json").is_file()
     assert not list((tmp_path / ".lte-data").glob("*.tmp"))
+
+
+def test_gui_settings_navigation_preference_roundtrip_preserves_other_settings(tmp_path):
+    module = _gui_module("settings")
+    store = module.GuiSettingsStore(tmp_path)
+    first_root = tmp_path / "outputs"
+    second_root = tmp_path / "other"
+
+    saved = store.save(
+        language="zh-CN",
+        output_roots=[first_root],
+        navigation_collapsed=True,
+    )
+    updated = store.update(
+        navigation_collapsed=False,
+        add_output_roots=[second_root],
+    )
+    restarted = module.GuiSettingsStore(tmp_path).load()
+
+    assert saved.navigation_collapsed is True
+    assert updated.language == "zh-CN"
+    assert updated.output_roots == (first_root.resolve(), second_root.resolve())
+    assert updated.navigation_collapsed is False
+    assert restarted == updated
+    assert json.loads(store.path.read_text(encoding="utf-8")) == {
+        "language": "zh-CN",
+        "output_roots": [str(first_root.resolve()), str(second_root.resolve())],
+        "navigation_collapsed": False,
+    }
+
+
+def test_gui_settings_stale_schema_without_navigation_preference_loads_defaults(
+    tmp_path,
+):
+    module = _gui_module("settings")
+    store = module.GuiSettingsStore(tmp_path)
+    store.path.parent.mkdir()
+    stale = {
+        "language": "zh-CN",
+        "output_roots": [str((tmp_path / "outputs").resolve())],
+    }
+    store.path.write_text(json.dumps(stale), encoding="utf-8")
+
+    assert store.load() == module.GuiSettings()
+    assert json.loads(store.path.read_text(encoding="utf-8")) == stale
+
+    updated = store.update(navigation_collapsed=True)
+
+    assert updated == module.GuiSettings(navigation_collapsed=True)
+    assert json.loads(store.path.read_text(encoding="utf-8")) == {
+        "language": "en",
+        "output_roots": [],
+        "navigation_collapsed": True,
+    }
 
 
 def test_gui_defaults_to_loopback_and_opens_browser():
@@ -917,6 +978,7 @@ def test_missing_gui_settings_use_english_defaults_without_writing(tmp_path):
 
     assert settings.language == "en"
     assert settings.output_roots == ()
+    assert settings.navigation_collapsed is False
     assert not (tmp_path / ".lte-data").exists()
 
 
@@ -1052,6 +1114,7 @@ def test_gui_settings_never_persist_environment_or_credentials(tmp_path, monkeyp
     assert set(json.loads(document)) == {
         "language",
         "output_roots",
+        "navigation_collapsed",
     }
 
 def test_gui_settings_atomic_failure_preserves_previous_file(tmp_path, monkeypatch):
@@ -1212,6 +1275,37 @@ def test_gui_settings_updates_merge_against_latest_document(tmp_path):
     settings = store.load()
     assert settings.language == "zh-CN"
     assert settings.output_roots == (first_root.resolve(), second_root.resolve())
+
+
+async def test_gui_shell_receives_and_persists_navigation_preference(
+    tmp_path, monkeypatch, user
+):
+    module = _gui_module("app")
+    output_root = tmp_path / "outputs"
+    module.GuiSettingsStore(tmp_path).save(
+        language="zh-CN",
+        output_roots=[output_root],
+        navigation_collapsed=True,
+    )
+    received: list[dict[str, object]] = []
+    original_render_shell = module.render_app_shell
+
+    def record_shell(*args, **kwargs):
+        received.append(kwargs)
+        return original_render_shell(*args, **kwargs)
+
+    monkeypatch.setattr(module, "render_app_shell", record_shell)
+    module.create_app(catalog=SimpleNamespace(root=tmp_path.resolve()), testing=True)
+
+    await user.open("/")
+
+    shell = received[-1]
+    assert shell["navigation_collapsed"] is True
+    shell["on_navigation_toggle"](False)
+    settings = module.GuiSettingsStore(tmp_path).load()
+    assert settings.language == "zh-CN"
+    assert settings.output_roots == (output_root.resolve(),)
+    assert settings.navigation_collapsed is False
 
 
 async def test_gui_shell_renders_and_switches_language_offline(

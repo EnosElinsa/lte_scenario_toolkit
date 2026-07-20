@@ -30,12 +30,18 @@ def render_app_shell(
     page_context: str,
     get_job_snapshot: Callable[[], JobSnapshot],
     on_language_change: Callable[[Any], None],
+    navigation_collapsed: bool = False,
+    on_navigation_toggle: Callable[[bool], None] | None = None,
 ) -> Any:
     """Render the responsive shell and return its empty main content element.
 
     ``page_context`` is translated by the caller because workflow pages can share
     an active navigation route while retaining distinct user-facing contexts.
+    Navigation arguments are accepted here so the app can persist the shared-shell
+    preference before the rail introduces its visual toggle.
     """
+
+    del navigation_collapsed, on_navigation_toggle
 
     drawer = (
         ui.left_drawer(value=False, fixed=True, bordered=False)
