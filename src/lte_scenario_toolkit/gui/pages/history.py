@@ -176,6 +176,33 @@ class HistoryRow:
         return tuple(actions)
 
 
+def history_row_matches(
+    row: HistoryRow,
+    query: str = "",
+    status: str = "all",
+) -> bool:
+    """Return whether a published row belongs in the current ledger view."""
+
+    if not isinstance(row, HistoryRow):
+        raise ValueError("history row filter requires a HistoryRow")
+    normalized_status = status.strip().casefold() if isinstance(status, str) else "all"
+    if normalized_status not in {"", "all"} and row.status.casefold() != normalized_status:
+        return False
+    normalized_query = query.strip().casefold() if isinstance(query, str) else ""
+    if not normalized_query:
+        return True
+    haystack = " ".join(
+        (
+            row.scenario_id,
+            row.profile_id,
+            row.run_id,
+            row.status,
+            row.local_created_at,
+        )
+    ).casefold()
+    return normalized_query in haystack
+
+
 @dataclass(frozen=True, slots=True)
 class HistorySnapshot:
     """A fresh multi-root discovery plus its non-actionable diagnostics."""
@@ -1540,6 +1567,8 @@ def render_trash_card(
         ui.element("div").classes(
             "lte-history-status-rail lte-history-status-rail--danger"
         ).mark(f"trash-status-rail-{prefix}")
+        trash_primary = ui.column().classes("lte-history-primary")
+        trash_primary.__enter__()
         with ui.row().classes("lte-history-card-heading"):
             with ui.column().classes("lte-history-card-identity"):
                 ui.label(" · ".join(card.scenario_profiles) or prefix).classes(
@@ -1553,13 +1582,25 @@ def render_trash_card(
                 marker=f"trash-state-{prefix}",
             )
         with ui.row().classes("lte-history-summary-grid"):
-            ui.label(f"{card.run_count} runs").classes("lte-history-summary-item")
+            ui.label(
+                _translated(
+                    translator,
+                    "history.trash_run_count",
+                    "{count} runs",
+                    count=card.run_count,
+                )
+            ).classes("lte-history-summary-item")
             ui.label(_format_bytes(card.size_bytes)).classes(
                 "lte-history-summary-item"
             )
-            ui.label(f"{card.artifact_count} artifacts").classes(
-                "lte-history-summary-item"
-            )
+            ui.label(
+                _translated(
+                    translator,
+                    "history.trash_artifact_count",
+                    "{count} artifacts",
+                    count=card.artifact_count,
+                )
+            ).classes("lte-history-summary-item")
             ui.label(prefix).classes("lte-history-summary-item")
         for root in card.roots:
             ui.label(str(root)).classes("lte-history-summary-item")
@@ -1680,6 +1721,7 @@ def render_trash_card(
             render_details,
             marker=f"trash-technical-{prefix}",
         )
+        trash_primary.__exit__(None, None, None)
     return container
 
 
@@ -2085,6 +2127,7 @@ def render_history_content(
         )
 
     pending = tuple(pending_selections)
+    rendered_rows: list[tuple[HistoryRow, Any]] = []
     holder.clear()
     with holder:
         with ui.row().classes("lte-history-toolbar").mark("history-toolbar"):
@@ -2102,7 +2145,7 @@ def render_history_content(
             ).classes("lte-history-search").mark("history-search")
             if hasattr(search, "props"):
                 search.props("type=search aria-label=Search runs")
-            ui.select(
+            status_filter = ui.select(
                 {
                     "all": _translated(translator, "history.filter_all", "All statuses"),
                     "completed": _translated(
@@ -2278,7 +2321,8 @@ def render_history_content(
                 ).hexdigest()[:8]
                 with ui.card().classes("lte-history-card").mark(
                     f"history-row-{root_digest}-{row.run_id}"
-                ):
+                ) as row_container:
+                    rendered_rows.append((row, row_container))
                     ui.element("div").classes(
                         "lte-history-status-rail "
                         f"lte-history-status-rail--{row.status}"
@@ -2506,6 +2550,34 @@ def render_history_content(
                             marker=f"history-technical-{row.run_id}",
                         )
 
+        def _event_value(event: Any, default: str = "") -> str:
+            value = getattr(event, "value", event)
+            return value if isinstance(value, str) else default
+
+        def apply_filters(_event: Any = None) -> None:
+            query = _event_value(getattr(search, "value", ""))
+            selected_status = getattr(status_filter, "value", "all")
+            if not isinstance(selected_status, str):
+                selected_status = "all"
+            if _event is not None:
+                event_value = _event_value(_event)
+                if getattr(_event, "sender", None) is status_filter:
+                    selected_status = event_value or "all"
+                elif event_value:
+                    query = event_value
+            for row, container in rendered_rows:
+                visible = history_row_matches(row, query, selected_status)
+                setter = getattr(container, "set_visibility", None)
+                if callable(setter):
+                    setter(visible)
+                elif hasattr(container, "visible"):
+                    container.visible = visible
+
+        if hasattr(search, "on_value_change"):
+            search.on_value_change(apply_filters)
+        if hasattr(status_filter, "on_value_change"):
+            status_filter.on_value_change(apply_filters)
+
 
 def render_history_page(
     ui: Any,
@@ -2590,6 +2662,7 @@ __all__ = [
     "confirm_history_trash_plan",
     "figure_source_options",
     "history_roots",
+    "history_row_matches",
     "history_rows",
     "move_history_to_trash",
     "permanent_delete_matches",

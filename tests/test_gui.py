@@ -6974,9 +6974,11 @@ def test_trash_card_renders_state_actions_and_restore_blocker(tmp_path):
     )
 
     markers = set()
+    classes_seen = []
 
     class Element:
         def classes(self, *_args):
+            classes_seen.extend(_args)
             return self
 
         def props(self, *_args):
@@ -7025,6 +7027,28 @@ def test_trash_card_renders_state_actions_and_restore_blocker(tmp_path):
     assert "trash-action-restore-abcdef01" in markers
     assert "trash-action-purge-abcdef01" in markers
     assert "trash-restore-blockers-abcdef01" in markers
+    assert "lte-history-primary" in classes_seen
+
+
+def test_history_row_matches_search_and_status_filters(tmp_path):
+    from lte_scenario_toolkit.gui.pages.history import history_row_matches
+
+    _root, _service, parent, _child, rows = _task6_history_family(tmp_path)
+    row = next(item for item in rows if item.run_id == parent.run_id)
+
+    assert history_row_matches(row, "city/default") is False
+    assert history_row_matches(row, "city") is True
+    assert history_row_matches(row, row.run_id[:8]) is True
+    assert history_row_matches(row, status="completed") is True
+    assert history_row_matches(row, status="partial") is False
+
+
+def test_trash_count_labels_are_localized():
+    from lte_scenario_toolkit.gui.i18n import Translator
+
+    assert Translator("en").text("history.trash_run_count", count=2) == "2 runs"
+    assert Translator("zh-CN").text("history.trash_run_count", count=2) == "2 \u4e2a\u8fd0\u884c"
+    assert Translator("zh-CN").text("history.trash_artifact_count", count=3) == "3 \u4e2a\u6210\u679c"
 
 
 def test_history_partial_csv_never_becomes_its_own_figure_source(tmp_path):
