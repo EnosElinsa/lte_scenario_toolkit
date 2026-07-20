@@ -206,10 +206,19 @@ def test_gui_css_keeps_the_workstation_shell_viewport_bounded_and_motion_safe():
     assert "--lte-command-height: 58px;" in css
     assert "height: 100dvh;" in css
     assert "min-height: calc(100dvh - var(--lte-command-height));" in css
+    assert "calc(100vh - 64px)" not in css
     assert "box-sizing: border-box;" in css
     assert ".lte-main" in css
     assert "overflow-x: hidden;" in css
     assert "overflow-y: auto;" in css
+    root_shell = re.search(
+        r"html,\s*body,\s*#app,\s*\.nicegui-content,\s*\.q-page\s*"
+        r"\{(?P<body>[^}]+)\}",
+        css,
+    )
+    assert root_shell is not None
+    assert "overflow-x: hidden;" in root_shell.group("body")
+    assert "overflow-y: hidden;" not in root_shell.group("body")
     assert ".lte-rail-nav" in css
     assert "@media (max-width: 980px)" in css
     assert ".lte-navigation-rail.q-drawer--mobile.q-drawer--mini" in css

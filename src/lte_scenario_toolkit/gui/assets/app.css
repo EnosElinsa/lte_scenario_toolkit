@@ -29,8 +29,10 @@
 html,
 body,
 #app,
-.nicegui-content {
+.nicegui-content,
+.q-page {
   min-height: 100%;
+  overflow-x: hidden;
   background: var(--lte-canvas);
   color: var(--lte-ink);
   font-family: Aptos, "Segoe UI Variable", "Segoe UI", sans-serif;
@@ -1332,7 +1334,7 @@ button:disabled,
   }
 
   .lte-main {
-    min-height: calc(100vh - 64px);
+    min-height: calc(100dvh - var(--lte-command-height));
     padding: 18px 12px 28px;
   }
 
