@@ -20,6 +20,7 @@ _JOB_TONE_CLASSES = " ".join(
     f"lte-job-indicator--{tone}"
     for tone in ("neutral", "info", "warning", "success", "danger", "active")
 )
+_NAVIGATION_MINI_CLASS = "lte-navigation-rail--mini"
 
 
 def render_app_shell(
@@ -47,6 +48,8 @@ def render_app_shell(
         .classes("lte-navigation-rail")
         .mark("shell-navigation")
     )
+    if navigation_collapsed:
+        drawer.classes(add=_NAVIGATION_MINI_CLASS)
     drawer.props(
         add="mini" if navigation_collapsed else None,
         remove="mini" if not navigation_collapsed else None,
@@ -65,6 +68,10 @@ def render_app_shell(
     def toggle_navigation_collapsed() -> None:
         nonlocal collapsed
         collapsed = not collapsed
+        drawer.classes(
+            add=_NAVIGATION_MINI_CLASS if collapsed else None,
+            remove=_NAVIGATION_MINI_CLASS if not collapsed else None,
+        )
         drawer.props(
             add="mini" if collapsed else None,
             remove="mini" if not collapsed else None,

@@ -88,24 +88,24 @@ h3,
   box-sizing: border-box;
 }
 
-.lte-navigation-rail.q-drawer--mini {
+.lte-navigation-rail.lte-navigation-rail--mini {
   width: 68px !important;
 }
 
-.lte-navigation-rail.q-drawer--mini .lte-rail-layout {
+.lte-navigation-rail.lte-navigation-rail--mini .lte-rail-layout {
   padding-right: 8px;
   padding-left: 8px;
 }
 
-.lte-navigation-rail.q-drawer--mini .lte-rail-brand,
-.lte-navigation-rail.q-drawer--mini .lte-nav__link {
+.lte-navigation-rail.lte-navigation-rail--mini .lte-rail-brand,
+.lte-navigation-rail.lte-navigation-rail--mini .lte-nav__link {
   justify-content: center;
   padding-right: 0;
   padding-left: 0;
 }
 
-.lte-navigation-rail.q-drawer--mini .lte-brand-copy,
-.lte-navigation-rail.q-drawer--mini .lte-nav__label {
+.lte-navigation-rail.lte-navigation-rail--mini .lte-brand-copy,
+.lte-navigation-rail.lte-navigation-rail--mini .lte-nav__label {
   display: none;
 }
 
@@ -1651,23 +1651,23 @@ button:disabled,
   .lte-command-bar__inner { gap: 12px; }
   .lte-shell-menu { display: inline-flex; }
   .lte-navigation-toggle { display: none; }
-  .lte-navigation-rail.q-drawer--mobile.q-drawer--mini {
+  .lte-navigation-rail.lte-navigation-rail--mini {
     width: 224px !important;
   }
-  .lte-navigation-rail.q-drawer--mobile.q-drawer--mini .lte-rail-layout {
+  .lte-navigation-rail.lte-navigation-rail--mini .lte-rail-layout {
     padding-right: 14px;
     padding-left: 14px;
   }
-  .lte-navigation-rail.q-drawer--mobile.q-drawer--mini .lte-rail-brand,
-  .lte-navigation-rail.q-drawer--mobile.q-drawer--mini .lte-nav__link {
+  .lte-navigation-rail.lte-navigation-rail--mini .lte-rail-brand,
+  .lte-navigation-rail.lte-navigation-rail--mini .lte-nav__link {
     justify-content: flex-start;
     padding-right: 12px;
     padding-left: 12px;
   }
-  .lte-navigation-rail.q-drawer--mobile.q-drawer--mini .lte-brand-copy {
+  .lte-navigation-rail.lte-navigation-rail--mini .lte-brand-copy {
     display: flex;
   }
-  .lte-navigation-rail.q-drawer--mobile.q-drawer--mini .lte-nav__label {
+  .lte-navigation-rail.lte-navigation-rail--mini .lte-nav__label {
     display: inline;
   }
   .lte-main { padding: 22px 18px 32px; }

@@ -245,7 +245,38 @@ def test_gui_css_keeps_the_workstation_shell_viewport_bounded_and_motion_safe():
     assert "overflow-y: hidden;" not in root_shell.group("body")
     assert ".lte-rail-nav" in css
     assert "@media (max-width: 980px)" in css
-    assert ".lte-navigation-rail.q-drawer--mobile.q-drawer--mini" in css
+    assert ".lte-navigation-rail.lte-navigation-rail--mini" in css
+    assert (
+        ".lte-navigation-rail.lte-navigation-rail--mini .lte-nav__label"
+        in css
+    )
+    assert (
+        ".lte-navigation-rail.lte-navigation-rail--mini .lte-brand-copy"
+        in css
+    )
+    mini_link_rule = re.search(
+        r"\.lte-navigation-rail\.lte-navigation-rail--mini "
+        r"\.lte-nav__link\s*\{(?P<body>[^}]+)\}",
+        css,
+    )
+    assert mini_link_rule is not None
+    assert "justify-content: center;" in mini_link_rule.group("body")
+    mini_label_rule = re.search(
+        r"\.lte-navigation-rail\.lte-navigation-rail--mini "
+        r"\.lte-nav__label\s*\{(?P<body>[^}]+)\}",
+        css,
+    )
+    assert mini_label_rule is not None
+    assert "display: none;" in mini_label_rule.group("body")
+    mobile_label_rule = re.search(
+        r"@media \(max-width: 980px\).*?"
+        r"\.lte-navigation-rail\.lte-navigation-rail--mini "
+        r"\.lte-nav__label\s*\{(?P<body>[^}]+)\}",
+        css,
+        re.DOTALL,
+    )
+    assert mobile_label_rule is not None
+    assert "display: inline;" in mobile_label_rule.group("body")
     assert "width: 224px !important;" in css
     assert "env(safe-area-inset-top)" in css
     assert "env(safe-area-inset-bottom)" in css
@@ -1800,7 +1831,20 @@ async def test_gui_shell_applies_navigation_mini_state_and_persists_rail_toggle(
     navigation = next(iter(user.find(marker="shell-navigation").elements))
     menu = next(iter(user.find(marker="shell-menu").elements))
     rail_toggle = next(iter(user.find(marker="shell-navigation-toggle").elements))
+    client = navigation._client()
+    nav_labels = [
+        element
+        for element in client.elements.values()
+        if "lte-nav__label" in element._classes
+    ]
+    nav_icons = [
+        element
+        for element in client.elements.values()
+        if "lte-nav__icon" in element._classes
+    ]
+    assert len(nav_labels) == len(nav_icons) == 4
     assert navigation._props["mini"] is True
+    assert "lte-navigation-rail--mini" in navigation._classes
     assert str(navigation._props["mini-width"]) == "68"
     assert rail_toggle._props["aria-label"] == "Expand navigation"
     assert menu._props["aria-label"] == "Open navigation menu"
@@ -1809,6 +1853,7 @@ async def test_gui_shell_applies_navigation_mini_state_and_persists_rail_toggle(
     await asyncio.sleep(0.05)
 
     assert "mini" not in navigation._props
+    assert "lte-navigation-rail--mini" not in navigation._classes
     assert rail_toggle._props["aria-label"] == "Collapse navigation"
     assert module.GuiSettingsStore(tmp_path).load().navigation_collapsed is False
 
