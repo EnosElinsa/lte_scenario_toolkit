@@ -1,0 +1,258 @@
+from __future__ import annotations
+
+import pickle
+from pathlib import Path
+
+import geopandas as gpd
+import numpy as np
+import rasterio
+from PIL import Image
+from rasterio.transform import from_origin
+from shapely.geometry import box
+
+from lte_scenario_toolkit.gui.scenario_previews import (
+    PREVIEW_SIZE,
+    ScenarioPreviewRequest,
+    ScenarioPreviewService,
+    build_scenario_previews,
+)
+
+
+def _write_boundary(path: Path) -> Path:
+    gpd.GeoDataFrame(
+        {"name": ["test"]},
+        geometry=[box(0, 0, 100, 50)],
+        crs="EPSG:3857",
+    ).to_file(path, driver="GeoJSON")
+    return path
+
+
+def _request(root: Path, *, boundary_path: Path, dem_path: Path | None = None):
+    return ScenarioPreviewRequest(
+        scenario_id="test/scenario",
+        scenario_name="Test Scenario",
+        boundary_path=boundary_path,
+        dem_path=dem_path,
+        allowed_root=root,
+    )
+
+
+def _write_dem(path: Path) -> Path:
+    values = np.linspace(0, 100, 100 * 50, dtype="float32").reshape(50, 100)
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        width=100,
+        height=50,
+        count=1,
+        dtype="float32",
+        crs="EPSG:3857",
+        transform=from_origin(0, 50, 1, 1),
+    ) as dataset:
+        dataset.write(values, 1)
+    return path
+
+
+def test_boundary_only_preview_is_a_fixed_valid_png(tmp_path):
+    boundary = _write_boundary(tmp_path / "boundary.geojson")
+    cache_root = tmp_path / ".lte-data" / "cache" / "scenario-previews"
+
+    result = ScenarioPreviewService(cache_root).build(_request(tmp_path, boundary_path=boundary))
+
+    assert result.kind == "boundary"
+    assert result.cache_hit is False
+    assert "DEM" in result.diagnostic
+    assert result.path.parent == cache_root
+    with Image.open(result.path) as image:
+        image.verify()
+    with Image.open(result.path) as image:
+        assert image.format == "PNG"
+        assert image.size == PREVIEW_SIZE == (760, 360)
+
+
+def test_dem_and_boundary_preview_renders_muted_terrain(tmp_path):
+    boundary = _write_boundary(tmp_path / "boundary.geojson")
+    dem = _write_dem(tmp_path / "terrain.tif")
+    cache_root = tmp_path / ".lte-data" / "cache" / "scenario-previews"
+
+    result = ScenarioPreviewService(cache_root).build(
+        _request(tmp_path, boundary_path=boundary, dem_path=dem)
+    )
+
+    assert result.kind == "terrain"
+    assert result.cache_hit is False
+    assert result.diagnostic is None
+    with Image.open(result.path) as image:
+        assert image.size == PREVIEW_SIZE
+        assert len(image.convert("RGB").getcolors(maxcolors=PREVIEW_SIZE[0] * PREVIEW_SIZE[1])) > 20
+
+
+def test_invalid_dem_degrades_to_boundary_only(tmp_path):
+    boundary = _write_boundary(tmp_path / "boundary.geojson")
+    dem = tmp_path / "invalid.tif"
+    dem.write_bytes(b"not a raster")
+    cache_root = tmp_path / ".lte-data" / "cache" / "scenario-previews"
+
+    result = ScenarioPreviewService(cache_root).build(
+        _request(tmp_path, boundary_path=boundary, dem_path=dem)
+    )
+
+    assert result.kind == "boundary"
+    assert result.diagnostic and "DEM preview unavailable" in result.diagnostic
+
+
+def test_preview_cache_hit_reuses_valid_png(tmp_path):
+    boundary = _write_boundary(tmp_path / "boundary.geojson")
+    cache_root = tmp_path / ".lte-data" / "cache" / "scenario-previews"
+    service = ScenarioPreviewService(cache_root)
+
+    first = service.build(_request(tmp_path, boundary_path=boundary))
+    second = service.build(_request(tmp_path, boundary_path=boundary))
+
+    assert first.path == second.path
+    assert second.cache_hit is True
+    assert second.kind == "boundary"
+
+
+def test_malformed_cached_png_is_regenerated(tmp_path):
+    boundary = _write_boundary(tmp_path / "boundary.geojson")
+    cache_root = tmp_path / ".lte-data" / "cache" / "scenario-previews"
+    service = ScenarioPreviewService(cache_root)
+    first = service.build(_request(tmp_path, boundary_path=boundary))
+    first.path.write_bytes(b"not a png")
+
+    second = service.build(_request(tmp_path, boundary_path=boundary))
+
+    assert second.cache_hit is False
+    with Image.open(second.path) as image:
+        image.verify()
+
+
+def test_missing_boundary_degrades_to_stable_fallback(tmp_path):
+    cache_root = tmp_path / ".lte-data" / "cache" / "scenario-previews"
+    request = _request(tmp_path, boundary_path=tmp_path / "missing.geojson")
+
+    first = ScenarioPreviewService(cache_root).build(request)
+    second = ScenarioPreviewService(cache_root).build(request)
+
+    assert first.kind == second.kind == "fallback"
+    assert first.path == second.path
+    assert first.diagnostic and "does not exist" in first.diagnostic
+    assert second.cache_hit is True
+    with Image.open(first.path) as image:
+        assert image.size == PREVIEW_SIZE
+
+
+def test_batch_isolates_one_bad_request_from_good_requests(tmp_path):
+    boundary = _write_boundary(tmp_path / "boundary.geojson")
+    cache_root = tmp_path / ".lte-data" / "cache" / "scenario-previews"
+    requests = [
+        _request(tmp_path, boundary_path=boundary),
+        _request(tmp_path, boundary_path=tmp_path / "missing.geojson"),
+    ]
+
+    results = build_scenario_previews(requests, cache_root)
+
+    assert [result.kind for result in results] == ["boundary", "fallback"]
+    assert all(result.path.is_file() for result in results)
+
+
+def test_outside_and_traversal_inputs_degrade_without_exposing_source(tmp_path):
+    boundary = _write_boundary(tmp_path / "boundary.geojson")
+    outside = _write_boundary(tmp_path.parent / "outside.geojson")
+    cache_root = tmp_path / ".lte-data" / "cache" / "scenario-previews"
+    service = ScenarioPreviewService(cache_root)
+
+    outside_result = service.build(_request(tmp_path, boundary_path=outside))
+    traversal_result = service.build(
+        _request(tmp_path, boundary_path=Path("nested") / ".." / boundary.name)
+    )
+
+    assert outside_result.kind == traversal_result.kind == "fallback"
+    assert "escapes" in outside_result.diagnostic
+    assert "traversal" in traversal_result.diagnostic
+    assert outside_result.path.suffix == ".png"
+
+
+def test_symlink_boundary_degrades_when_platform_allows_links(tmp_path):
+    target = _write_boundary(tmp_path / "real.geojson")
+    link = tmp_path / "linked.geojson"
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError) as exc:
+        import pytest
+
+        pytest.skip(f"symlink creation unavailable: {exc}")
+    cache_root = tmp_path / ".lte-data" / "cache" / "scenario-previews"
+
+    result = ScenarioPreviewService(cache_root).build(_request(tmp_path, boundary_path=link))
+
+    assert result.kind == "fallback"
+    assert "redirected" in result.diagnostic or "symlink" in result.diagnostic
+
+
+def test_boundary_change_invalidates_preview_key(tmp_path):
+    boundary = _write_boundary(tmp_path / "boundary.geojson")
+    cache_root = tmp_path / ".lte-data" / "cache" / "scenario-previews"
+    service = ScenarioPreviewService(cache_root)
+    first = service.build(_request(tmp_path, boundary_path=boundary))
+    boundary.write_text(boundary.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+
+    second = service.build(_request(tmp_path, boundary_path=boundary))
+
+    assert second.cache_hit is False
+    assert second.path != first.path
+
+
+def test_cache_root_rejects_traversal_and_redirected_component(tmp_path):
+    import pytest
+
+    with pytest.raises(ValueError, match="traversal"):
+        ScenarioPreviewService(tmp_path / "cache" / ".." / "escape")
+    redirected = tmp_path / "redirected"
+    try:
+        redirected.symlink_to(tmp_path, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+    with pytest.raises(ValueError, match="redirected|symlink"):
+        ScenarioPreviewService(redirected / "cache")
+
+
+def test_atomic_replace_failure_cleans_temporary_file(tmp_path, monkeypatch):
+    import pytest
+
+    boundary = _write_boundary(tmp_path / "boundary.geojson")
+    cache_root = tmp_path / ".lte-data" / "cache" / "scenario-previews"
+    service = ScenarioPreviewService(cache_root)
+
+    def fail_replace(*args, **kwargs):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr("lte_scenario_toolkit.gui.scenario_previews.os.replace", fail_replace)
+    with pytest.raises(OSError, match="replace failure"):
+        service.build(_request(tmp_path, boundary_path=boundary))
+    assert not list(cache_root.glob("*.tmp"))
+
+
+def test_requests_and_batch_worker_are_pickleable(tmp_path):
+    boundary = _write_boundary(tmp_path / "boundary.geojson")
+    request = _request(tmp_path, boundary_path=boundary)
+
+    pickle.loads(pickle.dumps(request))
+    pickle.loads(pickle.dumps(build_scenario_previews))
+
+
+def test_invalid_request_fields_degrade_to_fallback_result(tmp_path):
+    request = ScenarioPreviewRequest(
+        scenario_id=123,  # type: ignore[arg-type]
+        scenario_name="Scenario",
+        boundary_path=tmp_path / "missing.geojson",
+        dem_path=None,
+        allowed_root=tmp_path,
+    )
+
+    result = ScenarioPreviewService(tmp_path / "cache").build(request)
+
+    assert result.kind == "fallback"
+    assert result.path.is_file()
