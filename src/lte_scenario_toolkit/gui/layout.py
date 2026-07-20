@@ -41,14 +41,45 @@ def render_app_shell(
     preference before the rail introduces its visual toggle.
     """
 
-    del navigation_collapsed, on_navigation_toggle
-
     drawer = (
         ui.left_drawer(value=False, fixed=True, bordered=False)
-        .props("width=224 breakpoint=980 show-if-above")
+        .props("width=224 mini-width=68 breakpoint=980 show-if-above")
         .classes("lte-navigation-rail")
         .mark("shell-navigation")
     )
+    drawer.props(
+        add="mini" if navigation_collapsed else None,
+        remove="mini" if not navigation_collapsed else None,
+    )
+    collapsed = navigation_collapsed
+    navigation_toggle: Any | None = None
+    navigation_toggle_tooltip: Any | None = None
+
+    def navigation_label() -> str:
+        key = "nav.expand" if collapsed else "nav.collapse"
+        return translator.text(key)
+
+    def navigation_toggle_icon() -> str:
+        return "chevron_right" if collapsed else "chevron_left"
+
+    def toggle_navigation_collapsed() -> None:
+        nonlocal collapsed
+        collapsed = not collapsed
+        drawer.props(
+            add="mini" if collapsed else None,
+            remove="mini" if not collapsed else None,
+        )
+        if navigation_toggle is not None:
+            navigation_toggle.props(
+                add=(
+                    f'aria-label="{navigation_label()}" '
+                    f"icon={navigation_toggle_icon()}"
+                )
+            )
+        if navigation_toggle_tooltip is not None:
+            navigation_toggle_tooltip.set_text(navigation_label())
+        if on_navigation_toggle is not None:
+            on_navigation_toggle(collapsed)
     with drawer:
         with ui.column().classes("lte-rail-layout no-wrap"):
             with ui.row().classes("lte-rail-brand items-center no-wrap"):
@@ -64,6 +95,7 @@ def render_app_shell(
                     link.props(
                         f'aria-label="{translator.text(key)}"'
                     )
+                    link.tooltip(translator.text(key))
                     with link:
                         ui.icon(icon).classes("lte-nav__icon")
                         ui.label(translator.text(key)).classes("lte-nav__label")
@@ -71,6 +103,18 @@ def render_app_shell(
                         link.classes(add="lte-nav__link--active").props(
                             "aria-current=page"
                         )
+            with ui.element("footer").classes("lte-navigation-footer"):
+                navigation_toggle = (
+                    ui.button(
+                        icon=navigation_toggle_icon(),
+                        on_click=toggle_navigation_collapsed,
+                    )
+                    .props(f'flat round aria-label="{navigation_label()}"')
+                    .classes("lte-navigation-toggle")
+                    .mark("shell-navigation-toggle")
+                )
+                with navigation_toggle:
+                    navigation_toggle_tooltip = ui.tooltip(navigation_label())
 
     with ui.header().classes("lte-command-bar"):
         with ui.row().classes("lte-command-bar__inner items-center no-wrap"):

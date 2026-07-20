@@ -70,6 +70,27 @@ h3,
   overflow-x: hidden;
 }
 
+.lte-navigation-rail.q-drawer--mini {
+  width: 68px !important;
+}
+
+.lte-navigation-rail.q-drawer--mini .lte-rail-layout {
+  padding-right: 8px;
+  padding-left: 8px;
+}
+
+.lte-navigation-rail.q-drawer--mini .lte-rail-brand,
+.lte-navigation-rail.q-drawer--mini .lte-nav__link {
+  justify-content: center;
+  padding-right: 0;
+  padding-left: 0;
+}
+
+.lte-navigation-rail.q-drawer--mini .lte-brand-copy,
+.lte-navigation-rail.q-drawer--mini .lte-nav__label {
+  display: none;
+}
+
 .lte-rail-layout {
   min-height: 100%;
   padding: 20px 14px 16px;
@@ -136,6 +157,18 @@ h3,
 .lte-rail-nav {
   width: 100%;
   padding-top: 18px;
+}
+
+.lte-navigation-footer {
+  display: flex;
+  justify-content: center;
+  margin-top: auto;
+  padding-top: 16px;
+}
+
+.lte-navigation-toggle {
+  min-width: 44px;
+  min-height: 44px;
 }
 
 .lte-nav__link {
@@ -1153,6 +1186,7 @@ button:disabled,
   .lte-command-bar { padding: 0 16px; }
   .lte-command-bar__inner { gap: 12px; }
   .lte-shell-menu { display: inline-flex; }
+  .lte-navigation-toggle { display: none; }
   .lte-main { padding: 22px 18px 32px; }
   .lte-form-grid { grid-template-columns: 1fr !important; }
   .lte-candidate-workspace { grid-template-columns: 1fr; }

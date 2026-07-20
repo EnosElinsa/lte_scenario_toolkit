@@ -130,6 +130,9 @@ def test_gui_css_defines_field_atlas_shell_and_mobile_touch_contract():
     shell_menu = declarations(".lte-shell-menu")
     assert "min-width: 44px;" in shell_menu
     assert "min-height: 44px;" in shell_menu
+    assert ".lte-navigation-toggle { display: none; }" in css
+    assert ".lte-navigation-footer" in css
+    assert "margin-top: auto;" in css
     assert "min-height: 44px;" in declarations(".lte-nav__link")
     assert "min-height: 44px;" in declarations(".lte-language-select")
     assert "min-height: 44px;" in declarations(
@@ -601,6 +604,28 @@ def test_shared_presentation_helpers_only_compose_callbacks_and_content():
     title = next(label for label in labels if label.args == ("Artifacts",))
     assert ("role=heading aria-level=2", None) in title.prop_calls
     assert any(label.args == ("Available outputs",) for label in labels)
+
+
+async def test_inspector_drawer_can_be_created_from_a_nested_page_body(user):
+    from nicegui import ui
+
+    from lte_scenario_toolkit.gui.presentation import render_inspector_drawer
+
+    @ui.page("/presentation-inspector-drawer")
+    def inspector_page():
+        with ui.column().mark("inspector-page-body"):
+            render_inspector_drawer(
+                ui,
+                "Inspector",
+                lambda: ui.label("Drawer body").mark("inspector-drawer-content"),
+                marker="inspector-drawer",
+            )
+
+    await user.open("/presentation-inspector-drawer")
+
+    await user.should_see(marker="inspector-page-body")
+    await user.should_see(marker="inspector-drawer")
+    await user.should_see(marker="inspector-drawer-content", content="Drawer body")
 
 
 def test_presentation_mappings_cover_current_gui_machine_values():
@@ -1639,6 +1664,41 @@ async def test_gui_shell_receives_and_persists_navigation_preference(
     assert settings.language == "zh-CN"
     assert settings.output_roots == (output_root.resolve(),)
     assert settings.navigation_collapsed is False
+
+
+async def test_gui_shell_applies_navigation_mini_state_and_persists_rail_toggle(
+    tmp_path, user
+):
+    module = _gui_module("app")
+    module.GuiSettingsStore(tmp_path).save(
+        language="en",
+        output_roots=[],
+        navigation_collapsed=True,
+    )
+    module.create_app(catalog=SimpleNamespace(root=tmp_path.resolve()), testing=True)
+
+    await user.open("/")
+
+    navigation = next(iter(user.find(marker="shell-navigation").elements))
+    menu = next(iter(user.find(marker="shell-menu").elements))
+    rail_toggle = next(iter(user.find(marker="shell-navigation-toggle").elements))
+    assert navigation._props["mini"] is True
+    assert str(navigation._props["mini-width"]) == "68"
+    assert rail_toggle._props["aria-label"] == "Expand navigation"
+    assert menu._props["aria-label"] == "Open navigation menu"
+
+    user.find(marker="shell-navigation-toggle").click()
+    await asyncio.sleep(0.05)
+
+    assert "mini" not in navigation._props
+    assert rail_toggle._props["aria-label"] == "Collapse navigation"
+    assert module.GuiSettingsStore(tmp_path).load().navigation_collapsed is False
+
+    user.find(marker="shell-menu").click()
+    await asyncio.sleep(0.05)
+
+    assert navigation.value is True
+    assert module.GuiSettingsStore(tmp_path).load().navigation_collapsed is False
 
 
 async def test_gui_shell_renders_and_switches_language_offline(

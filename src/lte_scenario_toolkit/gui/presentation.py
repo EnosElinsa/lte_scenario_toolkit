@@ -374,12 +374,16 @@ def render_inspector_drawer(
 ) -> Any:
     """Render a detail drawer while leaving its open state to the caller."""
 
-    drawer = _mark(
-        ui.right_drawer(value=value, fixed=True, bordered=True).classes(
-            "lte-inspector-drawer"
-        ),
-        marker,
-    )
+    context = getattr(ui, "context", None)
+    content = getattr(getattr(context, "client", None), "content", None)
+    if content is None:
+        drawer = ui.right_drawer(value=value, fixed=True, bordered=True)
+    else:
+        # NiceGUI drawers must be direct children of the page layout even when
+        # callers compose the inspector from within their page body.
+        with content:
+            drawer = ui.right_drawer(value=value, fixed=True, bordered=True)
+    drawer = _mark(drawer.classes("lte-inspector-drawer"), marker)
     if on_value_change is not None:
         drawer.on_value_change(on_value_change)
     with drawer:
