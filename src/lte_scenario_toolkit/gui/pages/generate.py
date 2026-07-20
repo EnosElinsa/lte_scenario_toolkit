@@ -13,10 +13,12 @@ from typing import Any
 from ...jobs import Job, JobBusyError, JobCoordinator
 from ...run_service import RunService
 from ..presentation import (
+    ActionSpec,
     PresentationSpec,
     artifact_label_presentation,
     artifact_state_presentation,
     render_status_badge,
+    render_sticky_action_dock,
     render_technical_details,
 )
 
@@ -38,10 +40,35 @@ _ARTIFACT_FORMATS = {
 _GENERATION_PHASES = {
     "ready": PresentationSpec("generate.phase.ready"),
     "running": PresentationSpec("generate.phase.running", "active"),
+    "cancelling": PresentationSpec("generate.phase.cancelling", "warning"),
     "completed": PresentationSpec("generate.phase.completed", "success"),
     "partial": PresentationSpec("generate.phase.partial", "warning"),
     "error": PresentationSpec("generate.phase.error", "danger"),
 }
+
+
+def generation_action_roles(
+    phase: object,
+    *,
+    can_open_figures: bool,
+) -> tuple[tuple[str, str], ...]:
+    """Return the single, state-appropriate action sequence for a run."""
+
+    if phase == "ready":
+        return (("generate", "primary"),)
+    if phase == "running":
+        return (("cancel", "secondary"),)
+    if phase == "cancelling":
+        return (("cancel", "tertiary"),)
+    if phase == "completed":
+        if can_open_figures:
+            return (("open_figures", "primary"), ("open_history", "secondary"))
+        return (("open_history", "secondary"),)
+    if phase == "partial":
+        return (("open_history", "secondary"), ("inspect", "tertiary"))
+    if phase == "error":
+        return (("retry", "secondary"), ("inspect", "tertiary"))
+    return ()
 
 
 def _ordered_artifacts(values: Iterable[str]) -> tuple[str, ...]:
@@ -366,6 +393,30 @@ class GenerationController:
         self.coordinator.finish(active.job_id)
         return state
 
+    def cancel(self) -> bool:
+        """Request cooperative cancellation for this controller's active job."""
+
+        with self._lock:
+            job = self._job
+            if (
+                self._closed
+                or job is None
+                or job.future is None
+                or job.future.done()
+                or self._state.phase not in {"running", "cancelling"}
+            ):
+                return False
+            if self._state.phase == "cancelling":
+                return False
+            job_id = job.job_id
+        if not self.coordinator.cancel(job_id):
+            return False
+        with self._lock:
+            if self._job is not None and self._job.job_id == job_id:
+                self._state = replace(self._state, phase="cancelling")
+                return True
+        return False
+
     def close(self) -> None:
         with self._lock:
             self._closed = True
@@ -416,65 +467,75 @@ def render_generate_page(
     navigated = False
     selection_locked = False
     locked_selection = ARTIFACT_ORDER
+    submit: Any | None = None
+    action_phase: str | None = None
+    technical_details: Any | None = None
 
     with ui.column().classes("lte-page lte-generate-page"):
         ui.label(translator.text("generate.title")).classes("lte-page-title").props(
             "role=heading aria-level=1"
         )
         ui.label(translator.text("generate.subtitle")).classes("lte-page-subtitle")
-        with ui.card().classes("lte-generate-summary full-width"):
-            ui.label(translator.text("generate.summary")).classes("lte-section-title")
-            ui.label(f"{model.scenario_id} / {model.profile_id}")
-            ui.label(
-                translator.text(
-                    "generate.candidate",
-                    grid_id=model.candidate.flat_grid_id,
-                    count=model.candidate.point_count,
+        with ui.element("ol").classes("lte-generate-stepper").props(
+            'aria-label="' + translator.text("generate.stepper") + '"'
+        ):
+            for key in ("inputs", "generate", "artifacts"):
+                with ui.element("li").classes("lte-generate-step"):
+                    ui.label(translator.text(f"generate.step.{key}"))
+        with ui.element("div").classes("lte-generate-workspace"):
+            with ui.card().classes("lte-generate-summary lte-generate-run-summary"):
+                ui.label(translator.text("generate.summary")).classes("lte-section-title")
+                ui.label(f"{model.scenario_id} / {model.profile_id}")
+                ui.label(
+                    translator.text(
+                        "generate.candidate",
+                        grid_id=model.candidate.flat_grid_id,
+                        count=model.candidate.point_count,
+                    )
                 )
-            )
-            ui.label(
-                translator.text("generate.destination", path=str(model.output_root))
-            ).classes("lte-path")
-        phase_holder = ui.row().classes("lte-generation-phase")
-        with ui.card().classes("lte-generate-artifacts full-width"):
-            ui.label(translator.text("generate.artifacts")).classes("lte-section-title")
-            with ui.column().classes("lte-generation-artifact-list"):
-                for token in ARTIFACT_ORDER:
-                    presentation = artifact_label_presentation(token)
-                    with ui.row().classes("lte-generation-artifact-row").mark(
-                        f"generation-artifact-{token}"
-                    ):
-                        checkboxes[token] = (
-                            ui.checkbox(value=True)
-                            .props(
-                                'aria-label="'
-                                + translator.text(presentation.label_key)
-                                + '"'
+                ui.label(
+                    translator.text("generate.destination", path=str(model.output_root))
+                ).classes("lte-path")
+                phase_holder = ui.row().classes("lte-generation-phase")
+            with ui.card().classes("lte-generate-artifacts"):
+                ui.label(translator.text("generate.artifacts")).classes("lte-section-title")
+                with ui.column().classes("lte-generation-artifact-list"):
+                    for token in ARTIFACT_ORDER:
+                        presentation = artifact_label_presentation(token)
+                        with ui.row().classes("lte-generation-artifact-row").mark(
+                            f"generation-artifact-{token}"
+                        ):
+                            checkboxes[token] = (
+                                ui.checkbox(value=True)
+                                .props(
+                                    'aria-label="'
+                                    + translator.text(presentation.label_key)
+                                    + '"'
+                                )
+                                .mark(f"generation-artifact-select-{token}")
                             )
-                            .mark(f"generation-artifact-select-{token}")
-                        )
-                        with ui.column().classes("lte-generation-artifact-copy"):
-                            ui.label(translator.text(presentation.label_key)).classes(
-                                "lte-generation-artifact-name"
+                            with ui.column().classes("lte-generation-artifact-copy"):
+                                ui.label(translator.text(presentation.label_key)).classes(
+                                    "lte-generation-artifact-name"
+                                )
+                                assert presentation.description_key is not None
+                                ui.label(
+                                    translator.text(presentation.description_key)
+                                ).classes("lte-generation-artifact-description")
+                            ui.badge(_ARTIFACT_FORMATS[token]).classes(
+                                "lte-format-badge"
                             )
-                            assert presentation.description_key is not None
-                            ui.label(
-                                translator.text(presentation.description_key)
-                            ).classes("lte-generation-artifact-description")
-                        ui.badge(_ARTIFACT_FORMATS[token]).classes(
-                            "lte-format-badge"
-                        )
-                        holder = ui.row().classes(
-                            "lte-generation-artifact-status"
-                        )
-                        artifact_status_holders[token] = holder
-                        with holder:
-                            render_status_badge(
-                                ui,
-                                translator,
-                                artifact_state_presentation("pending"),
-                                marker=f"generation-artifact-status-{token}",
+                            holder = ui.row().classes(
+                                "lte-generation-artifact-status"
                             )
+                            artifact_status_holders[token] = holder
+                            with holder:
+                                render_status_badge(
+                                    ui,
+                                    translator,
+                                    artifact_state_presentation("pending"),
+                                    marker=f"generation-artifact-status-{token}",
+                                )
         selection_guidance = ui.label(
             translator.text("generate.selection_required")
         ).classes("lte-callout lte-callout--warning").mark(
@@ -483,15 +544,7 @@ def render_generate_page(
         selection_guidance.set_visibility(False)
         warning_box = ui.column().classes("lte-generate-warnings")
         error_box = ui.column().classes("lte-generate-errors")
-        with ui.row().classes("lte-card-actions lte-generation-actions"):
-            submit = ui.button(translator.text("generate.action")).classes(
-                "lte-action lte-action--primary"
-            ).props("unelevated").mark("generation-submit")
-            if on_open_figures is not None:
-                ui.button(
-                    translator.text("action.open_figures"),
-                    on_click=on_open_figures,
-                ).props("outline").mark("generation-open-figures")
+        action_dock_holder = ui.element("div").classes("full-width")
 
     def render_phase(phase: str) -> None:
         presentation = _GENERATION_PHASES.get(
@@ -535,7 +588,8 @@ def render_generate_page(
                 token,
                 "pending" if token in selected_set else "not-requested",
             )
-        submit.set_enabled(bool(selected))
+        if submit is not None:
+            submit.set_enabled(bool(selected))
         selection_guidance.set_visibility(not selected)
         return selected
 
@@ -550,8 +604,10 @@ def render_generate_page(
         sync_ready_selection()
 
     def render_outcome_details(state: GenerationState) -> None:
+        nonlocal technical_details
         warning_box.clear()
         error_box.clear()
+        technical_details = None
         with warning_box:
             if state.warnings:
                 ui.label(translator.text("generate.warning.summary")).classes(
@@ -583,7 +639,7 @@ def render_generate_page(
                         "generation-technical-copy"
                     )
 
-                render_technical_details(
+                technical_details = render_technical_details(
                     ui,
                     translator.text("generate.technical_details"),
                     render_details,
@@ -599,21 +655,18 @@ def render_generate_page(
     sync_ready_selection()
 
     def tick() -> None:
-        nonlocal navigated
         state = controller.drain()
         render_phase(state.phase)
         for token in artifact_status_holders:
             render_artifact_status(token, state.artifact_status(token))
-        if state.phase == "running":
+        refresh_actions(state)
+        if state.phase in {"running", "cancelling"}:
             return
         timer.deactivate()
-        submit.disable()
+        if submit is not None:
+            submit.disable()
         render_outcome_details(state)
-        if state.phase == "completed":
-            if not navigated and on_complete is not None:
-                navigated = True
-                on_complete(state)
-            return
+        refresh_actions(state)
 
     def start() -> None:
         nonlocal locked_selection, selection_locked
@@ -635,16 +688,103 @@ def render_generate_page(
             return
         locked_selection = selected
         selection_locked = True
-        submit.disable()
+        if submit is not None:
+            submit.disable()
         for checkbox in checkboxes.values():
             checkbox.disable()
         render_phase("running")
         for token in artifact_status_holders:
             render_artifact_status(token, controller.state.artifact_status(token))
+        refresh_actions(controller.state)
         timer.activate()
 
-    submit.on("click", start)
+    def open_history() -> None:
+        nonlocal navigated
+        if not navigated and on_complete is not None:
+            navigated = True
+            on_complete(controller.state)
+
+    def inspect_details() -> None:
+        if technical_details is not None and hasattr(technical_details, "set_value"):
+            technical_details.set_value(True)
+
+    def request_cancel() -> None:
+        if controller.cancel():
+            state = controller.state
+            render_phase(state.phase)
+            refresh_actions(state)
+
+    def retry_generation() -> None:
+        ui.navigate.reload()
+
+    def refresh_actions(state: GenerationState) -> None:
+        nonlocal action_phase, submit
+        if action_phase == state.phase:
+            return
+        action_phase = state.phase
+        action_dock_holder.clear()
+        callbacks: dict[str, Callable[[], None]] = {
+            "generate": start,
+            "cancel": request_cancel,
+            "open_history": open_history,
+            "inspect": inspect_details,
+            "retry": retry_generation,
+        }
+        labels = {
+            "generate": translator.text("generate.action"),
+            "cancel": translator.text("generate.action.cancel"),
+            "open_history": translator.text("action.open_history"),
+            "inspect": translator.text("action.inspect"),
+            "retry": translator.text("generate.action.retry"),
+        }
+        if on_open_figures is not None:
+            callbacks["open_figures"] = on_open_figures
+            labels["open_figures"] = translator.text("action.open_figures")
+        with action_dock_holder:
+            buttons = render_sticky_action_dock(
+                ui,
+                tuple(
+                    ActionSpec(
+                        name,
+                        labels[name],
+                        callbacks[name],
+                        role=role,
+                        enabled=not (name == "cancel" and state.phase == "cancelling"),
+                        marker={
+                            "generate": "generation-submit",
+                            "cancel": "generation-cancel",
+                            "open_figures": "generation-open-figures",
+                            "open_history": "generation-open-history",
+                            "inspect": "generation-inspect",
+                            "retry": "generation-retry",
+                        }[name],
+                    )
+                    for name, role in generation_action_roles(
+                        state.phase,
+                        can_open_figures=on_open_figures is not None,
+                    )
+                ),
+                label=translator.text("generate.action_dock"),
+                marker="generation-action-dock",
+                extra_classes="lte-generate-action-dock",
+            )
+        submit = buttons.get("generate")
+        if submit is None:
+            # Retain the disabled submit control while the dock exposes the
+            # current action, so its stable marker remains available to clients.
+            with action_dock_holder:
+                submit = (
+                    ui.button(translator.text("generate.action"))
+                    .classes("lte-action lte-action--tertiary")
+                    .props("flat")
+                    .mark("generation-submit")
+                )
+                submit.disable()
+
     timer = ui.timer(0.1, tick, active=False)
+    refresh_actions(controller.state)
+    render_phase("ready")
+    sync_ready_selection()
 
     def cleanup() -> None:
         timer.deactivate()

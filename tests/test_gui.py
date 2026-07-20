@@ -6158,7 +6158,7 @@ async def test_generation_page_uses_semantic_artifact_rows_and_live_partial_stat
             marker="generation-primary-error",
             content="Some artifacts could not be generated",
         )
-        assert registry.get("semantic-run") is None
+        assert registry.get("semantic-run") is not None
         technical = next(iter(user.find(marker="generation-technical-copy").elements))
         assert "terrain.renderer_failed" in technical.content
         assert "terrain_png" in technical.content
@@ -6397,6 +6397,91 @@ def test_generation_settings_failure_is_a_warning_and_generation_is_one_shot(
         with pytest.raises(RuntimeError, match="closed"):
             controller.start(("csv",))
     finally:
+        coordinator.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("phase", "can_open_figures", "expected"),
+    [
+        ("ready", True, (("generate", "primary"),)),
+        ("running", True, (("cancel", "secondary"),)),
+        (
+            "completed",
+            True,
+            (("open_figures", "primary"), ("open_history", "secondary")),
+        ),
+        ("partial", True, (("open_history", "secondary"), ("inspect", "tertiary"))),
+        ("error", True, (("retry", "secondary"), ("inspect", "tertiary"))),
+    ],
+)
+def test_generation_workspace_action_roles_follow_the_run_state(
+    phase, can_open_figures, expected
+):
+    from lte_scenario_toolkit.gui.pages.generate import generation_action_roles
+
+    assert generation_action_roles(phase, can_open_figures=can_open_figures) == expected
+
+
+def test_generation_workspace_uses_progressive_structure_and_compact_css():
+    page = (
+        ROOT / "src/lte_scenario_toolkit/gui/pages/generate.py"
+    ).read_text(encoding="utf-8")
+    stylesheet = (ROOT / "src/lte_scenario_toolkit/gui/assets/app.css").read_text(
+        encoding="utf-8"
+    )
+    translations = (ROOT / "src/lte_scenario_toolkit/gui/i18n.py").read_text(
+        encoding="utf-8"
+    )
+
+    for class_name in (
+        "lte-generate-stepper",
+        "lte-generate-summary",
+        "lte-generation-artifact-row",
+        "lte-generate-action-dock",
+    ):
+        assert class_name in page
+        assert class_name in stylesheet
+    for key in (
+        "generate.step.inputs",
+        "generate.step.generate",
+        "generate.step.artifacts",
+        "generate.action.cancel",
+        "action.inspect",
+        "generate.action.retry",
+    ):
+        assert key in translations
+    assert "@media (max-width: 760px)" in stylesheet
+    assert "@media (max-width: 390px)" in stylesheet
+
+
+def test_generation_controller_requests_cancellation_for_its_own_active_job(tmp_path):
+    from threading import Event
+
+    from lte_scenario_toolkit.gui.pages.generate import GenerationController
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    entered = Event()
+    release = Event()
+
+    class Service:
+        def export(self, *args, **kwargs):
+            entered.set()
+            assert release.wait(2)
+            raise RuntimeError("stopped after cancellation request")
+
+    coordinator = JobCoordinator()
+    controller = GenerationController(_task15_locked_session(tmp_path, Service()), coordinator)
+    try:
+        job = controller.start(("csv",))
+        assert entered.wait(2)
+        assert controller.cancel() is True
+        assert controller.state.phase == "cancelling"
+        assert job.cancel_event.is_set()
+    finally:
+        release.set()
+        if controller.job is not None and controller.job.future is not None:
+            controller.job.future.result(timeout=2)
+        controller.close()
         coordinator.shutdown()
 
 
@@ -9721,13 +9806,11 @@ async def test_offline_candidate_to_history_flow(user, tmp_path, monkeypatch):
     await user.should_see("Generate Scenario")
 
     user.find(marker="generation-submit").click()
-    for _ in range(40):
-        if user.back_history and user.back_history[-1] == "/history":
-            break
-        await asyncio.sleep(0.05)
-    assert user.back_history[-1] == "/history"
-    await user.should_see("Run History")
-    await user.should_see("without-default", retries=15)
+    await user.should_see(marker="generation-phase", content="All artifacts generated")
+    await user.should_see(marker="generation-open-figures")
+    user.find(marker="generation-open-figures").click()
+    await user.should_see("Figure source")
+    await user.should_see("Use Current Selection")
     assert len(export_calls) == 1
     assert export_calls[0][3] == output_root
     assert export_calls[0][4] == (

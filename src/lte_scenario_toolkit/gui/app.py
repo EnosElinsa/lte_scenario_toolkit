@@ -1178,7 +1178,6 @@ def create_app(
             return
         def remember_generation_run(path: Path) -> None:
             remember_output_root(session.preflight.output_root)
-            sessions.discard(session.session_id)
 
         render_generate_page(
             ui,
