@@ -6101,6 +6101,20 @@ async def test_generation_page_uses_semantic_artifact_rows_and_live_partial_stat
 
     try:
         await user.open("/generate/semantic-run")
+        stepper = next(iter(user.find(marker="generation-workflow-stepper").elements))
+        inputs_step = next(iter(user.find(marker="generation-step-inputs").elements))
+        generate_step = next(
+            iter(user.find(marker="generation-step-generate").elements)
+        )
+        artifacts_step = next(
+            iter(user.find(marker="generation-step-artifacts").elements)
+        )
+        assert stepper.props["role"] == "list"
+        assert stepper.props["aria-label"] == "Generation progress"
+        assert inputs_step.props["role"] == "listitem"
+        assert inputs_step.props["aria-current"] == "step"
+        assert inputs_step.props["aria-label"] == "Inputs: ready"
+        assert "aria-current" not in generate_step.props
         expected = {
             "csv": ("Scenario CSV", "Station records", "CSV"),
             "preview_png": ("2D preview", "plan-view image", "PNG"),
@@ -6119,6 +6133,9 @@ async def test_generation_page_uses_semantic_artifact_rows_and_live_partial_stat
         user.find(marker="generation-submit").click()
         assert await asyncio.to_thread(entered.wait, 2)
         await user.should_see(marker="generation-phase", content="Generating artifacts")
+        assert generate_step.props["aria-current"] == "step"
+        assert generate_step.props["aria-label"] == "Generate: in progress"
+        assert "aria-current" not in inputs_step.props
         await user.should_see(
             marker="shell-job-indicator",
             content="Scenario generation",
@@ -6153,6 +6170,9 @@ async def test_generation_page_uses_semantic_artifact_rows_and_live_partial_stat
             marker="generation-artifact-status-terrain_png",
             content="Failed",
         )
+        assert artifacts_step.props["aria-current"] == "step"
+        assert artifacts_step.props["aria-label"] == "Artifacts: partial output"
+        assert "aria-current" not in generate_step.props
         assert user.back_history[-1] != "/history"
         await user.should_see(
             marker="generation-primary-error",
@@ -6420,6 +6440,49 @@ def test_generation_workspace_action_roles_follow_the_run_state(
     from lte_scenario_toolkit.gui.pages.generate import generation_action_roles
 
     assert generation_action_roles(phase, can_open_figures=can_open_figures) == expected
+
+
+@pytest.mark.parametrize(
+    ("phase", "current"),
+    [
+        ("ready", "inputs"),
+        ("running", "generate"),
+        ("cancelling", "generate"),
+        ("completed", "artifacts"),
+        ("partial", "artifacts"),
+        ("error", "artifacts"),
+    ],
+)
+def test_generation_stepper_assigns_one_current_step_for_each_run_state(
+    phase, current
+):
+    from lte_scenario_toolkit.gui.pages.generate import generation_current_step
+
+    assert generation_current_step(phase) == current
+
+
+@pytest.mark.parametrize(
+    ("language", "workflow_label", "state_label"),
+    [
+        ("en", "Generation progress", "Generate: in progress"),
+        ("zh-CN", "\u751f\u6210\u8fdb\u5ea6", "\u751f\u6210\uff1a\u6b63\u5728\u8fdb\u884c"),
+    ],
+)
+def test_generation_stepper_uses_localized_progress_and_state_labels(
+    language, workflow_label, state_label
+):
+    from lte_scenario_toolkit.gui.i18n import Translator
+
+    translator = Translator(language)
+
+    assert translator.text("generate.workflow.aria_label") == workflow_label
+    assert (
+        translator.text(
+            "generate.workflow.state.running",
+            step=translator.text("generate.step.generate"),
+        )
+        == state_label
+    )
 
 
 def test_generation_workspace_uses_progressive_structure_and_compact_css():

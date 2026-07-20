@@ -1213,10 +1213,17 @@ h3,
   text-align: center;
 }
 
-.lte-generate-step:nth-child(2) {
+.lte-generate-step--complete {
+  color: #245849;
+  background: #e4f1eb;
+}
+
+.lte-generate-step--current {
   color: #0d4c50;
   background: #dcefed;
 }
+
+.lte-generate-step--pending { color: var(--lte-ink-muted); }
 
 .lte-generate-workspace {
   display: grid;

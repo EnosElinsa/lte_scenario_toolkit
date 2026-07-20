@@ -45,6 +45,7 @@ _GENERATION_PHASES = {
     "partial": PresentationSpec("generate.phase.partial", "warning"),
     "error": PresentationSpec("generate.phase.error", "danger"),
 }
+_GENERATION_STEPS = ("inputs", "generate", "artifacts")
 
 
 def generation_action_roles(
@@ -69,6 +70,16 @@ def generation_action_roles(
     if phase == "error":
         return (("retry", "secondary"), ("inspect", "tertiary"))
     return ()
+
+
+def generation_current_step(phase: object) -> str:
+    """Return the one workflow step that represents the current run state."""
+
+    if phase == "ready":
+        return "inputs"
+    if phase in {"running", "cancelling"}:
+        return "generate"
+    return "artifacts"
 
 
 def _ordered_artifacts(values: Iterable[str]) -> tuple[str, ...]:
@@ -476,12 +487,17 @@ def render_generate_page(
             "role=heading aria-level=1"
         )
         ui.label(translator.text("generate.subtitle")).classes("lte-page-subtitle")
+        generation_steps: dict[str, Any] = {}
         with ui.element("ol").classes("lte-generate-stepper").props(
-            'aria-label="' + translator.text("generate.stepper") + '"'
-        ):
-            for key in ("inputs", "generate", "artifacts"):
-                with ui.element("li").classes("lte-generate-step"):
-                    ui.label(translator.text(f"generate.step.{key}"))
+            'role="list" '
+            f'aria-label="{translator.text("generate.workflow.aria_label")}"'
+        ).mark("generation-workflow-stepper"):
+            for key in _GENERATION_STEPS:
+                generation_steps[key] = ui.label(
+                    translator.text(f"generate.step.{key}")
+                ).classes("lte-generate-step").props('role="listitem"').mark(
+                    f"generation-step-{key}"
+                )
         with ui.element("div").classes("lte-generate-workspace"):
             with ui.card().classes("lte-generate-summary lte-generate-run-summary"):
                 ui.label(translator.text("generate.summary")).classes("lte-section-title")
@@ -561,6 +577,41 @@ def render_generate_page(
                 presentation,
                 marker="generation-phase",
             )
+        render_stepper(phase)
+
+    def render_stepper(phase: str) -> None:
+        current = generation_current_step(phase)
+        phase_key = phase if phase in _GENERATION_PHASES else "ready"
+        current_index = _GENERATION_STEPS.index(current)
+        for index, key in enumerate(_GENERATION_STEPS):
+            element = generation_steps[key]
+            visual_state = (
+                "current"
+                if key == current
+                else "complete"
+                if index < current_index
+                else "pending"
+            )
+            element.classes(
+                add=f"lte-generate-step--{visual_state}",
+                remove=(
+                    "lte-generate-step--complete lte-generate-step--current "
+                    "lte-generate-step--pending"
+                ),
+            )
+            element.props(remove="aria-current")
+            element.props(
+                add=(
+                    'aria-label="'
+                    + translator.text(
+                        f"generate.workflow.state.{phase_key}",
+                        step=translator.text(f"generate.step.{key}"),
+                    )
+                    + '"'
+                )
+            )
+            if key == current:
+                element.props(add="aria-current=step")
 
     def render_artifact_status(token: str, raw_status: str) -> None:
         holder = artifact_status_holders[token]
