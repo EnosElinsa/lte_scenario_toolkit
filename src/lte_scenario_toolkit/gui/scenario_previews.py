@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import stat
 import tempfile
 from dataclasses import dataclass
@@ -22,13 +21,45 @@ PREVIEW_SIZE = (760, 360)
 PreviewKind = Literal["terrain", "boundary", "fallback"]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class ScenarioPreviewRequest:
     scenario_id: str
     scenario_name: str
     boundary_path: Path
-    dem_path: Path | None
     allowed_root: Path
+    dem_path: Path | None = None
+
+    def __init__(
+        self,
+        scenario_id: str,
+        scenario_name: str,
+        boundary_path: Path,
+        *positional: Path,
+        allowed_root: Path | None = None,
+        dem_path: Path | None = None,
+    ) -> None:
+        """Accept both boundary-only and legacy five-positional construction."""
+
+        if len(positional) > 2:
+            raise TypeError("ScenarioPreviewRequest accepts at most five positional values")
+        if len(positional) == 1:
+            if allowed_root is None:
+                allowed_root = positional[0]
+            elif dem_path is None:
+                dem_path = positional[0]
+            else:
+                raise TypeError("dem_path was provided twice")
+        elif len(positional) == 2:
+            if allowed_root is not None or dem_path is not None:
+                raise TypeError("request paths were provided twice")
+            dem_path, allowed_root = positional
+        if allowed_root is None:
+            raise TypeError("allowed_root is required")
+        object.__setattr__(self, "scenario_id", scenario_id)
+        object.__setattr__(self, "scenario_name", scenario_name)
+        object.__setattr__(self, "boundary_path", boundary_path)
+        object.__setattr__(self, "allowed_root", allowed_root)
+        object.__setattr__(self, "dem_path", dem_path)
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,7 +139,7 @@ def _safe_input(value: str | os.PathLike[str], root: Path, label: str) -> Path:
     return lexical.resolve(strict=True)
 
 
-def _safe_cache_root(value: str | os.PathLike[str]) -> Path:
+def _safe_cache_root(value: str | os.PathLike[str], *, create: bool = False) -> Path:
     if not isinstance(value, (str, os.PathLike)):
         raise ValueError("cache_root must be a local directory")
     raw = Path(value).expanduser()
@@ -120,10 +151,19 @@ def _safe_cache_root(value: str | os.PathLike[str]) -> Path:
     for part in lexical.parts[1:]:
         current /= part
         if not os.path.lexists(current):
-            current.mkdir()
+            if create:
+                current.mkdir()
+            else:
+                break
+        if not os.path.lexists(current):
+            continue
         if _redirected(current) or not current.is_dir():
             raise ValueError(f"cache path must be a regular directory: {current}")
-    return lexical.resolve(strict=True)
+    return lexical.resolve(strict=True) if lexical.exists() else lexical
+
+
+def _ensure_cache_root(path: Path) -> Path:
+    return _safe_cache_root(path, create=True)
 
 
 def _stat_fingerprint(path: Path | None) -> dict[str, object] | None:
@@ -133,7 +173,24 @@ def _stat_fingerprint(path: Path | None) -> dict[str, object] | None:
         info = path.stat()
     except OSError:
         return {"path": str(path), "missing": True}
-    return {"path": str(path), "size": info.st_size, "mtime_ns": info.st_mtime_ns}
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+    except OSError:
+        return {
+            "path": str(path),
+            "size": info.st_size,
+            "mtime_ns": info.st_mtime_ns,
+            "digest": None,
+        }
+    return {
+        "path": str(path),
+        "size": info.st_size,
+        "mtime_ns": info.st_mtime_ns,
+        "digest": digest.hexdigest(),
+    }
 
 
 def _valid_png(path: Path) -> bool:
@@ -148,11 +205,6 @@ def _valid_png(path: Path) -> bool:
             return image.format == "PNG" and image.size == PREVIEW_SIZE
     except (OSError, ValueError):
         return False
-
-
-def _slug(value: object) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "-", str(value)).strip("-_")
-    return cleaned[:48] or "scenario"
 
 
 def _cache_key(request: ScenarioPreviewRequest, boundary: Path | None, dem: Path | None) -> str:
@@ -176,13 +228,74 @@ def _cache_key(request: ScenarioPreviewRequest, boundary: Path | None, dem: Path
         "dem": dem_identity,
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    return f"{_slug(request.scenario_id)}-{hashlib.sha256(encoded).hexdigest()}.png"
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _bounded_diagnostic(value: str | None) -> str | None:
     if value is None:
         return None
     return value if len(value) <= 240 else value[:237] + "..."
+
+
+def _safe_reason(exc: BaseException) -> str:
+    text = str(exc).lower()
+    if isinstance(exc, FileNotFoundError) or "does not exist" in text:
+        return "does not exist"
+    if "traversal" in text:
+        return "traversal rejected"
+    if "escapes" in text or "outside" in text:
+        return "escapes allowed root"
+    if "redirected" in text or "symlink" in text or "junction" in text:
+        return "uses a redirected path"
+    return "is invalid"
+
+
+def _boundary_diagnostic(exc: BaseException) -> str:
+    return f"Boundary preview unavailable: boundary {_safe_reason(exc)}."
+
+
+def _dem_diagnostic(exc: BaseException) -> str:
+    return f"DEM preview unavailable; showing boundary only: DEM {_safe_reason(exc)}."
+
+
+def _metadata_path(destination: Path) -> Path:
+    return destination.with_suffix(".json")
+
+
+def _atomic_json(payload: dict[str, object], destination: Path) -> None:
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            dir=destination.parent,
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _load_metadata(destination: Path) -> tuple[PreviewKind, str | None] | None:
+    try:
+        payload = json.loads(_metadata_path(destination).read_text(encoding="utf-8"))
+        kind = payload["kind"]
+        diagnostic = payload.get("diagnostic")
+        if kind not in {"terrain", "boundary", "fallback"}:
+            return None
+        if diagnostic is not None and not isinstance(diagnostic, str):
+            return None
+        return kind, diagnostic
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError):
+        return None
 
 
 def _atomic_save(image: Image.Image, destination: Path) -> None:
@@ -270,35 +383,68 @@ class ScenarioPreviewService:
         diagnostic: str | None = None
         boundary: Path | None = None
         dem: Path | None = None
+        root: Path | None = None
+        root_error = False
         try:
             if not isinstance(request.scenario_id, str) or not request.scenario_id.strip():
                 raise ValueError("scenario_id must be non-empty text")
             if not isinstance(request.scenario_name, str) or not request.scenario_name.strip():
                 raise ValueError("scenario_name must be non-empty text")
-            root = _root(request.allowed_root)
-            boundary = _safe_input(request.boundary_path, root, "boundary")
         except Exception as exc:
-            diagnostic = f"Boundary preview unavailable: {exc}"
-        if boundary is not None and request.dem_path is not None:
+            diagnostic = _boundary_diagnostic(exc)
+        try:
+            root = _root(request.allowed_root)
+        except Exception as exc:
+            diagnostic = _boundary_diagnostic(exc)
+            root_error = True
+            root = None
+        if root is not None:
+            try:
+                boundary = _safe_input(request.boundary_path, root, "boundary")
+            except Exception as exc:
+                diagnostic = _boundary_diagnostic(exc)
+        if boundary is not None and request.dem_path is not None and root is not None:
             try:
                 dem = _safe_input(request.dem_path, root, "DEM")
             except Exception as exc:
-                diagnostic = f"DEM preview unavailable; showing boundary only: {exc}"
+                diagnostic = _dem_diagnostic(exc)
+
+        if root_error:
+            raise ValueError("allowed_root is invalid")
+        if root is not None:
+            expected_cache = root / ".lte-data" / "cache" / "scenario-previews"
+            if self.cache_root != expected_cache:
+                safe_cache = _ensure_cache_root(expected_cache)
+                base = _cache_key(request, boundary, dem)
+                destination = safe_cache / f"{base}-fallback.png"
+                diagnostic = "Preview cache root is outside allowed root; using safe fallback."
+                image = Image.new("RGB", PREVIEW_SIZE, (238, 240, 242))
+                _grid(ImageDraw.Draw(image))
+                _atomic_save(image, destination)
+                _atomic_json(
+                    {"kind": "fallback", "diagnostic": diagnostic},
+                    _metadata_path(destination),
+                )
+                return ScenarioPreviewResult("fallback", destination, False, diagnostic)
+            self.cache_root = _ensure_cache_root(self.cache_root)
 
         filename = _cache_key(request, boundary, dem)
-        destination = self.cache_root / filename
-        if os.path.lexists(destination) and _redirected(destination):
-            fallback_name = hashlib.sha256(f"redirected:{filename}".encode()).hexdigest()
-            destination = self.cache_root / f"{_slug(request.scenario_id)}-{fallback_name}.png"
-            diagnostic = "Preview cache entry was redirected; using a safe fallback path."
-            kind: PreviewKind = "fallback"
-        else:
-            kind = "fallback"
+        candidates = {
+            candidate_kind: self.cache_root / f"{filename}-{candidate_kind}.png"
+            for candidate_kind in ("terrain", "boundary", "fallback")
+        }
         diagnostic = _bounded_diagnostic(diagnostic)
-        if _valid_png(destination):
-            cached_kind: PreviewKind = "fallback" if boundary is None else "boundary"
-            return ScenarioPreviewResult(cached_kind, destination, True, diagnostic)
+        for cached_kind, candidate in candidates.items():
+            metadata = _load_metadata(candidate) if _valid_png(candidate) else None
+            if metadata is not None and metadata[0] == cached_kind:
+                return ScenarioPreviewResult(
+                    cached_kind,
+                    candidate,
+                    True,
+                    metadata[1],
+                )
 
+        kind: PreviewKind = "fallback"
         if boundary is not None:
             try:
                 frame = gpd.read_file(boundary)
@@ -350,7 +496,7 @@ class ScenarioPreviewService:
                         _grid(ImageDraw.Draw(image))
                         kind = "terrain"
                     except Exception as exc:
-                        diagnostic = f"DEM preview unavailable; showing boundary only: {exc}"
+                        diagnostic = _dem_diagnostic(exc)
                 draw = ImageDraw.Draw(image)
                 for ring, exterior in _rings(geometry):
                     draw.line(
@@ -360,7 +506,7 @@ class ScenarioPreviewService:
                         joint="curve",
                     )
             except Exception as exc:
-                diagnostic = f"Boundary preview unavailable: {exc}"
+                diagnostic = _boundary_diagnostic(exc)
                 image = Image.new("RGB", PREVIEW_SIZE, (238, 240, 242))
                 draw = ImageDraw.Draw(image)
                 _grid(draw)
@@ -369,15 +515,27 @@ class ScenarioPreviewService:
             draw = ImageDraw.Draw(image)
             _grid(draw)
 
+        diagnostic = _bounded_diagnostic(diagnostic)
+        destination = candidates[kind]
+        if os.path.lexists(destination) and _redirected(destination):
+            diagnostic = "Preview cache entry uses a redirected path; using safe fallback."
+            kind = "fallback"
+            destination = self.cache_root / f"{filename}-fallback-safe.png"
+            if os.path.lexists(destination) and _redirected(destination):
+                raise ValueError("preview cache entry is redirected")
         try:
             _atomic_save(image, destination)
-        except Exception as exc:
+        except Exception:
             if diagnostic is None:
-                diagnostic = f"Preview cache write failed: {exc}"
+                diagnostic = "Preview cache write failed: cache write failed."
             # Return a stable path even when a write is interrupted; callers can
             # still display a neutral image when an earlier cache exists.
             if not _valid_png(destination):
                 raise
+        _atomic_json(
+            {"kind": kind, "diagnostic": _bounded_diagnostic(diagnostic)},
+            _metadata_path(destination),
+        )
         return ScenarioPreviewResult(kind, destination, False, _bounded_diagnostic(diagnostic))
 
 
@@ -392,17 +550,24 @@ def build_scenario_previews(
     for request in requests:
         try:
             results.append(service.build(request))
-        except Exception as exc:
+        except Exception:
             fallback = Image.new("RGB", PREVIEW_SIZE, (238, 240, 242))
-            digest = hashlib.sha256(repr(request).encode()).hexdigest()
-            destination = service.cache_root / f"fallback-{digest}.png"
+            destination = Path()
             try:
+                root = _root(request.allowed_root)
+                destination_root = _ensure_cache_root(
+                    root / ".lte-data" / "cache" / "scenario-previews"
+                )
+                digest = hashlib.sha256(repr(request).encode()).hexdigest()
+                destination = destination_root / f"{digest}-fallback.png"
                 _atomic_save(fallback, destination)
+                _atomic_json(
+                    {"kind": "fallback", "diagnostic": "preview failed."},
+                    _metadata_path(destination),
+                )
             except Exception:
-                destination = service.cache_root / "fallback-unavailable.png"
-            results.append(
-                ScenarioPreviewResult("fallback", destination, False, _bounded_diagnostic(str(exc)))
-            )
+                pass
+            results.append(ScenarioPreviewResult("fallback", destination, False, "Preview failed."))
     return results
 
 

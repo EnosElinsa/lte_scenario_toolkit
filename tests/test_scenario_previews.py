@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import pickle
 from pathlib import Path
 
@@ -71,6 +72,37 @@ def test_boundary_only_preview_is_a_fixed_valid_png(tmp_path):
         assert image.size == PREVIEW_SIZE == (760, 360)
 
 
+def test_boundary_only_request_can_omit_dem_positionally(tmp_path):
+    boundary = _write_boundary(tmp_path / "boundary.geojson")
+    request = ScenarioPreviewRequest("scenario", "Scenario", boundary, tmp_path)
+
+    assert request.dem_path is None
+    result = ScenarioPreviewService(tmp_path / ".lte-data" / "cache" / "scenario-previews").build(
+        request
+    )
+    assert result.kind == "boundary"
+
+
+def test_request_preserves_legacy_five_positional_order(tmp_path):
+    boundary = _write_boundary(tmp_path / "boundary.geojson")
+    dem = _write_dem(tmp_path / "terrain.tif")
+
+    request = ScenarioPreviewRequest("scenario", "Scenario", boundary, dem, tmp_path)
+
+    assert request.dem_path == dem
+    assert request.allowed_root == tmp_path
+
+
+def test_request_accepts_dem_positional_with_keyword_root(tmp_path):
+    boundary = _write_boundary(tmp_path / "boundary.geojson")
+    dem = _write_dem(tmp_path / "terrain.tif")
+
+    request = ScenarioPreviewRequest("scenario", "Scenario", boundary, dem, allowed_root=tmp_path)
+
+    assert request.dem_path == dem
+    assert request.allowed_root == tmp_path
+
+
 def test_dem_and_boundary_preview_renders_muted_terrain(tmp_path):
     boundary = _write_boundary(tmp_path / "boundary.geojson")
     dem = _write_dem(tmp_path / "terrain.tif")
@@ -86,6 +118,19 @@ def test_dem_and_boundary_preview_renders_muted_terrain(tmp_path):
     with Image.open(result.path) as image:
         assert image.size == PREVIEW_SIZE
         assert len(image.convert("RGB").getcolors(maxcolors=PREVIEW_SIZE[0] * PREVIEW_SIZE[1])) > 20
+
+
+def test_terrain_cache_hit_preserves_terrain_kind(tmp_path):
+    boundary = _write_boundary(tmp_path / "boundary.geojson")
+    dem = _write_dem(tmp_path / "terrain.tif")
+    cache_root = tmp_path / ".lte-data" / "cache" / "scenario-previews"
+    service = ScenarioPreviewService(cache_root)
+
+    first = service.build(_request(tmp_path, boundary_path=boundary, dem_path=dem))
+    second = service.build(_request(tmp_path, boundary_path=boundary, dem_path=dem))
+
+    assert first.kind == second.kind == "terrain"
+    assert second.cache_hit is True
 
 
 def test_invalid_dem_degrades_to_boundary_only(tmp_path):
@@ -140,6 +185,7 @@ def test_missing_boundary_degrades_to_stable_fallback(tmp_path):
     assert first.path == second.path
     assert first.diagnostic and "does not exist" in first.diagnostic
     assert second.cache_hit is True
+    assert second.diagnostic == first.diagnostic
     with Image.open(first.path) as image:
         assert image.size == PREVIEW_SIZE
 
@@ -175,6 +221,21 @@ def test_outside_and_traversal_inputs_degrade_without_exposing_source(tmp_path):
     assert outside_result.path.suffix == ".png"
 
 
+def test_cache_root_outside_allowed_root_writes_nowhere_outside(tmp_path):
+    boundary = _write_boundary(tmp_path / "boundary.geojson")
+    outside_cache = tmp_path.parent / "secret-preview-cache"
+    outside_cache.mkdir()
+    marker = outside_cache / "marker.txt"
+    marker.write_text("keep", encoding="utf-8")
+
+    result = ScenarioPreviewService(outside_cache).build(_request(tmp_path, boundary_path=boundary))
+
+    assert result.kind == "fallback"
+    assert result.path.is_relative_to(tmp_path / ".lte-data" / "cache" / "scenario-previews")
+    assert marker.read_text(encoding="utf-8") == "keep"
+    assert list(outside_cache.glob("*.png")) == []
+
+
 def test_symlink_boundary_degrades_when_platform_allows_links(tmp_path):
     target = _write_boundary(tmp_path / "real.geojson")
     link = tmp_path / "linked.geojson"
@@ -190,6 +251,34 @@ def test_symlink_boundary_degrades_when_platform_allows_links(tmp_path):
 
     assert result.kind == "fallback"
     assert "redirected" in result.diagnostic or "symlink" in result.diagnostic
+
+
+def test_diagnostics_and_cache_filename_redact_sensitive_paths(tmp_path):
+    secret = tmp_path / "SECRET_DO_NOT_LEAK"
+    boundary = secret / "boundary.geojson"
+    cache_root = tmp_path / ".lte-data" / "cache" / "scenario-previews"
+    result = ScenarioPreviewService(cache_root).build(_request(tmp_path, boundary_path=boundary))
+
+    assert "SECRET_DO_NOT_LEAK" not in (result.diagnostic or "")
+    assert "SECRET_DO_NOT_LEAK" not in result.path.name
+
+
+def test_content_change_invalidates_key_even_when_metadata_is_restored(tmp_path):
+    boundary = _write_boundary(tmp_path / "boundary.geojson")
+    cache_root = tmp_path / ".lte-data" / "cache" / "scenario-previews"
+    service = ScenarioPreviewService(cache_root)
+    first = service.build(_request(tmp_path, boundary_path=boundary))
+    original_stat = boundary.stat()
+    raw = boundary.read_bytes()
+    replacement = raw.replace(b'"test"', b'"demo"')
+    assert len(replacement) == len(raw)
+    boundary.write_bytes(replacement)
+    os.utime(boundary, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    second = service.build(_request(tmp_path, boundary_path=boundary))
+
+    assert second.cache_hit is False
+    assert second.path != first.path
 
 
 def test_boundary_change_invalidates_preview_key(tmp_path):
