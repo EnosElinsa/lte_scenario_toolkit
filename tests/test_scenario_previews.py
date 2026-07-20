@@ -11,6 +11,7 @@ from PIL import Image
 from rasterio.transform import from_origin
 from shapely.geometry import box
 
+import lte_scenario_toolkit.gui.scenario_previews as preview_module
 from lte_scenario_toolkit.gui.scenario_previews import (
     PREVIEW_SIZE,
     ScenarioPreviewRequest,
@@ -236,6 +237,23 @@ def test_cache_root_outside_allowed_root_writes_nowhere_outside(tmp_path):
     assert list(outside_cache.glob("*.png")) == []
 
 
+def test_outside_cache_fallback_is_not_reused_by_internal_cache(tmp_path):
+    boundary = _write_boundary(tmp_path / "boundary.geojson")
+    outside_cache = tmp_path.parent / "outside-cache-provenance"
+    outside_cache.mkdir()
+    outside_result = ScenarioPreviewService(outside_cache).build(
+        _request(tmp_path, boundary_path=boundary)
+    )
+    assert outside_result.kind == "fallback"
+
+    internal = ScenarioPreviewService(tmp_path / ".lte-data" / "cache" / "scenario-previews").build(
+        _request(tmp_path, boundary_path=boundary)
+    )
+
+    assert internal.kind == "boundary"
+    assert internal.cache_hit is False
+
+
 def test_symlink_boundary_degrades_when_platform_allows_links(tmp_path):
     target = _write_boundary(tmp_path / "real.geojson")
     link = tmp_path / "linked.geojson"
@@ -279,6 +297,65 @@ def test_content_change_invalidates_key_even_when_metadata_is_restored(tmp_path)
 
     assert second.cache_hit is False
     assert second.path != first.path
+
+
+def test_shapefile_sidecar_change_invalidates_preview_key(tmp_path):
+    boundary = tmp_path / "boundary.shp"
+    gpd.GeoDataFrame(
+        {"name": ["test"]},
+        geometry=[box(0, 0, 100, 50)],
+        crs="EPSG:3857",
+    ).to_file(boundary)
+    cache_root = tmp_path / ".lte-data" / "cache" / "scenario-previews"
+    service = ScenarioPreviewService(cache_root)
+    first = service.build(_request(tmp_path, boundary_path=boundary))
+    sidecar = boundary.with_suffix(".dbf")
+    original_stat = sidecar.stat()
+    sidecar.write_bytes(sidecar.read_bytes() + b" ")
+    os.utime(sidecar, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    second = service.build(_request(tmp_path, boundary_path=boundary))
+
+    assert second.cache_hit is False
+    assert second.path != first.path
+
+
+def test_read_time_revalidation_failure_degrades_without_opening_source(tmp_path, monkeypatch):
+    boundary = _write_boundary(tmp_path / "boundary.geojson")
+    cache_root = tmp_path / ".lte-data" / "cache" / "scenario-previews"
+
+    def reject_recheck(path, root, label):
+        raise ValueError("simulated source swap")
+
+    monkeypatch.setattr(preview_module, "_revalidate_input", reject_recheck)
+    result = ScenarioPreviewService(cache_root).build(_request(tmp_path, boundary_path=boundary))
+
+    assert result.kind == "fallback"
+    assert result.path.is_file()
+    assert "simulated" not in (result.diagnostic or "")
+
+
+def test_temporary_fallback_does_not_follow_existing_symlink(tmp_path, monkeypatch):
+    monkeypatch.setattr(preview_module.tempfile, "gettempdir", lambda: str(tmp_path))
+    fallback_root = tmp_path / "lte-scenario-toolkit-previews"
+    fallback_root.mkdir()
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"keep")
+    symlink = fallback_root / "secret-fallback.png"
+    try:
+        symlink.symlink_to(outside)
+    except (OSError, NotImplementedError) as exc:
+        import pytest
+
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    result = preview_module._temporary_fallback("secret", preview_module._fallback_image())
+
+    assert result.is_file()
+    assert not result.is_symlink()
+    assert outside.read_bytes() == b"keep"
+    with Image.open(result) as image:
+        assert image.size == PREVIEW_SIZE
 
 
 def test_boundary_change_invalidates_preview_key(tmp_path):

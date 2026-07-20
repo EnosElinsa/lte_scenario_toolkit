@@ -139,6 +139,12 @@ def _safe_input(value: str | os.PathLike[str], root: Path, label: str) -> Path:
     return lexical.resolve(strict=True)
 
 
+def _revalidate_input(path: Path, root: Path, label: str) -> Path:
+    """Recheck a source immediately before handing it to a file reader."""
+
+    return _safe_input(path, root, label)
+
+
 def _safe_cache_root(value: str | os.PathLike[str], *, create: bool = False) -> Path:
     if not isinstance(value, (str, os.PathLike)):
         raise ValueError("cache_root must be a local directory")
@@ -185,12 +191,21 @@ def _stat_fingerprint(path: Path | None) -> dict[str, object] | None:
             "mtime_ns": info.st_mtime_ns,
             "digest": None,
         }
-    return {
+    fingerprint: dict[str, object] = {
         "path": str(path),
         "size": info.st_size,
         "mtime_ns": info.st_mtime_ns,
         "digest": digest.hexdigest(),
     }
+    if path.suffix.lower() == ".shp":
+        sidecars: dict[str, object] = {}
+        for suffix in (".shp", ".shx", ".dbf", ".prj", ".cpg"):
+            sidecar = path.with_suffix(suffix)
+            if sidecar == path or not os.path.lexists(sidecar):
+                continue
+            sidecars[suffix] = _stat_fingerprint(sidecar)
+        fingerprint["sidecars"] = sidecars
+    return fingerprint
 
 
 def _valid_png(path: Path) -> bool:
@@ -262,6 +277,41 @@ def _metadata_path(destination: Path) -> Path:
     return destination.with_suffix(".json")
 
 
+def _safe_metadata_diagnostic(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return "Cached preview diagnostic unavailable."
+    safe_diagnostics = {
+        "DEM unavailable; showing boundary only.",
+        "Preview cache root is outside allowed root; using safe fallback.",
+        "Preview cache entry uses a redirected path; using safe fallback.",
+        "Preview cache write failed: cache write failed.",
+        "Allowed root is invalid; using validated fallback cache.",
+        "Preview cache is unavailable; using temporary fallback.",
+        "Scenario identity is invalid; using temporary fallback.",
+        "Preview failed.",
+    }
+    reasoned = {
+        "does not exist",
+        "traversal rejected",
+        "escapes allowed root",
+        "uses a redirected path",
+        "is invalid",
+    }
+    valid_reasoned = any(
+        value == f"{prefix}{reason}."
+        for prefix in (
+            "Boundary preview unavailable: boundary ",
+            "DEM preview unavailable; showing boundary only: DEM ",
+        )
+        for reason in reasoned
+    )
+    if value in safe_diagnostics or valid_reasoned:
+        return _bounded_diagnostic(value)
+    return "Cached preview diagnostic unavailable."
+
+
 def _atomic_json(payload: dict[str, object], destination: Path) -> None:
     if os.path.lexists(destination) and _redirected(destination):
         if destination.is_symlink():
@@ -279,7 +329,10 @@ def _atomic_json(payload: dict[str, object], destination: Path) -> None:
             delete=False,
         ) as stream:
             temporary = Path(stream.name)
-            json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+            safe_payload = dict(payload)
+            if "diagnostic" in safe_payload:
+                safe_payload["diagnostic"] = _safe_metadata_diagnostic(safe_payload["diagnostic"])
+            json.dump(safe_payload, stream, sort_keys=True, separators=(",", ":"))
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, destination)
@@ -289,7 +342,7 @@ def _atomic_json(payload: dict[str, object], destination: Path) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def _load_metadata(destination: Path) -> tuple[PreviewKind, str | None] | None:
+def _load_metadata(destination: Path) -> tuple[PreviewKind, str | None, str | None] | None:
     metadata_path = _metadata_path(destination)
     if not os.path.lexists(metadata_path) or _redirected(metadata_path):
         return None
@@ -297,39 +350,12 @@ def _load_metadata(destination: Path) -> tuple[PreviewKind, str | None] | None:
         payload = json.loads(metadata_path.read_text(encoding="utf-8"))
         kind = payload["kind"]
         diagnostic = payload.get("diagnostic")
+        cache_policy = payload.get("cache_policy")
         if kind not in {"terrain", "boundary", "fallback"}:
             return None
-        if diagnostic is not None and not isinstance(diagnostic, str):
+        if cache_policy not in {None, "normal", "fallback-only"}:
             return None
-        if diagnostic is not None:
-            safe_diagnostics = {
-                "DEM unavailable; showing boundary only.",
-                "Preview cache root is outside allowed root; using safe fallback.",
-                "Preview cache entry uses a redirected path; using safe fallback.",
-                "Preview cache write failed: cache write failed.",
-                "Allowed root is invalid; using validated fallback cache.",
-                "Preview cache is unavailable; using temporary fallback.",
-                "Scenario identity is invalid; using temporary fallback.",
-                "Preview failed.",
-            }
-            reasoned = {
-                "does not exist",
-                "traversal rejected",
-                "escapes allowed root",
-                "uses a redirected path",
-                "is invalid",
-            }
-            valid_reasoned = any(
-                diagnostic == f"{prefix}{reason}."
-                for prefix in (
-                    "Boundary preview unavailable: boundary ",
-                    "DEM preview unavailable; showing boundary only: DEM ",
-                )
-                for reason in reasoned
-            )
-            if diagnostic not in safe_diagnostics and not valid_reasoned:
-                diagnostic = "Cached preview diagnostic unavailable."
-        return kind, _bounded_diagnostic(diagnostic)
+        return kind, _safe_metadata_diagnostic(diagnostic), cache_policy
     except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError):
         return None
 
@@ -347,10 +373,25 @@ def _temporary_fallback(base: str, image: Image.Image) -> Path:
     except Exception:
         root = Path(tempfile.gettempdir()).resolve()
     destination = root / f"{base}-fallback.png"
+    if os.path.lexists(destination) and _redirected(destination):
+        if destination.is_symlink():
+            destination.unlink()
+        else:
+            descriptor, unique_name = tempfile.mkstemp(prefix=f"{base}-", suffix=".png", dir=root)
+            os.close(descriptor)
+            destination = Path(unique_name)
     try:
         _atomic_save(image, destination)
     except Exception:
-        image.save(destination, format="PNG")
+        descriptor, unique_name = tempfile.mkstemp(prefix=f"{base}-", suffix=".png", dir=root)
+        destination = Path(unique_name)
+        with os.fdopen(descriptor, "wb") as stream:
+            image.save(stream, format="PNG")
+            stream.flush()
+            os.fsync(stream.fileno())
+        if not _valid_png(destination):
+            destination.unlink(missing_ok=True)
+            raise ValueError("temporary fallback PNG is invalid") from None
     return destination
 
 
@@ -489,7 +530,11 @@ class ScenarioPreviewService:
                 image = _fallback_image()
                 _atomic_save(image, destination)
                 _atomic_json(
-                    {"kind": "fallback", "diagnostic": diagnostic},
+                    {
+                        "kind": "fallback",
+                        "diagnostic": diagnostic,
+                        "cache_policy": "fallback-only",
+                    },
                     _metadata_path(destination),
                 )
                 return ScenarioPreviewResult("fallback", destination, False, diagnostic)
@@ -531,7 +576,11 @@ class ScenarioPreviewService:
         diagnostic = _bounded_diagnostic(diagnostic)
         for cached_kind, candidate in candidates.items():
             metadata = _load_metadata(candidate) if _valid_png(candidate) else None
-            if metadata is not None and metadata[0] == cached_kind:
+            if (
+                metadata is not None
+                and metadata[0] == cached_kind
+                and metadata[2] != "fallback-only"
+            ):
                 return ScenarioPreviewResult(
                     cached_kind,
                     candidate,
@@ -542,6 +591,7 @@ class ScenarioPreviewService:
         kind: PreviewKind = "fallback"
         if boundary is not None and identity_valid:
             try:
+                boundary = _revalidate_input(boundary, root, "boundary")
                 frame = gpd.read_file(boundary)
                 if frame.empty or frame.crs is None:
                     raise ValueError("boundary has no usable geometry or CRS")
@@ -561,6 +611,7 @@ class ScenarioPreviewService:
                         diagnostic = "DEM unavailable; showing boundary only."
                 else:
                     try:
+                        dem = _revalidate_input(dem, root, "DEM")
                         fingerprint = json.dumps(_stat_fingerprint(dem), sort_keys=True)
                         overlay = MapAssetService(root).dem_overlay(
                             dem,
@@ -570,7 +621,8 @@ class ScenarioPreviewService:
                             style=MapStyle.COMBINED,
                             max_dimension=PREVIEW_SIZE[0],
                         )
-                        with Image.open(overlay.path) as source:
+                        overlay_path = _revalidate_input(overlay.path, root, "rendered map overlay")
+                        with Image.open(overlay_path) as source:
                             terrain = source.convert("RGB").resize(
                                 PREVIEW_SIZE, Image.Resampling.BILINEAR
                             )
@@ -628,7 +680,11 @@ class ScenarioPreviewService:
             if not _valid_png(destination):
                 raise
         _atomic_json(
-            {"kind": kind, "diagnostic": _bounded_diagnostic(diagnostic)},
+            {
+                "kind": kind,
+                "diagnostic": _bounded_diagnostic(diagnostic),
+                "cache_policy": "normal",
+            },
             _metadata_path(destination),
         )
         return ScenarioPreviewResult(kind, destination, False, _bounded_diagnostic(diagnostic))
@@ -657,7 +713,11 @@ def build_scenario_previews(
                 destination = destination_root / f"{digest}-fallback.png"
                 _atomic_save(fallback, destination)
                 _atomic_json(
-                    {"kind": "fallback", "diagnostic": "preview failed."},
+                    {
+                        "kind": "fallback",
+                        "diagnostic": "preview failed.",
+                        "cache_policy": "fallback-only",
+                    },
                     _metadata_path(destination),
                 )
             except Exception:
