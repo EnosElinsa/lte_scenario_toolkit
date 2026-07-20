@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
@@ -467,6 +468,7 @@ class FigureController:
         self._state = replace(initial_state, spec=initial_spec)
         self._job: Job | None = None
         self._closed = False
+        self._close_requested = False
         if source is not None:
             self.set_source(
                 source,
@@ -713,8 +715,24 @@ class FigureController:
         with self._lock:
             self._job = job
         assert job.future is not None
-        job.future.add_done_callback(lambda _future: self.coordinator.finish(job.job_id))
+
+        def finish_background_job(_future: Any) -> None:
+            self.coordinator.finish(job.job_id)
+            self._finalize_deferred_close()
+
+        job.future.add_done_callback(finish_background_job)
         return job
+
+    def _finalize_deferred_close(self) -> None:
+        """Release page-owned leases only after background work is finished."""
+
+        with self._lock:
+            if not self._close_requested or self._job_unfinished_locked():
+                return
+            self._closed = True
+            self._close_requested = False
+            self._replace_usage_lease(())
+            self._job = None
 
     def _reserve(self, kind: str) -> Job:
         with self._lock:
@@ -919,7 +937,9 @@ class FigureController:
             raise ValueError("job must be a reserved CPU figure export")
         if result.kind != "export":
             raise ValueError("CPU figure export returned the wrong result kind")
-        return self._apply_result(job, result)
+        state = self._apply_result(job, result)
+        self._finalize_deferred_close()
+        return state
 
     def abandon_cpu_export(self, job: Job) -> FigurePageState:
         with self._lock:
@@ -936,6 +956,7 @@ class FigureController:
             self._state = replace(state, phase=phase)
             updated = self._state
         self.coordinator.finish(job.job_id)
+        self._finalize_deferred_close()
         return updated
 
     def _apply_result(
@@ -1072,17 +1093,14 @@ class FigureController:
 
     def close(self) -> None:
         with self._lock:
+            if self._closed:
+                return
+            if self._job_unfinished_locked():
+                self._close_requested = True
+                return
             self._closed = True
             self._replace_usage_lease(())
-            reserved = (
-                self._job
-                if self._job is not None and self._job.future is None
-                else None
-            )
-            if reserved is not None:
-                self._job = None
-        if reserved is not None:
-            self.coordinator.finish(reserved.job_id)
+            self._job = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1722,7 +1740,13 @@ def render_figures_page(
 
         try:
             result = await run.cpu_bound(_render_figure_export, request)
-        except Exception as exc:
+        except BaseException as exc:
+            # Cancellation can arrive as ``BaseException``. Release the
+            # reserved coordinator slot and source lease before propagating it
+            # so a deleted page cannot strand the application's one-job gate.
+            controller.abandon_cpu_export(job)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
             result = _FigureJobResult(
                 "export",
                 request.revision,

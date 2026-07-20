@@ -1242,21 +1242,30 @@ def _format_bytes(value: int) -> str:
     return f"{size} B"
 
 
-def _invoke_opaque(callback: Callable[..., Any], value: object) -> Any:
-    """Call a UI callback with its opaque model, supporting legacy no-arg fakes."""
+def _invoke_opaque(callback: Callable[..., Any], *values: object) -> Any:
+    """Call a UI callback with opaque values while supporting old callbacks."""
+
+    if not values:
+        return callback()
 
     try:
         parameters = inspect.signature(callback)
     except (TypeError, ValueError):
         # Some extension/builtin callables have no inspectable signature. Call
         # them exactly once; a callback-body TypeError must never be retried.
-        return callback(value)
+        return callback(*values)
     try:
-        parameters.bind(value)
+        parameters.bind(*values)
     except TypeError:
-        parameters.bind()
-        return callback()
-    return callback(value)
+        # Existing hosts may still provide a one-argument callback. Preserve
+        # that contract by passing the first opaque value only.
+        try:
+            parameters.bind(values[0])
+        except TypeError:
+            parameters.bind()
+            return callback()
+        return callback(values[0])
+    return callback(*values)
 
 
 def render_move_to_trash_dialog(
@@ -1432,7 +1441,7 @@ def render_permanent_delete_dialog(
                 "Type the first eight characters of the transaction ID to continue.",
             )
         ).classes("lte-page-subtitle")
-        ui.input(
+        confirmation_input = ui.input(
             _translated(
                 translator,
                 "history.trash_permanent_confirmation",
@@ -1453,7 +1462,11 @@ def render_permanent_delete_dialog(
                     "history.trash_permanent_confirm",
                     "Delete permanently",
                 ),
-                on_click=lambda: _invoke_opaque(on_confirm, card.transaction_id),
+                on_click=lambda: _invoke_opaque(
+                    on_confirm,
+                    card.transaction_id,
+                    getattr(confirmation_input, "value", None),
+                ),
             ).props("unelevated color=negative").mark(
                 "history-trash-permanent-confirm"
             )
@@ -1508,7 +1521,7 @@ def render_trash_card(
     card: TrashCard,
     *,
     on_restore: Callable[[str], Any] | None = None,
-    on_purge: Callable[[str], Any] | None = None,
+    on_purge: Callable[..., Any] | None = None,
     on_recover: Callable[[str], Any] | None = None,
 ) -> Any:
     """Render one whole-family transaction card with state-gated actions."""
@@ -1703,6 +1716,24 @@ def render_trash_frame(
         )
 
 
+def render_trash_loading(
+    ui: Any,
+    translator: Any,
+    *,
+    on_back: Callable[[], Any] | None = None,
+) -> Any:
+    """Render the Trash shell immediately while its snapshot is rebuilt."""
+
+    holder = render_trash_frame(ui, translator, 0, on_back=on_back)
+    with holder:
+        render_loading_state(
+            ui,
+            _translated(translator, "history.loading", "Loading Trash"),
+            marker="trash-loading",
+        )
+    return holder
+
+
 def render_trash_content(
     ui: Any,
     translator: Any,
@@ -1710,7 +1741,7 @@ def render_trash_content(
     snapshot: TrashSnapshot,
     *,
     on_restore: Callable[[str], Any] | None = None,
-    on_purge: Callable[[str], Any] | None = None,
+    on_purge: Callable[..., Any] | None = None,
     on_recover: Callable[[str], Any] | None = None,
 ) -> None:
     """Render authoritative transaction cards and collapsed diagnostics."""
@@ -1765,7 +1796,7 @@ def render_trash_page(
     *,
     on_back: Callable[[], Any] | None = None,
     on_restore: Callable[[str], Any] | None = None,
-    on_purge: Callable[[str], Any] | None = None,
+    on_purge: Callable[..., Any] | None = None,
     on_recover: Callable[[str], Any] | None = None,
 ) -> TrashSnapshot:
     """Render one complete Trash snapshot; route orchestration remains external."""
@@ -2429,6 +2460,7 @@ __all__ = [
     "render_trash_card",
     "render_trash_content",
     "render_trash_frame",
+    "render_trash_loading",
     "render_trash_page",
     "resolve_history_action",
     "resolve_history_reference",

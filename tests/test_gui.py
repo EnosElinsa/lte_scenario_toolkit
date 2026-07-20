@@ -5966,6 +5966,244 @@ async def test_history_exposes_confirmed_unpublished_selection_with_safe_actions
     assert continued == ["new-york-pending"]
 
 
+@pytest.mark.asyncio
+async def test_run_trash_mutation_finishes_and_skips_deleted_client_render():
+    """A completed Trash worker must not send a result to a gone client."""
+
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    class DeletedClient:
+        is_deleted = True
+
+    async def fake_io_bound(worker, *args, **kwargs):
+        return worker(*args, **kwargs)
+
+    coordinator = JobCoordinator()
+    rendered: list[object] = []
+    try:
+        await app_module.run_trash_mutation(
+            client=DeletedClient(),
+            coordinator=coordinator,
+            kind="history.trash_restore",
+            worker=lambda: object(),
+            on_success=lambda value: rendered.append(value),
+            io_bound=fake_io_bound,
+        )
+        assert rendered == []
+        assert coordinator.snapshot().active is False
+    finally:
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_finishes_on_error_and_blocks_second_job():
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobBusyError, JobCoordinator
+
+    class LiveClient:
+        is_deleted = False
+
+    gate = Event()
+    entered = Event()
+
+    async def fake_io_bound(worker, *args, **kwargs):
+        entered.set()
+        await asyncio.to_thread(gate.wait, 2)
+        return worker(*args, **kwargs)
+
+    coordinator = JobCoordinator()
+    errors: list[type[BaseException]] = []
+    try:
+        pending = asyncio.create_task(
+            app_module.run_trash_mutation(
+                client=LiveClient(),
+                coordinator=coordinator,
+                kind="history.trash_purge",
+                worker=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+                on_error=lambda error: errors.append(type(error)),
+                io_bound=fake_io_bound,
+            )
+        )
+        assert await asyncio.to_thread(entered.wait, 2)
+        with pytest.raises(JobBusyError):
+            coordinator.start("history.trash_restore")
+        gate.set()
+        await pending
+        assert errors == [RuntimeError]
+        assert coordinator.snapshot().active is False
+    finally:
+        gate.set()
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_trash_route_renders_loading_before_io(monkeypatch, tmp_path, user):
+    from nicegui import run
+
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.run_trash import RunUsageLeaseRegistry, TrashManager
+
+    events: list[str] = []
+    leases = RunUsageLeaseRegistry()
+    manager = TrashManager(lambda: (tmp_path / "results",), leases)
+    coordinator = JobCoordinator()
+
+    monkeypatch.setattr(
+        app_module,
+        "render_trash_loading",
+        lambda *args, **kwargs: events.append("loading") or object(),
+    )
+
+    async def fake_io_bound(worker, *args, **kwargs):
+        events.append("io")
+        return worker(*args, **kwargs)
+
+    monkeypatch.setattr(run, "io_bound", fake_io_bound)
+    monkeypatch.setattr(
+        app_module,
+        "render_trash_page",
+        lambda *args, **kwargs: events.append("render"),
+    )
+    try:
+        app_module.create_app(
+            catalog=SimpleNamespace(root=tmp_path.resolve()),
+            coordinator=coordinator,
+            trash_manager=manager,
+            usage_leases=leases,
+            testing=True,
+        )
+        await user.open("/history/trash")
+        for _ in range(20):
+            if len(events) >= 2:
+                break
+            await asyncio.sleep(0.05)
+        assert events[:2] == ["loading", "io"]
+    finally:
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_trash_route_callbacks_use_transaction_id_and_confirmation(
+    monkeypatch, tmp_path, user
+):
+    from nicegui import run
+
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.run_trash import (
+        RunUsageLeaseRegistry,
+        TrashManager,
+        TrashMutationReceipt,
+    )
+
+    leases = RunUsageLeaseRegistry()
+    manager = TrashManager(lambda: (tmp_path / "results",), leases)
+    calls: list[tuple[str, tuple[object, ...]]] = []
+    manager.restore = lambda value: calls.append(("restore", (value,))) or TrashMutationReceipt(value, restored=True)  # type: ignore[method-assign]
+    manager.purge = lambda value, *, confirmation: calls.append(  # type: ignore[method-assign]
+        ("purge", (value, confirmation))
+    ) or TrashMutationReceipt(value, purged=True)
+    manager.recover = lambda value: calls.append(("recover", (value,))) or object()  # type: ignore[method-assign]
+    captured: dict[str, object] = {}
+
+    def capture_page(*args, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(app_module, "render_trash_page", capture_page)
+
+    async def fake_io_bound(worker, *args, **kwargs):
+        return worker(*args, **kwargs)
+
+    monkeypatch.setattr(run, "io_bound", fake_io_bound)
+    coordinator = JobCoordinator()
+    try:
+        app_module.create_app(
+            catalog=SimpleNamespace(root=tmp_path.resolve()),
+            coordinator=coordinator,
+            trash_manager=manager,
+            usage_leases=leases,
+            testing=True,
+        )
+        await user.open("/history/trash")
+        for _ in range(20):
+            if "on_restore" in captured:
+                break
+            await asyncio.sleep(0.05)
+        transaction_id = "a" * 32
+        await captured["on_restore"](transaction_id)  # type: ignore[index,operator]
+        await captured["on_purge"](transaction_id, "typed")  # type: ignore[index,operator]
+        await captured["on_recover"](transaction_id)  # type: ignore[index,operator]
+        assert calls == [
+            ("restore", (transaction_id,)),
+            ("purge", (transaction_id, "typed")),
+            ("recover", (transaction_id,)),
+        ]
+    finally:
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_create_app_passes_shared_trash_dependencies_to_figures(
+    monkeypatch, tmp_path, user
+):
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.run_trash import RunUsageLeaseRegistry, TrashManager
+
+    captured: list[dict[str, object]] = []
+    leases = RunUsageLeaseRegistry()
+    manager = TrashManager(lambda: (tmp_path / "configured",), leases)
+    coordinator = JobCoordinator()
+    from lte_scenario_toolkit.gui.settings import GuiSettingsStore
+
+    GuiSettingsStore(tmp_path).update(
+        add_output_roots=(tmp_path / "configured",)
+    )
+
+    def fake_render_figures(*args, **kwargs):
+        captured.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(app_module, "render_figures_page", fake_render_figures)
+    try:
+        app_module.create_app(
+            catalog=SimpleNamespace(root=tmp_path.resolve()),
+            coordinator=coordinator,
+            trash_manager=manager,
+            usage_leases=leases,
+            testing=True,
+        )
+        await user.open("/figures")
+        assert captured
+        assert captured[0]["usage_leases"] is leases
+        roots_provider = captured[0]["run_roots"]
+        assert callable(roots_provider)
+        assert (tmp_path / "results").resolve() in tuple(roots_provider())
+        assert (tmp_path / "configured").resolve() in tuple(roots_provider())
+    finally:
+        coordinator.shutdown()
+
+
+def test_figure_reserved_cpu_close_defers_job_release_until_abandon(tmp_path):
+    from lte_scenario_toolkit.gui.pages.figures import FigureController
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    coordinator = JobCoordinator()
+    controller = FigureController(tmp_path, coordinator)
+    try:
+        job = controller._reserve("figure-export")
+        controller.close()
+        assert coordinator.snapshot().active is True
+
+        controller.abandon_cpu_export(job)
+        assert coordinator.snapshot().active is False
+    finally:
+        controller.close()
+        coordinator.shutdown()
+
+
 async def test_app_history_prioritizes_current_confirmed_selection(user, tmp_path):
     from types import SimpleNamespace
 
@@ -6411,19 +6649,27 @@ async def test_figure_page_locks_all_controls_and_restores_rejected_edits(
     from lte_scenario_toolkit.figure_service import FigureService
     from lte_scenario_toolkit.gui import app as app_module
     from lte_scenario_toolkit.gui.pages import figures
+    from lte_scenario_toolkit.gui.settings import GuiSettingsStore
     from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.run_service import RunService
 
     entered = Event()
     release = Event()
-    completed_a = (
-        tmp_path / "source-runs" / "city" / "default" / "completed-a"
+    source_root = (tmp_path / "source-runs").resolve()
+    source_service = RunService(source_root)
+    source_run = source_service.begin("city", "default")
+    (source_run.path / "scenario.csv").write_text("X,Y\n1,2\n", encoding="utf-8")
+    completed_a = source_service.publish(
+        source_run,
+        status="completed",
+        artifacts=["scenario.csv"],
     ).resolve()
     rejected_b = (tmp_path / "rejected-b").resolve()
     source = replace(
         _task15_figure_source(tmp_path),
         path=completed_a,
         source_kind="run",
-        run_id="a" * 32,
+        run_id=source_run.run_id,
     )
     views = []
     actual_render = app_module.render_figures_page
@@ -6445,6 +6691,7 @@ async def test_figure_page_locks_all_controls_and_restores_rejected_edits(
     monkeypatch.setattr(FigureService, "preview", staticmethod(delayed_preview))
     monkeypatch.setattr(figures, "_valid_preview", lambda path: path.is_file())
     coordinator = JobCoordinator()
+    GuiSettingsStore(tmp_path).update(add_output_roots=(source_root,))
     try:
         app_module.create_app(
             catalog=SimpleNamespace(root=tmp_path.resolve()),

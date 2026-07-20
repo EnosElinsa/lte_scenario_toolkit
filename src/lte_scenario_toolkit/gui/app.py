@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import inspect
 import ipaddress
 import os
 import stat
@@ -20,6 +22,7 @@ from ..figure_service import FigureSpec
 from ..jobs import JobCoordinator
 from ..map_assets import MapAssetService
 from ..profiles import ProfileStore
+from ..run_trash import RunUsageLeaseRegistry, TrashManager
 from ..selection_service import SelectionService
 from .assets import install_gui_assets
 from .i18n import Translator, validate_translations
@@ -43,11 +46,17 @@ from .pages.generate import (
     render_generation_unavailable,
 )
 from .pages.history import (
+    HistoryTrashPlan,
+    build_trash_snapshot,
+    confirm_history_trash_plan,
     figure_source_options,
+    history_roots,
     rebuild_history,
-    render_history_content,
     render_history_error,
     render_history_loading,
+    render_history_page,
+    render_trash_loading,
+    render_trash_page,
 )
 from .pages.scenarios import (
     get_job_coordinator,
@@ -57,6 +66,92 @@ from .pages.scenarios import (
 from .settings import GuiSettingsError, GuiSettingsStore
 
 GUI_INSTALL_INSTRUCTION = 'python -m pip install -e ".[gui]"'
+
+
+def client_is_deleted(client: Any) -> bool:
+    """Normalize NiceGUI's deleted-client flag across supported releases."""
+
+    try:
+        value = getattr(client, "is_deleted", False)
+        return bool(value() if callable(value) else value)
+    except Exception:
+        # A client that cannot report its state must be treated as gone. This
+        # keeps late worker completions from enqueueing messages to a dead
+        # websocket.
+        return True
+
+
+async def run_trash_mutation(
+    *,
+    client: Any,
+    coordinator: JobCoordinator,
+    kind: str,
+    worker: Callable[[], Any],
+    on_success: Callable[[Any], Any] | None = None,
+    on_error: Callable[[BaseException], Any] | None = None,
+    on_refresh: Callable[[], Any] | None = None,
+    io_bound: Callable[..., Any] | None = None,
+) -> Any:
+    """Run one serialized Trash mutation and always release its job slot.
+
+    ``io_bound`` is injectable for tests; production callers use NiceGUI's
+    worker bridge.  Result/error callbacks are skipped when the page client
+    has already been deleted, preventing late websocket writes.
+    """
+
+    if io_bound is None:
+        from nicegui import run
+
+        io_bound = run.io_bound
+    try:
+        job = coordinator.start(kind)
+    except BaseException as exc:
+        if not client_is_deleted(client) and on_error is not None:
+            try:
+                result = on_error(exc)
+                if inspect.isawaitable(result):
+                    await result
+            except BaseException:
+                pass
+        return None
+
+    result_value: Any = None
+    try:
+        work_result = io_bound(worker)
+        result_value = (
+            await work_result
+            if inspect.isawaitable(work_result)
+            else work_result
+        )
+        if not client_is_deleted(client) and on_success is not None:
+            callback_result = on_success(result_value)
+            if inspect.isawaitable(callback_result):
+                await callback_result
+        return result_value
+    except BaseException as exc:
+        if (
+            not isinstance(exc, asyncio.CancelledError)
+            and not client_is_deleted(client)
+            and on_error is not None
+        ):
+            try:
+                callback_result = on_error(exc)
+                if inspect.isawaitable(callback_result):
+                    await callback_result
+            except BaseException:
+                pass
+        return None
+    finally:
+        # ``start`` reserves a job without a Future, so this finish is valid
+        # regardless of whether the worker succeeded, failed, or was canceled.
+        coordinator.finish(job.job_id)
+        if not client_is_deleted(client) and on_refresh is not None:
+            try:
+                refresh_result = on_refresh()
+                if inspect.isawaitable(refresh_result):
+                    await refresh_result
+            except BaseException:
+                pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,12 +379,31 @@ def create_app(
     | None = None,
     online_tile_probe: Callable[[], bool] | None = None,
     figure_source_options_provider: Callable[[], Mapping[str, str]] | None = None,
+    trash_manager: TrashManager | None = None,
+    usage_leases: RunUsageLeaseRegistry | None = None,
 ):
     """Register and return the NiceGUI application for one validated catalog."""
 
     from nicegui import app, ui
 
     station_layer_resource = install_gui_assets(app, ui)
+
+    if usage_leases is not None and not isinstance(
+        usage_leases,
+        RunUsageLeaseRegistry,
+    ):
+        raise ValueError("usage_leases must be a RunUsageLeaseRegistry")
+    if trash_manager is not None and not isinstance(trash_manager, TrashManager):
+        raise ValueError("trash_manager must be a TrashManager")
+    manager_leases = (
+        None if trash_manager is None else getattr(trash_manager, "_leases", None)
+    )
+    if (
+        manager_leases is not None
+        and usage_leases is not None
+        and manager_leases is not usage_leases
+    ):
+        raise ValueError("trash_manager and usage_leases must share one registry")
 
     if catalog is None:
         repo_root = Path.cwd().resolve()
@@ -409,6 +523,21 @@ def create_app(
         with ephemeral_roots_lock:
             current = tuple(ephemeral_roots)
         return (*configured, *current)
+
+    def authoritative_history_roots() -> tuple[Path, ...]:
+        """Return exactly the roots used by History and Trash planning."""
+
+        return history_roots(repo_root, history_output_roots())
+
+    active_leases = (
+        usage_leases
+        or manager_leases
+        or RunUsageLeaseRegistry()
+    )
+    active_trash = trash_manager or TrashManager(
+        authoritative_history_roots,
+        active_leases,
+    )
 
     def available_figure_source_options() -> dict[str, str]:
         if figure_source_options_provider is not None:
@@ -691,6 +820,8 @@ def create_app(
             parent_run_path=None if request is None else request.parent_run_path,
             on_published=remember_figure_run,
             preview_url_builder=preview_asset_url,
+            usage_leases=active_leases,
+            run_roots=authoritative_history_roots,
         )
 
     @ui.page("/figures/{request_id}", **page_options)
@@ -762,55 +893,310 @@ def create_app(
 
         roots = history_output_roots()
         history_translator: Translator | None = None
+        history_root: Any | None = None
+        loading_holder: Any | None = None
 
         def loading_body(translator: Translator) -> Any:
-            nonlocal history_translator
+            nonlocal history_translator, history_root, loading_holder
             history_translator = translator
-            return render_history_loading(ui, translator)
+            history_root = ui.column().classes("full-width")
+            with history_root:
+                loading_holder = render_history_loading(ui, translator)
+            return history_root
 
-        holder = render_shell(
+        render_shell(
             "/history",
             "history.title",
             loading_body,
         )
         assert history_translator is not None
+        assert history_root is not None
+        assert loading_holder is not None
         client = ui.context.client
         await client.connected()
-        if client.is_deleted:
+        if client_is_deleted(client):
             return
         try:
             snapshot = await run.io_bound(rebuild_history, repo_root, roots)
+            trash_snapshot = await run.io_bound(build_trash_snapshot, active_trash)
         except Exception as error:
-            if not client.is_deleted:
-                render_history_error(ui, history_translator, holder, error)
+            if not client_is_deleted(client):
+                render_history_error(ui, history_translator, loading_holder, error)
             return
-        if client.is_deleted:
+        if client_is_deleted(client):
             return
-        render_history_content(
-            ui,
-            history_translator,
-            holder,
-            snapshot,
-            on_reveal=reveal_directory,
-            on_open_figures=lambda path, root, parent, parent_path, figure_spec: open_history_source(
-                path,
-                root,
-                parent,
-                parent_path,
-                figure_spec=figure_spec,
-            ),
-            on_retry_missing=lambda path, root, parent, parent_path, formats, figure_spec: open_history_source(
-                path,
-                root,
-                parent,
-                parent_path,
-                formats,
-                figure_spec,
-            ),
-            pending_selections=sessions.confirmed_sessions(),
-            on_open_pending_figures=open_pending_figures,
-            on_continue_pending=continue_pending_generation,
-        )
+
+        async def move_to_trash(displayed: HistoryTrashPlan) -> None:
+            def worker() -> Any:
+                current = rebuild_history(repo_root, history_output_roots())
+                matches = [
+                    row
+                    for row in current.rows
+                    if row.reference == displayed.reference
+                ]
+                if len(matches) != 1:
+                    raise ValueError(
+                        "The selected run is no longer available; refresh History"
+                    )
+                return confirm_history_trash_plan(
+                    displayed,
+                    matches[0],
+                    active_trash,
+                )
+
+            async def on_success(receipt: Any) -> None:
+                if client_is_deleted(client):
+                    return
+                count = getattr(receipt, "run_count", None)
+                if type(count) is not int:
+                    count = len(getattr(receipt, "members", ()))
+                ui.notify(
+                    history_translator.text("history.trash_success", count=count),
+                    type="positive",
+                )
+
+            async def refresh() -> None:
+                if client_is_deleted(client):
+                    return
+                fresh_history = await run.io_bound(
+                    rebuild_history,
+                    repo_root,
+                    history_output_roots(),
+                )
+                fresh_trash = await run.io_bound(
+                    build_trash_snapshot,
+                    active_trash,
+                )
+                if client_is_deleted(client):
+                    return
+                history_root.clear()
+                with history_root:
+                    render_history_page(
+                        ui,
+                        history_translator,
+                        repo_root,
+                        history_output_roots(),
+                        snapshot=fresh_history,
+                        on_reveal=reveal_directory,
+                        on_open_figures=lambda path, root, parent, parent_path, figure_spec: open_history_source(
+                            path,
+                            root,
+                            parent,
+                            parent_path,
+                            figure_spec=figure_spec,
+                        ),
+                        on_retry_missing=lambda path, root, parent, parent_path, formats, figure_spec: open_history_source(
+                            path,
+                            root,
+                            parent,
+                            parent_path,
+                            formats,
+                            figure_spec,
+                        ),
+                        pending_selections=sessions.confirmed_sessions(),
+                        on_open_pending_figures=open_pending_figures,
+                        on_continue_pending=continue_pending_generation,
+                        trash_manager=active_trash,
+                        on_move_to_trash=move_to_trash,
+                        trash_count=fresh_trash.count,
+                        on_open_trash=lambda: ui.navigate.to("/history/trash"),
+                    )
+
+            def on_error(_error: BaseException) -> None:
+                if client_is_deleted(client):
+                    return
+                key = (
+                    "history.trash_busy"
+                    if getattr(_error, "code", None) == "job.busy"
+                    else "history.trash_error"
+                )
+                ui.notify(history_translator.text(key), type="negative")
+
+            await run_trash_mutation(
+                client=client,
+                coordinator=runtime.coordinator,
+                kind="history.trash_move",
+                worker=worker,
+                on_success=on_success,
+                on_error=on_error,
+                on_refresh=refresh,
+            )
+
+        history_root.clear()
+        with history_root:
+            render_history_page(
+                ui,
+                history_translator,
+                repo_root,
+                history_output_roots(),
+                snapshot=snapshot,
+                on_reveal=reveal_directory,
+                on_open_figures=lambda path, root, parent, parent_path, figure_spec: open_history_source(
+                    path,
+                    root,
+                    parent,
+                    parent_path,
+                    figure_spec=figure_spec,
+                ),
+                on_retry_missing=lambda path, root, parent, parent_path, formats, figure_spec: open_history_source(
+                    path,
+                    root,
+                    parent,
+                    parent_path,
+                    formats,
+                    figure_spec,
+                ),
+                pending_selections=sessions.confirmed_sessions(),
+                on_open_pending_figures=open_pending_figures,
+                on_continue_pending=continue_pending_generation,
+                trash_manager=active_trash,
+                on_move_to_trash=move_to_trash,
+                trash_count=trash_snapshot.count,
+                on_open_trash=lambda: ui.navigate.to("/history/trash"),
+            )
+
+    @ui.page("/history/trash", **page_options)
+    async def history_trash() -> None:
+        from nicegui import run
+
+        translator_holder: Translator | None = None
+        page_root: Any | None = None
+        loading_holder: Any | None = None
+
+        def loading_body(translator: Translator) -> Any:
+            nonlocal translator_holder, page_root, loading_holder
+            translator_holder = translator
+            page_root = ui.column().classes("full-width")
+            with page_root:
+                loading_holder = render_trash_loading(
+                    ui,
+                    translator,
+                    on_back=lambda: ui.navigate.to("/history"),
+                )
+            return page_root
+
+        render_shell("/history", "history.trash_title", loading_body)
+        assert translator_holder is not None
+        assert page_root is not None
+        assert loading_holder is not None
+        client = ui.context.client
+        await client.connected()
+        if client_is_deleted(client):
+            return
+        try:
+            snapshot = await run.io_bound(build_trash_snapshot, active_trash)
+        except Exception as error:
+            if not client_is_deleted(client):
+                # The loading holder is deliberately the only mutable area;
+                # never attempt to write a dead client after this point.
+                render_history_error(ui, translator_holder, loading_holder, error)
+            return
+        if client_is_deleted(client):
+            return
+
+        async def refresh_trash() -> None:
+            if client_is_deleted(client):
+                return
+            fresh = await run.io_bound(build_trash_snapshot, active_trash)
+            if client_is_deleted(client):
+                return
+            page_root.clear()
+            with page_root:
+                render_trash_page(
+                    ui,
+                    translator_holder,
+                    fresh,
+                    on_back=lambda: ui.navigate.to("/history"),
+                    on_restore=restore_transaction,
+                    on_purge=purge_transaction,
+                    on_recover=recover_transaction,
+                )
+
+        def _notify_trash_error(key: str) -> Callable[[BaseException], Any]:
+            def notify(_error: BaseException) -> None:
+                if client_is_deleted(client):
+                    return
+                error_key = (
+                    "history.trash_busy"
+                    if getattr(_error, "code", None) == "job.busy"
+                    else key
+                )
+                ui.notify(translator_holder.text(error_key), type="negative")
+
+            return notify
+
+        async def restore_transaction(transaction_id: str) -> None:
+            await run_trash_mutation(
+                client=client,
+                coordinator=runtime.coordinator,
+                kind="history.trash_restore",
+                worker=lambda: active_trash.restore(transaction_id),
+                on_success=lambda receipt: ui.notify(
+                    translator_holder.text(
+                        "history.trash_restore_success",
+                        count=getattr(receipt, "run_count", 0),
+                    ),
+                    type="positive",
+                )
+                if not client_is_deleted(client)
+                else None,
+                on_error=_notify_trash_error("history.trash_restore_error"),
+                on_refresh=refresh_trash,
+            )
+
+        async def purge_transaction(
+            transaction_id: str,
+            confirmation: str | None = None,
+        ) -> None:
+            supplied = "" if confirmation is None else confirmation
+            await run_trash_mutation(
+                client=client,
+                coordinator=runtime.coordinator,
+                kind="history.trash_purge",
+                worker=lambda: active_trash.purge(
+                    transaction_id,
+                    confirmation=supplied,
+                ),
+                on_success=lambda receipt: ui.notify(
+                    translator_holder.text(
+                        "history.trash_permanent_success",
+                        count=getattr(receipt, "run_count", 0),
+                    ),
+                    type="positive",
+                )
+                if not client_is_deleted(client)
+                else None,
+                on_error=_notify_trash_error("history.trash_permanent_error"),
+                on_refresh=refresh_trash,
+            )
+
+        async def recover_transaction(transaction_id: str) -> None:
+            await run_trash_mutation(
+                client=client,
+                coordinator=runtime.coordinator,
+                kind="history.trash_restore",
+                worker=lambda: active_trash.recover(transaction_id),
+                on_success=lambda _receipt: ui.notify(
+                    translator_holder.text("history.trash_recover_success"),
+                    type="positive",
+                )
+                if not client_is_deleted(client)
+                else None,
+                on_error=_notify_trash_error("history.trash_recover_error"),
+                on_refresh=refresh_trash,
+            )
+
+        page_root.clear()
+        with page_root:
+            render_trash_page(
+                ui,
+                translator_holder,
+                snapshot,
+                on_back=lambda: ui.navigate.to("/history"),
+                on_restore=restore_transaction,
+                on_purge=purge_transaction,
+                on_recover=recover_transaction,
+            )
 
     @ui.page("/configure", **page_options)
     def configure_picker() -> None:
