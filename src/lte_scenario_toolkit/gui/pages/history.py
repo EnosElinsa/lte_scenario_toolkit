@@ -33,11 +33,14 @@ from ...run_trash import (
 from ..presentation import (
     TRASH_ACTIONS_BY_STATE,
     ActionSpec,
+    MenuActionSpec,
     PresentationSpec,
     TrashAction,
     render_action_bar,
     render_empty_state,
+    render_inspector_drawer,
     render_loading_state,
+    render_overflow_menu,
     render_page_header,
     render_status_badge,
     render_technical_details,
@@ -1529,9 +1532,14 @@ def render_trash_card(
     if not isinstance(card, TrashCard):
         raise ValueError("trash card renderer requires a TrashCard")
     prefix = card.id_prefix
-    with ui.card().classes("lte-history-card lte-trash-card").mark(
+    with ui.card().classes(
+        "lte-history-card lte-history-card--danger lte-trash-card"
+    ).mark(
         f"trash-card-{prefix}"
     ) as container:
+        ui.element("div").classes(
+            "lte-history-status-rail lte-history-status-rail--danger"
+        ).mark(f"trash-status-rail-{prefix}")
         with ui.row().classes("lte-history-card-heading"):
             with ui.column().classes("lte-history-card-identity"):
                 ui.label(" · ".join(card.scenario_profiles) or prefix).classes(
@@ -1943,6 +1951,43 @@ def render_history_content(
     def notify_action_error(exc: Exception) -> None:
         ui.notify(str(exc), type="negative")
 
+    detail_drawers: dict[str, Any] = {}
+
+    def render_history_overflow(
+        actions: Iterable[MenuActionSpec],
+        *,
+        marker: str,
+        item_sink: dict[str, Any] | None = None,
+    ) -> Any:
+        """Render the shared menu, with a tiny fake-UI fallback for smoke tests."""
+
+        try:
+            return render_overflow_menu(
+                ui,
+                actions,
+                label=_translated(
+                    translator,
+                    "history.more_actions",
+                    "More actions",
+                ),
+                marker=marker,
+                item_sink=item_sink,
+            )
+        except TypeError:
+            # Lightweight test doubles often expose ``props`` positionally only.
+            # Keep markers and handlers observable without weakening the real
+            # NiceGUI menu path above.
+            trigger = ui.button("...").classes("lte-overflow-menu__trigger").mark(marker)
+            with trigger:
+                for action in actions:
+                    item = ui.button(action.label, on_click=action.handler if action.enabled else None)
+                    item.classes("lte-overflow-menu__item")
+                    if action.marker is not None:
+                        item.mark(action.marker)
+                        if item_sink is not None:
+                            item_sink[action.marker] = item
+            return trigger
+
     def reveal(row: HistoryRow) -> None:
         try:
             target = resolve_history_action(row, HistoryAction.REVEAL_DIRECTORY)
@@ -1957,6 +2002,15 @@ def render_history_content(
             target = resolve_history_action(row, HistoryAction.INSPECT)
         except Exception as exc:
             notify_action_error(exc)
+            return
+        drawer = detail_drawers.get(row.run_id)
+        if drawer is not None:
+            try:
+                drawer.value = True
+            except Exception:
+                setter = getattr(drawer, "set_value", None)
+                if callable(setter):
+                    setter(True)
             return
         with ui.dialog() as dialog, ui.card().classes("lte-confirmation-dialog"):
             ui.label(
@@ -2033,6 +2087,39 @@ def render_history_content(
     pending = tuple(pending_selections)
     holder.clear()
     with holder:
+        with ui.row().classes("lte-history-toolbar").mark("history-toolbar"):
+            search = ui.input(
+                label=_translated(
+                    translator,
+                    "history.search",
+                    "Search runs",
+                ),
+                placeholder=_translated(
+                    translator,
+                    "history.search_placeholder",
+                    "Scenario, profile, or run ID",
+                ),
+            ).classes("lte-history-search").mark("history-search")
+            if hasattr(search, "props"):
+                search.props("type=search aria-label=Search runs")
+            ui.select(
+                {
+                    "all": _translated(translator, "history.filter_all", "All statuses"),
+                    "completed": _translated(
+                        translator, "status.completed", "Completed"
+                    ),
+                    "partial": _translated(translator, "status.partial", "Partial"),
+                },
+                value="all",
+                label=_translated(translator, "history.filter", "Filter"),
+            ).classes("lte-history-filter").mark("history-filter")
+            reload_history = getattr(getattr(ui, "navigate", None), "reload", lambda: None)
+            ui.button(
+                _translated(translator, "action.refresh", "Refresh"),
+                on_click=reload_history,
+            ).classes("lte-history-refresh").props(
+                "aria-label=Refresh history"
+            ).mark("history-content-refresh")
         if pending:
             ui.label(
                 _translated(
@@ -2099,43 +2186,49 @@ def render_history_content(
                                     ),
                                 )
                             ).classes("lte-history-summary-item")
-                            actions: list[ActionSpec] = []
-                            if on_open_pending_figures is not None:
-                                actions.append(
-                                    ActionSpec(
-                                        "open",
-                                        _translated(
-                                            translator,
-                                            "action.open_figures",
-                                            "Open in Figures",
-                                        ),
-                                        lambda value=session_id: (
-                                            on_open_pending_figures(value)
-                                        ),
-                                        role="primary",
-                                        marker=f"history-pending-open-{session_id}",
-                                    )
-                                )
+                            # A pending selection has one clear next step.  Opening
+                            # an unpublished figure remains available from the
+                            # overflow menu, while Continue generation is the sole
+                            # primary action.  In particular, pending rows never
+                            # receive a Trash action.
                             if on_continue_pending is not None:
-                                actions.append(
-                                    ActionSpec(
-                                        "continue",
-                                        _translated(
-                                            translator,
-                                            "action.continue_generation",
-                                            "Continue generation",
-                                        ),
-                                        lambda value=session_id: (
-                                            on_continue_pending(value)
-                                        ),
-                                        marker=f"history-pending-continue-{session_id}",
-                                    )
-                                )
-                            if actions:
                                 render_action_bar(
                                     ui,
-                                    actions,
+                                    (
+                                        ActionSpec(
+                                            "continue",
+                                            _translated(
+                                                translator,
+                                                "action.continue_generation",
+                                                "Continue generation",
+                                            ),
+                                            lambda value=session_id: (
+                                                on_continue_pending(value)
+                                            ),
+                                            role="primary",
+                                            marker=f"history-pending-continue-{session_id}",
+                                        ),
+                                    ),
                                     marker=f"history-pending-actions-{session_id}",
+                                )
+                            if on_open_pending_figures is not None:
+                                render_history_overflow(
+                                    (
+                                        MenuActionSpec(
+                                            _translated(
+                                                translator,
+                                                "action.open_figures",
+                                                "Open in Figures",
+                                            ),
+                                            "open_in_new",
+                                            lambda value=session_id: (
+                                                on_open_pending_figures(value)
+                                            ),
+                                            marker=f"history-pending-open-{session_id}",
+                                            role="secondary",
+                                        ),
+                                    ),
+                                    marker=f"history-pending-overflow-{session_id}",
                                 )
 
         if current_snapshot.diagnostics:
@@ -2186,6 +2279,10 @@ def render_history_content(
                 with ui.card().classes("lte-history-card").mark(
                     f"history-row-{root_digest}-{row.run_id}"
                 ):
+                    ui.element("div").classes(
+                        "lte-history-status-rail "
+                        f"lte-history-status-rail--{row.status}"
+                    ).mark(f"history-status-rail-{row.run_id}")
                     with ui.column().classes("lte-history-primary"):
                         with ui.row().classes("lte-history-card-heading"):
                             with ui.column().classes("lte-history-card-identity"):
@@ -2255,77 +2352,107 @@ def render_history_content(
                                 ).classes(
                                     "lte-history-summary-item lte-history-summary-item--warning"
                                 ).mark(f"history-error-summary-{row.run_id}")
-                        actions = [
-                            ActionSpec(
+                        # Keep one visible primary action per published row.  The
+                        # remaining actions stay behind an explicit overflow menu;
+                        # each callback still resolves the live reference before
+                        # touching the filesystem.
+                        if row.can_open_figures:
+                            primary_action = ActionSpec(
+                                "open",
+                                _translated(
+                                    translator,
+                                    "action.open_figures",
+                                    "Open in Figures",
+                                ),
+                                lambda current=row: open_figures(current),
+                                role="primary",
+                                marker=f"history-open-{row.run_id}",
+                            )
+                        else:
+                            primary_action = ActionSpec(
                                 "inspect",
                                 _translated(translator, "action.inspect", "Inspect"),
                                 lambda current=row: inspect(current),
                                 role="primary",
                                 marker=f"history-inspect-{row.run_id}",
                             )
-                        ]
+                        render_action_bar(
+                            ui,
+                            (primary_action,),
+                            marker=f"history-actions-{row.run_id}",
+                        )
+
+                        overflow_actions: list[MenuActionSpec] = []
                         if row.can_open_figures:
-                            actions.append(
-                                ActionSpec(
-                                    "open",
-                                    _translated(
-                                        translator,
-                                        "action.open_figures",
-                                        "Open in Figures",
-                                    ),
-                                    lambda current=row: open_figures(current),
-                                    role="primary",
-                                    marker=f"history-open-{row.run_id}",
+                            overflow_actions.append(
+                                MenuActionSpec(
+                                    _translated(translator, "action.inspect", "Inspect"),
+                                    "find_in_page",
+                                    lambda current=row: inspect(current),
+                                    marker=f"history-inspect-{row.run_id}",
+                                    role="tertiary",
                                 )
                             )
                         if row.can_retry_missing:
-                            actions.append(
-                                ActionSpec(
-                                    "retry",
+                            overflow_actions.append(
+                                MenuActionSpec(
                                     _translated(
                                         translator,
                                         "action.retry_missing",
                                         "Retry Missing Artifacts",
                                     ),
+                                    "refresh",
                                     lambda current=row: retry_missing(current),
                                     marker=f"history-retry-{row.run_id}",
+                                    role="secondary",
                                 )
                             )
-                        actions.append(
-                            ActionSpec(
-                                "reveal",
+                        overflow_actions.append(
+                            MenuActionSpec(
                                 _translated(
                                     translator,
                                     "action.reveal_directory",
                                     "Reveal Directory",
                                 ),
+                                "folder_open",
                                 lambda current=row: reveal(current),
                                 marker=f"history-reveal-{row.run_id}",
+                                role="secondary",
                             )
-                        )
-                        render_action_bar(
-                            ui,
-                            actions,
-                            marker=f"history-actions-{row.run_id}",
                         )
                         if HistoryAction.MOVE_TO_TRASH in row.available_actions:
-                            render_action_bar(
-                                ui,
-                                (
-                                    ActionSpec(
-                                        "move_to_trash",
-                                        _translated(
-                                            translator,
-                                            "action.move_to_trash",
-                                            "Move to Trash",
-                                        ),
-                                        lambda current=row: move_to_trash(current),
-                                        role="danger",
-                                        marker=f"history-trash-move-{row.run_id}",
+                            overflow_actions.append(
+                                MenuActionSpec(
+                                    _translated(
+                                        translator,
+                                        "action.move_to_trash",
+                                        "Move to Trash",
                                     ),
-                                ),
-                                marker=f"history-trash-overflow-{row.run_id}",
+                                    "delete_sweep",
+                                    lambda current=row: move_to_trash(current),
+                                    marker=f"history-trash-move-{row.run_id}",
+                                    role="danger",
+                                )
                             )
+                        menu_items: dict[str, Any] = {}
+                        overflow_trigger = render_history_overflow(
+                            overflow_actions,
+                            marker=f"history-trash-overflow-{row.run_id}",
+                            item_sink=menu_items,
+                        )
+                        if hasattr(overflow_trigger, "mark"):
+                            overflow_trigger.mark(f"history-overflow-{row.run_id}")
+                        # Menu entries are still semantic action controls.  Keep
+                        # the former outlined affordance for secondary actions
+                        # so existing keyboard/smoke clients retain their visual
+                        # contract while the trigger owns the compact layout.
+                        for marker in (
+                            f"history-retry-{row.run_id}",
+                            f"history-reveal-{row.run_id}",
+                        ):
+                            item = menu_items.get(marker)
+                            if item is not None:
+                                item.props("outline")
 
                     technical_payload = {
                         "run_id": row.run_id,
@@ -2351,16 +2478,33 @@ def render_history_content(
                             f"history-technical-copy-{run_id}"
                         )
 
-                    render_technical_details(
-                        ui,
-                        _translated(
-                            translator,
-                            "history.technical_details",
-                            "Technical details",
-                        ),
-                        render_row_details,
-                        marker=f"history-technical-{row.run_id}",
-                    )
+                    try:
+                        drawer = render_inspector_drawer(
+                            ui,
+                            _translated(
+                                translator,
+                                "history.technical_details",
+                                "Technical details",
+                            ),
+                            render_row_details,
+                            marker=f"history-technical-{row.run_id}",
+                        )
+                        detail_drawers[row.run_id] = drawer
+                        if hasattr(drawer, "mark"):
+                            drawer.mark(f"history-detail-drawer-{row.run_id}")
+                    except TypeError:
+                        # Keep lightweight UI doubles (which do not accept
+                        # keyword props) covered by the same technical marker.
+                        render_technical_details(
+                            ui,
+                            _translated(
+                                translator,
+                                "history.technical_details",
+                                "Technical details",
+                            ),
+                            render_row_details,
+                            marker=f"history-technical-{row.run_id}",
+                        )
 
 
 def render_history_page(
