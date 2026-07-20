@@ -5564,6 +5564,14 @@ def test_candidate_workbench_css_is_bounded_and_mobile_safe():
     assert ".lte-candidate-action-dock" in mobile_block
     assert "flex-wrap: wrap" in mobile_block
     assert ".lte-filmstrip-grid { grid-template-columns" not in mobile_block
+    card_rule = re.search(
+        r"(?m)^\.lte-candidate-map-card\s*\{(?P<body>[^}]+)\}", css
+    )
+    assert card_rule is not None
+    assert "min-height: calc(560px + 2 * var(--lte-space-4) + 2px);" in card_rule.group(
+        "body"
+    )
+    assert "padding: 10px 12px calc(10px + env(safe-area-inset-bottom));" in css
     reduced_motion = css.index("@media (prefers-reduced-motion: reduce)")
     assert ".lte-candidate-page *" in css[reduced_motion:]
 
@@ -5600,6 +5608,19 @@ def test_candidate_workbench_has_explicit_390px_overflow_safeguards():
     assert "grid-auto-flow: column;" in narrow
     assert "overflow-x: auto;" in narrow
     assert ".lte-filmstrip-grid { grid-template-columns" not in narrow
+
+
+def test_candidate_map_card_height_contract_covers_768_and_800_viewports():
+    css = (ROOT / "src/lte_scenario_toolkit/gui/assets/app.css").read_text(
+        encoding="utf-8"
+    )
+    required_content_height = 560 + (2 * 16) + 2
+    assert (
+        "min-height: calc(560px + 2 * var(--lte-space-4) + 2px);" in css
+    )
+    for viewport_height in (768, 800):
+        bounded_height = min(viewport_height * 0.72, 780)
+        assert bounded_height < required_content_height
 
 
 async def test_candidate_page_can_disable_all_rescan_entrypoints(user, tmp_path):

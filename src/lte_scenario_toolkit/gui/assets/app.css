@@ -975,6 +975,7 @@ h3,
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: calc(560px + 2 * var(--lte-space-4) + 2px);
   height: min(72vh, 780px);
   overflow: hidden;
 }
@@ -1053,7 +1054,7 @@ h3,
   width: 100%;
   min-width: 0;
   gap: var(--lte-space-2);
-  padding: 10px 12px;
+  padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
   background: rgb(242 241 235 / 96%);
   border-top: 1px solid var(--lte-border);
   backdrop-filter: blur(8px);
