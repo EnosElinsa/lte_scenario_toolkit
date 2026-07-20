@@ -1833,6 +1833,19 @@ async def test_gui_shell_keeps_the_mobile_overlay_control_separate_from_mini_mod
     await user.open("/")
 
     navigation = next(iter(user.find(marker="shell-navigation").elements))
+    assert "lte-navigation-rail" in navigation._classes
+    css = (ROOT / "src/lte_scenario_toolkit/gui/assets/app.css").read_text(
+        encoding="utf-8"
+    )
+    drawer_rule = re.search(
+        r"\.lte-navigation-rail\.q-drawer__content\s*\{(?P<body>[^}]+)\}",
+        css,
+    )
+    assert drawer_rule is not None
+    assert ".lte-navigation-rail .q-drawer__content" not in css
+    assert "overflow-x: hidden;" in drawer_rule.group("body")
+    assert "overflow-y: hidden;" in drawer_rule.group("body")
+    assert "box-sizing: border-box;" in drawer_rule.group("body")
     assert navigation._props["mini"] is True
     assert str(navigation._props["width"]) == "224"
     assert str(navigation._props["mini-width"]) == "68"
