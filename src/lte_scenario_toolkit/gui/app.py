@@ -1,16 +1,19 @@
-"""Command-line entrypoint and application factory for the local GUI."""
+﻿"""Command-line entrypoint and application factory for the local GUI."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import inspect
 import ipaddress
+import logging
 import os
 import stat
 import sys
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
@@ -19,10 +22,15 @@ from uuid import uuid4
 
 from ..data_catalog import CatalogError, DataCatalog, load_data_catalog
 from ..figure_service import FigureSpec
-from ..jobs import JobCoordinator
+from ..jobs import JobBusyError, JobCoordinator
 from ..map_assets import MapAssetService
 from ..profiles import ProfileStore
-from ..run_trash import RunUsageLeaseRegistry, TrashManager
+from ..run_trash import (
+    RunLeaseConflictError,
+    RunUsageLeaseRegistry,
+    TrashManager,
+    TrashPlanStaleError,
+)
 from ..selection_service import SelectionService
 from .assets import install_gui_assets
 from .i18n import Translator, validate_translations
@@ -46,7 +54,9 @@ from .pages.generate import (
     render_generation_unavailable,
 )
 from .pages.history import (
+    HistorySnapshot,
     HistoryTrashPlan,
+    TrashSnapshot,
     build_trash_snapshot,
     confirm_history_trash_plan,
     figure_source_options,
@@ -66,6 +76,137 @@ from .pages.scenarios import (
 from .settings import GuiSettingsError, GuiSettingsStore
 
 GUI_INSTALL_INSTRUCTION = 'python -m pip install -e ".[gui]"'
+_LOGGER = logging.getLogger(__name__)
+
+
+class TrashViewRefreshError(RuntimeError):
+    """Raised when a committed Trash mutation cannot rebuild its view."""
+
+    code = "trash.refresh_failed"
+
+
+def _root_digest_for_log(root: object) -> str:
+    """Return a stable root digest without logging the filesystem path."""
+
+    try:
+        value = os.path.normcase(os.path.normpath(os.fspath(root)))
+    except (OSError, TypeError, ValueError):
+        value = "invalid-root"
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:16]
+
+
+def log_trash_mutation(
+    kind: str,
+    *,
+    transaction_id: str | None = None,
+    state: object | None = None,
+    member_count: int | None = None,
+    roots: Iterable[object] = (),
+    error: BaseException | None = None,
+    cancelled: bool = False,
+) -> None:
+    """Emit safe structured lifecycle fields for one Trash operation."""
+
+    fields = {
+        "kind": kind,
+        "transaction_id": transaction_id,
+        "state": None if state is None else str(getattr(state, "value", state)),
+        "member_count": member_count,
+        "root_digests": tuple(_root_digest_for_log(root) for root in roots),
+    }
+    if cancelled:
+        _LOGGER.info("trash mutation cancelled %s", fields)
+    elif error is not None:
+        fields["error_type"] = type(error).__name__
+        fields["error_code"] = getattr(error, "code", "trash.transaction_failed")
+        _LOGGER.warning("trash mutation failed %s", fields)
+    else:
+        _LOGGER.info("trash mutation completed %s", fields)
+
+
+def log_trash_result(kind: str, result: Any) -> None:
+    """Log a completed mutation before any client callback is attempted.
+
+    Restore/purge workers return ``(receipt, before)`` so that the UI can
+    report the affected family.  Keeping this extraction here means a
+    disconnected NiceGUI client still leaves one complete, path-safe
+    lifecycle record and route callbacks do not need to duplicate it.
+    """
+
+    receipt = result
+    before = None
+    if isinstance(result, tuple) and len(result) == 2:
+        receipt, before = result
+    source = before if before is not None else receipt
+    members = getattr(source, "members", ())
+    member_count = getattr(receipt, "run_count", None)
+    if type(member_count) is not int:
+        member_count = len(members)
+    state = getattr(source, "state", None)
+    if before is not None:
+        if kind == "history.trash_restore":
+            state = "restored"
+        elif kind == "history.trash_purge":
+            state = "purged"
+    log_trash_mutation(
+        kind,
+        transaction_id=getattr(receipt, "transaction_id", None),
+        state=state,
+        member_count=member_count,
+        roots=getattr(source, "roots", ()),
+    )
+
+
+def log_trash_delivery_cancelled(kind: str) -> None:
+    """Record a disconnected UI waiter without changing mutation outcome."""
+
+    _LOGGER.info("trash mutation delivery cancelled %s", {"kind": kind})
+
+
+def trash_error_translation_key(
+    error: BaseException,
+    *,
+    default: str,
+) -> str:
+    """Map domain failures to stable localized UI keys without raw details."""
+
+    chain: list[BaseException] = []
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+
+    for candidate in chain:
+        code = getattr(candidate, "code", None)
+        if isinstance(candidate, JobBusyError) or code == "job.busy":
+            return "history.trash_busy"
+        if isinstance(candidate, TrashPlanStaleError) or code == "trash.plan_stale":
+            return "history.trash_stale"
+        if isinstance(candidate, RunLeaseConflictError) or code in {
+            "run.in_use",
+            "run.lease_conflict",
+        }:
+            return "history.trash_lease_conflict"
+
+    code = getattr(error, "code", None)
+    text = " ".join(str(candidate) for candidate in chain).casefold()
+    if "in use" in text or "lease" in text:
+        return "history.trash_lease_conflict"
+    if "stale" in text or "refresh" in text or "changed" in text:
+        return "history.trash_stale"
+    if code == "trash.root_unavailable" or "root" in text and "unavailable" in text:
+        return "history.trash_root_unavailable"
+    if "destination" in text or "occupied" in text:
+        return "history.trash_destination_occupied"
+    if "journal" in text or "payload" in text:
+        return "history.trash_journal_invalid"
+    if "purgeable" in text or "partially purged" in text or "purge state" in text:
+        return "history.trash_permanent_error"
+    if "not restorable" in text or "recovery required" in text:
+        return "history.trash_restore_error"
+    return default
 
 
 def client_is_deleted(client: Any) -> bool:
@@ -86,10 +227,13 @@ async def run_trash_mutation(
     client: Any,
     coordinator: JobCoordinator,
     kind: str,
+    log_kind: str | None = None,
     worker: Callable[[], Any],
     on_success: Callable[[Any], Any] | None = None,
     on_error: Callable[[BaseException], Any] | None = None,
+    on_error_log: Callable[[BaseException], None] | None = None,
     on_refresh: Callable[[], Any] | None = None,
+    on_refresh_error: Callable[[BaseException], Any] | None = None,
     io_bound: Callable[..., Any] | None = None,
 ) -> Any:
     """Run one serialized Trash mutation and always release its job slot.
@@ -103,9 +247,19 @@ async def run_trash_mutation(
         from nicegui import run
 
         io_bound = run.io_bound
+    lifecycle_kind = kind if log_kind is None else log_kind
     try:
         job = coordinator.start(kind)
     except BaseException as exc:
+        logged = False
+        if on_error_log is not None:
+            try:
+                on_error_log(exc)
+                logged = True
+            except BaseException:
+                pass
+        if not logged:
+            log_trash_mutation(lifecycle_kind, error=exc)
         if not client_is_deleted(client) and on_error is not None:
             try:
                 result = on_error(exc)
@@ -115,43 +269,235 @@ async def run_trash_mutation(
                 pass
         return None
 
-    result_value: Any = None
-    try:
-        work_result = io_bound(worker)
-        result_value = (
-            await work_result
-            if inspect.isawaitable(work_result)
-            else work_result
-        )
-        if not client_is_deleted(client) and on_success is not None:
-            callback_result = on_success(result_value)
-            if inspect.isawaitable(callback_result):
-                await callback_result
-        return result_value
-    except BaseException as exc:
-        if (
-            not isinstance(exc, asyncio.CancelledError)
-            and not client_is_deleted(client)
-            and on_error is not None
-        ):
+    finish_lock = Lock()
+    worker_done = False
+    finish_requested = False
+    finish_done = False
+
+    def bridge_cannot_submit() -> bool:
+        try:
+            from nicegui import core
+
+            return bool(core.app.is_stopping)
+        except Exception:
+            return True
+
+    def finish_once() -> None:
+        nonlocal finish_requested, finish_done
+        with finish_lock:
+            if finish_done:
+                return
+            finish_requested = True
+            if not worker_done:
+                return
+            finish_done = True
+        coordinator.finish(job.job_id)
+
+    def log_worker_error(error: BaseException) -> None:
+        if on_error_log is not None:
             try:
-                callback_result = on_error(exc)
-                if inspect.isawaitable(callback_result):
-                    await callback_result
+                on_error_log(error)
+                return
             except BaseException:
                 pass
-        return None
-    finally:
-        # ``start`` reserves a job without a Future, so this finish is valid
-        # regardless of whether the worker succeeded, failed, or was canceled.
+        log_trash_mutation(lifecycle_kind, error=error)
+
+    async def invoke_ui_callback(
+        callback: Callable[..., Any] | None,
+        *args: Any,
+    ) -> None:
+        if callback is None or client_is_deleted(client):
+            return
+        try:
+            callback_result = callback(*args)
+            if inspect.isawaitable(callback_result):
+                await callback_result
+        except BaseException:
+            pass
+
+    if client_is_deleted(client) or bridge_cannot_submit():
+        with finish_lock:
+            finish_requested = True
+            finish_done = True
         coordinator.finish(job.job_id)
+        log_trash_mutation(lifecycle_kind, cancelled=True)
+        return None
+
+    executor: ThreadPoolExecutor | None = None
+    try:
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lte-trash")
+        worker_future = executor.submit(worker)
+    except BaseException as exc:
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+        with finish_lock:
+            finish_requested = True
+            finish_done = True
+        coordinator.finish(job.job_id)
+        log_worker_error(exc)
+        await invoke_ui_callback(on_error, exc)
+        return None
+
+    def worker_finished(completed_future: Any) -> None:
+        nonlocal worker_done, finish_done
+        should_finish = False
+        try:
+            try:
+                completed_result = completed_future.result()
+            except BaseException as exc:
+                log_worker_error(exc)
+            else:
+                log_trash_result(lifecycle_kind, completed_result)
+        except BaseException:
+            # Diagnostics must never strand the mutation gate.
+            pass
+        finally:
+            try:
+                with finish_lock:
+                    worker_done = True
+                    should_finish = finish_requested and not finish_done
+                    if should_finish:
+                        finish_done = True
+                if should_finish:
+                    coordinator.finish(job.job_id)
+            except BaseException:
+                pass
+            finally:
+                try:
+                    executor.shutdown(wait=False, cancel_futures=False)
+                except BaseException:
+                    pass
+
+    worker_future.add_done_callback(worker_finished)
+
+    try:
+        async def bridge_call() -> Any:
+            work_result = io_bound(worker_future.result)
+            return (
+                await work_result
+                if inspect.isawaitable(work_result)
+                else work_result
+            )
+
+        bridge_task = asyncio.create_task(bridge_call())
+
+        def consume_bridge_result(task: asyncio.Task[Any]) -> None:
+            try:
+                task.exception()
+            except BaseException:
+                pass
+
+        bridge_task.add_done_callback(consume_bridge_result)
+        worker_result: Any = None
+        worker_error: BaseException | None = None
+        try:
+            bridge_result = await asyncio.shield(bridge_task)
+        except asyncio.CancelledError:
+            finish_once()
+            try:
+                await asyncio.shield(bridge_task)
+            except BaseException:
+                pass
+            log_trash_delivery_cancelled(lifecycle_kind)
+            return None
+        except BaseException as bridge_error:
+            if worker_future.done():
+                try:
+                    worker_result = worker_future.result()
+                except BaseException as exc:
+                    if exc is bridge_error:
+                        worker_error = exc
+                    else:
+                        _LOGGER.warning(
+                            "trash worker bridge failed %s",
+                            {
+                                "kind": lifecycle_kind,
+                                "error_type": type(bridge_error).__name__,
+                            },
+                        )
+                        return None
+                else:
+                    _LOGGER.warning(
+                        "trash worker bridge failed %s",
+                        {
+                            "kind": lifecycle_kind,
+                            "error_type": type(bridge_error).__name__,
+                        },
+                    )
+                    return None
+            else:
+                _LOGGER.warning(
+                    "trash worker bridge failed %s",
+                    {
+                        "kind": lifecycle_kind,
+                        "error_type": type(bridge_error).__name__,
+                    },
+                )
+                return None
+        else:
+            if bridge_result is None:
+                log_trash_delivery_cancelled(lifecycle_kind)
+                return None
+            if not worker_future.done():
+                _LOGGER.warning(
+                    "trash worker bridge returned before completion %s",
+                    {"kind": lifecycle_kind},
+                )
+                return None
+            try:
+                worker_result = worker_future.result()
+            except BaseException as exc:
+                worker_error = exc
+
+        if worker_error is not None:
+            if not client_is_deleted(client) and on_refresh is not None:
+                try:
+                    refresh_result = on_refresh()
+                    if inspect.isawaitable(refresh_result):
+                        await refresh_result
+                except BaseException as refresh_error:
+                    _LOGGER.warning(
+                        "trash view refresh failed %s",
+                        {
+                            "kind": lifecycle_kind,
+                            "error_type": type(refresh_error).__name__,
+                            "error_code": getattr(
+                                refresh_error,
+                                "code",
+                                "trash.refresh_failed",
+                            ),
+                        },
+                    )
+                    await invoke_ui_callback(on_refresh_error, refresh_error)
+            await invoke_ui_callback(on_error, worker_error)
+            return None
+
         if not client_is_deleted(client) and on_refresh is not None:
             try:
                 refresh_result = on_refresh()
                 if inspect.isawaitable(refresh_result):
                     await refresh_result
-            except BaseException:
-                pass
+            except BaseException as refresh_error:
+                _LOGGER.warning(
+                    "trash view refresh failed %s",
+                    {
+                        "kind": lifecycle_kind,
+                        "error_type": type(refresh_error).__name__,
+                        "error_code": getattr(
+                            refresh_error,
+                            "code",
+                            "trash.refresh_failed",
+                        ),
+                    },
+                )
+                await invoke_ui_callback(on_refresh_error, refresh_error)
+                return worker_result
+        if not client_is_deleted(client):
+            await invoke_ui_callback(on_success, worker_result)
+            return worker_result
+        return None
+    finally:
+        finish_once()
 
 
 @dataclass(frozen=True, slots=True)
@@ -923,7 +1269,11 @@ def create_app(
             if not client_is_deleted(client):
                 render_history_error(ui, history_translator, loading_holder, error)
             return
-        if client_is_deleted(client):
+        if (
+            not isinstance(snapshot, HistorySnapshot)
+            or not isinstance(trash_snapshot, TrashSnapshot)
+            or client_is_deleted(client)
+        ):
             return
 
         async def move_to_trash(displayed: HistoryTrashPlan) -> None:
@@ -955,6 +1305,14 @@ def create_app(
                     type="positive",
                 )
 
+            def on_refresh_error(_error: BaseException) -> None:
+                if client_is_deleted(client):
+                    return
+                ui.notify(
+                    history_translator.text("history.trash_refresh_error"),
+                    type="warning",
+                )
+
             async def refresh() -> None:
                 if client_is_deleted(client):
                     return
@@ -969,6 +1327,13 @@ def create_app(
                 )
                 if client_is_deleted(client):
                     return
+                if not isinstance(fresh_history, HistorySnapshot) or not isinstance(
+                    fresh_trash,
+                    TrashSnapshot,
+                ):
+                    raise TrashViewRefreshError(
+                        "History rebuild did not return current snapshots"
+                    )
                 history_root.clear()
                 with history_root:
                     render_history_page(
@@ -1002,13 +1367,22 @@ def create_app(
                         on_open_trash=lambda: ui.navigate.to("/history/trash"),
                     )
 
+            def log_error(_error: BaseException) -> None:
+                plan_value = displayed.trash_plan
+                log_trash_mutation(
+                    "history.trash_move",
+                    transaction_id=getattr(plan_value, "transaction_id", None),
+                    member_count=displayed.run_count,
+                    roots=displayed.roots,
+                    error=_error,
+                )
+
             def on_error(_error: BaseException) -> None:
                 if client_is_deleted(client):
                     return
-                key = (
-                    "history.trash_busy"
-                    if getattr(_error, "code", None) == "job.busy"
-                    else "history.trash_error"
+                key = trash_error_translation_key(
+                    _error,
+                    default="history.trash_error",
                 )
                 ui.notify(history_translator.text(key), type="negative")
 
@@ -1019,7 +1393,9 @@ def create_app(
                 worker=worker,
                 on_success=on_success,
                 on_error=on_error,
+                on_error_log=log_error,
                 on_refresh=refresh,
+                on_refresh_error=on_refresh_error,
             )
 
         history_root.clear()
@@ -1091,7 +1467,7 @@ def create_app(
                 # never attempt to write a dead client after this point.
                 render_history_error(ui, translator_holder, loading_holder, error)
             return
-        if client_is_deleted(client):
+        if not isinstance(snapshot, TrashSnapshot) or client_is_deleted(client):
             return
 
         async def refresh_trash() -> None:
@@ -1100,6 +1476,10 @@ def create_app(
             fresh = await run.io_bound(build_trash_snapshot, active_trash)
             if client_is_deleted(client):
                 return
+            if not isinstance(fresh, TrashSnapshot):
+                raise TrashViewRefreshError(
+                    "Trash rebuild did not return a current snapshot"
+                )
             page_root.clear()
             with page_root:
                 render_trash_page(
@@ -1112,36 +1492,104 @@ def create_app(
                     on_recover=recover_transaction,
                 )
 
-        def _notify_trash_error(key: str) -> Callable[[BaseException], Any]:
+        def _notify_trash_success(kind: str, result: Any) -> None:
+            receipt = result
+            before = None
+            if (
+                isinstance(result, tuple)
+                and len(result) == 2
+            ):
+                receipt, before = result
+            member_count = getattr(receipt, "run_count", None)
+            if before is not None:
+                member_count = len(getattr(before, "members", ()))
+            if client_is_deleted(client):
+                return
+            if kind == "history.trash_restore":
+                key = "history.trash_restore_success"
+            elif kind == "history.trash_purge":
+                key = "history.trash_permanent_success"
+            else:
+                key = "history.trash_recover_success"
+            values = {
+                "count": member_count or getattr(receipt, "run_count", 0),
+            }
+            ui.notify(translator_holder.text(key, **values), type="positive")
+
+        def _notify_trash_refresh_error(_error: BaseException) -> None:
+            if client_is_deleted(client):
+                return
+            ui.notify(
+                translator_holder.text("history.trash_refresh_error"),
+                type="warning",
+            )
+
+        def _log_trash_error(
+            *,
+            kind: str,
+            transaction_id: str | None,
+            context: Mapping[str, Any] | None = None,
+        ) -> Callable[[BaseException], None]:
+            def log_error(_error: BaseException) -> None:
+                before = None if context is None else context.get("before")
+                log_trash_mutation(
+                    kind,
+                    transaction_id=transaction_id,
+                    state=None if before is None else getattr(before, "state", None),
+                    member_count=(
+                        None
+                        if before is None
+                        else len(getattr(before, "members", ()))
+                    ),
+                    roots=() if before is None else getattr(before, "roots", ()),
+                    error=_error,
+                )
+
+            return log_error
+
+        def _notify_trash_error(
+            key: str,
+        ) -> Callable[[BaseException], None]:
             def notify(_error: BaseException) -> None:
                 if client_is_deleted(client):
                     return
-                error_key = (
-                    "history.trash_busy"
-                    if getattr(_error, "code", None) == "job.busy"
-                    else key
+                error_key = trash_error_translation_key(
+                    _error,
+                    default=key,
                 )
                 ui.notify(translator_holder.text(error_key), type="negative")
 
             return notify
 
         async def restore_transaction(transaction_id: str) -> None:
+            context: dict[str, Any] = {}
+
+            def worker() -> Any:
+                try:
+                    before = active_trash.transaction(transaction_id)
+                except Exception:
+                    before = None
+                context["before"] = before
+                return active_trash.restore(transaction_id), before
+
             await run_trash_mutation(
                 client=client,
                 coordinator=runtime.coordinator,
                 kind="history.trash_restore",
-                worker=lambda: active_trash.restore(transaction_id),
-                on_success=lambda receipt: ui.notify(
-                    translator_holder.text(
-                        "history.trash_restore_success",
-                        count=getattr(receipt, "run_count", 0),
-                    ),
-                    type="positive",
-                )
-                if not client_is_deleted(client)
-                else None,
-                on_error=_notify_trash_error("history.trash_restore_error"),
+                worker=worker,
+                on_success=lambda receipt: _notify_trash_success(
+                    "history.trash_restore", receipt
+                ),
+                on_error=_notify_trash_error(
+                    "history.trash_restore_error",
+                ),
+                on_error_log=_log_trash_error(
+                    kind="history.trash_restore",
+                    transaction_id=transaction_id,
+                    context=context,
+                ),
                 on_refresh=refresh_trash,
+                on_refresh_error=_notify_trash_refresh_error,
             )
 
         async def purge_transaction(
@@ -1149,41 +1597,69 @@ def create_app(
             confirmation: str | None = None,
         ) -> None:
             supplied = "" if confirmation is None else confirmation
+            context: dict[str, Any] = {}
+
+            def worker() -> Any:
+                try:
+                    before = active_trash.transaction(transaction_id)
+                except Exception:
+                    before = None
+                context["before"] = before
+                return active_trash.purge(
+                    transaction_id,
+                    confirmation=supplied,
+                ), before
+
             await run_trash_mutation(
                 client=client,
                 coordinator=runtime.coordinator,
                 kind="history.trash_purge",
-                worker=lambda: active_trash.purge(
-                    transaction_id,
-                    confirmation=supplied,
+                worker=worker,
+                on_success=lambda receipt: _notify_trash_success(
+                    "history.trash_purge", receipt
                 ),
-                on_success=lambda receipt: ui.notify(
-                    translator_holder.text(
-                        "history.trash_permanent_success",
-                        count=getattr(receipt, "run_count", 0),
-                    ),
-                    type="positive",
-                )
-                if not client_is_deleted(client)
-                else None,
-                on_error=_notify_trash_error("history.trash_permanent_error"),
+                on_error=_notify_trash_error(
+                    "history.trash_permanent_error",
+                ),
+                on_error_log=_log_trash_error(
+                    kind="history.trash_purge",
+                    transaction_id=transaction_id,
+                    context=context,
+                ),
                 on_refresh=refresh_trash,
+                on_refresh_error=_notify_trash_refresh_error,
             )
 
         async def recover_transaction(transaction_id: str) -> None:
+            context: dict[str, Any] = {}
+
+            def worker() -> Any:
+                try:
+                    before = active_trash.transaction(transaction_id)
+                except Exception:
+                    before = None
+                context["before"] = before
+                return active_trash.recover(transaction_id), before
+
             await run_trash_mutation(
                 client=client,
                 coordinator=runtime.coordinator,
                 kind="history.trash_restore",
-                worker=lambda: active_trash.recover(transaction_id),
-                on_success=lambda _receipt: ui.notify(
-                    translator_holder.text("history.trash_recover_success"),
-                    type="positive",
-                )
-                if not client_is_deleted(client)
-                else None,
-                on_error=_notify_trash_error("history.trash_recover_error"),
+                log_kind="history.trash_recover",
+                worker=worker,
+                on_success=lambda receipt: _notify_trash_success(
+                    "history.trash_recover", receipt
+                ),
+                on_error=_notify_trash_error(
+                    "history.trash_recover_error",
+                ),
+                on_error_log=_log_trash_error(
+                    kind="history.trash_recover",
+                    transaction_id=transaction_id,
+                    context=context,
+                ),
                 on_refresh=refresh_trash,
+                on_refresh_error=_notify_trash_refresh_error,
             )
 
         page_root.clear()

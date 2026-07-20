@@ -5996,6 +5996,540 @@ async def test_run_trash_mutation_finishes_and_skips_deleted_client_render():
         coordinator.shutdown()
 
 
+def test_client_is_deleted_accepts_bool_and_callable_flags():
+    from lte_scenario_toolkit.gui.app import client_is_deleted
+
+    assert client_is_deleted(SimpleNamespace(is_deleted=True)) is True
+    assert client_is_deleted(SimpleNamespace(is_deleted=False)) is False
+    assert client_is_deleted(SimpleNamespace(is_deleted=lambda: True)) is True
+    assert client_is_deleted(SimpleNamespace(is_deleted=lambda: False)) is False
+
+
+def test_trash_error_mapping_and_safe_structured_logging(monkeypatch, tmp_path):
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.gui.pages.history import HistoryActionError
+    from lte_scenario_toolkit.jobs import JobBusyError
+    from lte_scenario_toolkit.run_trash import (
+        RunLeaseConflictError,
+        TrashPlanStaleError,
+    )
+
+    class CapturedLogger:
+        def __init__(self):
+            self.messages: list[str] = []
+
+        def info(self, message, fields):
+            self.messages.append(f"{message} {fields}")
+
+        def warning(self, message, fields):
+            self.messages.append(f"{message} {fields}")
+
+    logger = CapturedLogger()
+    monkeypatch.setattr(app_module, "_LOGGER", logger)
+    assert (
+        app_module.trash_error_translation_key(
+            JobBusyError(
+                "busy",
+                active_job_id="a",
+                active_kind="x",
+                requested_kind="y",
+            ),
+            default="history.trash_error",
+        )
+        == "history.trash_busy"
+    )
+    assert app_module.trash_error_translation_key(
+        TrashPlanStaleError("changed"), default="history.trash_error"
+    ) == "history.trash_stale"
+    assert app_module.trash_error_translation_key(
+        RunLeaseConflictError("in use"), default="history.trash_error"
+    ) == "history.trash_lease_conflict"
+    assert app_module.trash_error_translation_key(
+        ValueError("original destination is occupied"),
+        default="history.trash_error",
+    ) == "history.trash_destination_occupied"
+    assert app_module.trash_error_translation_key(
+        ValueError("an expected root is unavailable"),
+        default="history.trash_error",
+    ) == "history.trash_root_unavailable"
+    assert app_module.trash_error_translation_key(
+        ValueError("trash journal is invalid"),
+        default="history.trash_error",
+    ) == "history.trash_journal_invalid"
+    assert app_module.trash_error_translation_key(
+        ValueError("transaction is not purgeable"),
+        default="history.trash_error",
+    ) == "history.trash_permanent_error"
+
+    try:
+        raise HistoryActionError("changed or is in use") from TrashPlanStaleError(
+            "changed"
+        )
+    except HistoryActionError as wrapped_stale:
+        assert app_module.trash_error_translation_key(
+            wrapped_stale,
+            default="history.trash_error",
+        ) == "history.trash_stale"
+
+    try:
+        raise HistoryActionError("changed or is in use") from RunLeaseConflictError(
+            "in use"
+        )
+    except HistoryActionError as wrapped_lease:
+        assert app_module.trash_error_translation_key(
+            wrapped_lease,
+            default="history.trash_error",
+        ) == "history.trash_lease_conflict"
+
+    app_module.log_trash_mutation(
+        "history.trash_move",
+        transaction_id="a" * 32,
+        state="trashed",
+        member_count=2,
+        roots=(tmp_path,),
+    )
+    assert logger.messages
+    rendered = logger.messages[-1]
+    assert str(tmp_path) not in rendered
+    assert "root_digests" in rendered
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_none_result_defers_finish_until_worker_done():
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    started = Event()
+    release = Event()
+    finished = Event()
+
+    def worker():
+        started.set()
+        assert release.wait(2)
+        finished.set()
+        return object()
+
+    async def canceled_io_bound(callback):
+        import threading
+
+        threading.Thread(target=callback, daemon=True).start()
+        assert await asyncio.to_thread(started.wait, 2)
+        return None
+
+    coordinator = JobCoordinator()
+    rendered: list[str] = []
+    try:
+        await app_module.run_trash_mutation(
+            client=SimpleNamespace(is_deleted=False),
+            coordinator=coordinator,
+            kind="history.trash_restore",
+            worker=worker,
+            on_success=lambda _value: rendered.append("success"),
+            on_refresh=lambda: rendered.append("refresh"),
+            io_bound=canceled_io_bound,
+        )
+        assert coordinator.snapshot().active is True
+        assert rendered == []
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 2)
+        for _ in range(20):
+            if not coordinator.snapshot().active:
+                break
+            await asyncio.sleep(0.01)
+        assert coordinator.snapshot().active is False
+    finally:
+        release.set()
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_none_result_handles_delayed_worker_start():
+    import threading
+
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    release = Event()
+    started = Event()
+
+    def worker():
+        started.set()
+        release.wait(2)
+
+    async def canceled_io_bound(callback):
+        threading.Thread(target=callback, daemon=True).start()
+        return None
+
+    coordinator = JobCoordinator()
+    try:
+        await app_module.run_trash_mutation(
+            client=SimpleNamespace(is_deleted=False),
+            coordinator=coordinator,
+            kind="history.trash_purge",
+            worker=worker,
+            io_bound=canceled_io_bound,
+        )
+        assert coordinator.snapshot().active is True
+        assert await asyncio.to_thread(started.wait, 2)
+        release.set()
+        for _ in range(20):
+            if not coordinator.snapshot().active:
+                break
+            await asyncio.sleep(0.01)
+        assert coordinator.snapshot().active is False
+    finally:
+        release.set()
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_pre_submit_cancel_releases_slot():
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    async def canceled_io_bound(_callback):
+        raise asyncio.CancelledError
+
+    coordinator = JobCoordinator()
+    try:
+        await app_module.run_trash_mutation(
+            client=SimpleNamespace(is_deleted=False),
+            coordinator=coordinator,
+            kind="history.trash_restore",
+            worker=lambda: object(),
+            io_bound=canceled_io_bound,
+        )
+        assert coordinator.snapshot().active is False
+    finally:
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_pre_submit_runtime_error_releases_slot():
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    async def failed_io_bound(_callback):
+        raise RuntimeError("bridge is unavailable")
+
+    coordinator = JobCoordinator()
+    try:
+        await app_module.run_trash_mutation(
+            client=SimpleNamespace(is_deleted=False),
+            coordinator=coordinator,
+            kind="history.trash_purge",
+            worker=lambda: object(),
+            io_bound=failed_io_bound,
+        )
+        assert coordinator.snapshot().active is False
+    finally:
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_executor_creation_failure_releases_slot(monkeypatch):
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    class BrokenExecutor:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("cannot start worker thread")
+
+    monkeypatch.setattr(app_module, "ThreadPoolExecutor", BrokenExecutor)
+    coordinator = JobCoordinator()
+    errors: list[type[BaseException]] = []
+    try:
+        await app_module.run_trash_mutation(
+            client=SimpleNamespace(is_deleted=False),
+            coordinator=coordinator,
+            kind="history.trash_move",
+            worker=lambda: object(),
+            on_error=lambda error: errors.append(type(error)),
+            io_bound=lambda callback: callback(),
+        )
+        assert errors == [RuntimeError]
+        assert coordinator.snapshot().active is False
+    finally:
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_bridge_failure_never_renders_mid_worker():
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    started = Event()
+    release = Event()
+    events: list[str] = []
+
+    def worker():
+        started.set()
+        assert release.wait(2)
+        return object()
+
+    async def failed_io_bound(_callback):
+        raise RuntimeError("bridge is unavailable")
+
+    coordinator = JobCoordinator()
+    try:
+        await app_module.run_trash_mutation(
+            client=SimpleNamespace(is_deleted=False),
+            coordinator=coordinator,
+            kind="history.trash_purge",
+            worker=worker,
+            on_refresh=lambda: events.append("refresh"),
+            on_error=lambda _error: events.append("error"),
+            io_bound=failed_io_bound,
+        )
+        assert started.wait(2)
+        assert events == []
+        assert coordinator.snapshot().active is True
+        release.set()
+        for _ in range(20):
+            if not coordinator.snapshot().active:
+                break
+            await asyncio.sleep(0.01)
+        assert coordinator.snapshot().active is False
+    finally:
+        release.set()
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_refresh_failure_does_not_relabel_committed_work():
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    async def fake_io_bound(callback):
+        return callback()
+
+    def failed_refresh():
+        events.append("refresh")
+        raise RuntimeError("render failed")
+
+    events: list[str] = []
+    coordinator = JobCoordinator()
+    result = object()
+    try:
+        returned = await app_module.run_trash_mutation(
+            client=SimpleNamespace(is_deleted=False),
+            coordinator=coordinator,
+            kind="history.trash_restore",
+            worker=lambda: result,
+            on_refresh=failed_refresh,
+            on_success=lambda _value: events.append("success"),
+            on_error=lambda _error: events.append("error"),
+            on_refresh_error=lambda _error: events.append("refresh_error"),
+            io_bound=fake_io_bound,
+        )
+        assert returned is result
+        assert events == ["refresh", "refresh_error"]
+        assert coordinator.snapshot().active is False
+    finally:
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_logging_failure_cannot_strand_job(monkeypatch):
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    async def fake_io_bound(callback):
+        return callback()
+
+    monkeypatch.setattr(
+        app_module._LOGGER,
+        "info",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("log failed")),
+    )
+    coordinator = JobCoordinator()
+    try:
+        await app_module.run_trash_mutation(
+            client=SimpleNamespace(is_deleted=False),
+            coordinator=coordinator,
+            kind="history.trash_restore",
+            worker=lambda: object(),
+            io_bound=fake_io_bound,
+        )
+        assert coordinator.snapshot().active is False
+    finally:
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_failure_and_refresh_failure_reports_both():
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    async def fake_io_bound(callback):
+        return callback()
+
+    def failed_refresh():
+        raise RuntimeError("refresh failed")
+
+    coordinator = JobCoordinator()
+    events: list[str] = []
+    try:
+        await app_module.run_trash_mutation(
+            client=SimpleNamespace(is_deleted=False),
+            coordinator=coordinator,
+            kind="history.trash_purge",
+            worker=lambda: (_ for _ in ()).throw(RuntimeError("purge failed")),
+            on_refresh=failed_refresh,
+            on_refresh_error=lambda _error: events.append("refresh_error"),
+            on_error=lambda _error: events.append("mutation_error"),
+            io_bound=fake_io_bound,
+        )
+        assert events == ["refresh_error", "mutation_error"]
+        assert coordinator.snapshot().active is False
+    finally:
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_outer_cancel_waits_for_submitted_worker():
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    started = Event()
+    release = Event()
+
+    def worker():
+        started.set()
+        assert release.wait(2)
+        return object()
+
+    async def bridge(callback):
+        return await asyncio.to_thread(callback)
+
+    coordinator = JobCoordinator()
+    client = SimpleNamespace(is_deleted=False)
+    task = asyncio.create_task(
+        app_module.run_trash_mutation(
+            client=client,
+            coordinator=coordinator,
+            kind="history.trash_restore",
+            worker=worker,
+            io_bound=bridge,
+        )
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        client.is_deleted = True
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert coordinator.snapshot().active is True
+        release.set()
+        await task
+        assert coordinator.snapshot().active is False
+    finally:
+        release.set()
+        if not task.done():
+            await task
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_cancel_suppresses_late_worker_error_callback():
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    started = Event()
+    release = Event()
+    errors: list[type[BaseException]] = []
+
+    def worker():
+        started.set()
+        assert release.wait(2)
+        raise RuntimeError("late worker failure")
+
+    async def bridge(callback):
+        return await asyncio.to_thread(callback)
+
+    coordinator = JobCoordinator()
+    task = asyncio.create_task(
+        app_module.run_trash_mutation(
+            client=SimpleNamespace(is_deleted=False),
+            coordinator=coordinator,
+            kind="history.trash_restore",
+            worker=worker,
+            on_error=lambda error: errors.append(type(error)),
+            io_bound=bridge,
+        )
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert coordinator.snapshot().active is True
+        release.set()
+        await task
+        assert errors == []
+        assert coordinator.snapshot().active is False
+    finally:
+        release.set()
+        if not task.done():
+            await task
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_run_trash_mutation_refreshes_before_success():
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    async def fake_io_bound(worker):
+        return worker()
+
+    coordinator = JobCoordinator()
+    events: list[str] = []
+    try:
+        await app_module.run_trash_mutation(
+            client=SimpleNamespace(is_deleted=False),
+            coordinator=coordinator,
+            kind="history.trash_move",
+            worker=lambda: object(),
+            on_refresh=lambda: events.append("refresh"),
+            on_success=lambda _value: events.append("success"),
+            io_bound=fake_io_bound,
+        )
+        assert events == ["refresh", "success"]
+        assert coordinator.snapshot().active is False
+    finally:
+        coordinator.shutdown()
+
+
+@pytest.mark.parametrize(
+    "kind",
+    (
+        "history.trash_move",
+        "history.trash_restore",
+        "history.trash_purge",
+        "history.trash_recover",
+    ),
+)
+@pytest.mark.asyncio
+async def test_run_trash_mutation_finishes_each_operation_kind(kind):
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    async def fake_io_bound(worker):
+        return worker()
+
+    coordinator = JobCoordinator()
+    try:
+        await app_module.run_trash_mutation(
+            client=SimpleNamespace(is_deleted=False),
+            coordinator=coordinator,
+            kind=kind,
+            worker=lambda: object(),
+            io_bound=fake_io_bound,
+        )
+        assert coordinator.snapshot().active is False
+    finally:
+        coordinator.shutdown()
+
+
 @pytest.mark.asyncio
 async def test_run_trash_mutation_finishes_on_error_and_blocks_second_job():
     from lte_scenario_toolkit.gui import app as app_module
@@ -6085,6 +6619,54 @@ async def test_trash_route_renders_loading_before_io(monkeypatch, tmp_path, user
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("route", ("/history", "/history/trash"))
+async def test_history_routes_treat_none_io_result_as_cancellation(
+    monkeypatch,
+    tmp_path,
+    user,
+    route,
+):
+    from nicegui import run
+
+    from lte_scenario_toolkit.gui import app as app_module
+    from lte_scenario_toolkit.jobs import JobCoordinator
+    from lte_scenario_toolkit.run_trash import RunUsageLeaseRegistry, TrashManager
+
+    leases = RunUsageLeaseRegistry()
+    manager = TrashManager(lambda: (tmp_path / "results",), leases)
+    rendered: list[str] = []
+
+    async def canceled_io_bound(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(run, "io_bound", canceled_io_bound)
+    monkeypatch.setattr(
+        app_module,
+        "render_history_page",
+        lambda *args, **kwargs: rendered.append("history"),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "render_trash_page",
+        lambda *args, **kwargs: rendered.append("trash"),
+    )
+    coordinator = JobCoordinator()
+    try:
+        app_module.create_app(
+            catalog=SimpleNamespace(root=tmp_path.resolve()),
+            coordinator=coordinator,
+            trash_manager=manager,
+            usage_leases=leases,
+            testing=True,
+        )
+        await user.open(route)
+        await asyncio.sleep(0.05)
+        assert rendered == []
+    finally:
+        coordinator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_trash_route_callbacks_use_transaction_id_and_confirmation(
     monkeypatch, tmp_path, user
 ):
@@ -6101,6 +6683,12 @@ async def test_trash_route_callbacks_use_transaction_id_and_confirmation(
     leases = RunUsageLeaseRegistry()
     manager = TrashManager(lambda: (tmp_path / "results",), leases)
     calls: list[tuple[str, tuple[object, ...]]] = []
+    manager.transaction = lambda value: SimpleNamespace(  # type: ignore[method-assign]
+        transaction_id=value,
+        state="trashed",
+        members=(),
+        roots=(),
+    )
     manager.restore = lambda value: calls.append(("restore", (value,))) or TrashMutationReceipt(value, restored=True)  # type: ignore[method-assign]
     manager.purge = lambda value, *, confirmation: calls.append(  # type: ignore[method-assign]
         ("purge", (value, confirmation))
