@@ -26,7 +26,13 @@ from ...figure_service import (
 from ...jobs import Job, JobBusyError, JobCoordinator
 from ...run_service import RunService
 from ...run_trash import RunIdentity, RunUsageLeaseRegistry
-from ..presentation import render_technical_details
+from ..presentation import (
+    ActionSpec,
+    MenuActionSpec,
+    render_action_bar,
+    render_overflow_menu,
+    render_technical_details,
+)
 
 PREVIEW_CACHE_VERSION = "figure-preview-v3"
 PREVIEW_LIMITS = {
@@ -1144,6 +1150,8 @@ def render_figures_page(
     usage_leases: RunUsageLeaseRegistry | None = None,
     run_roots: Callable[[], Iterable[Path]] | None = None,
     lease_owner: str | None = None,
+    refresh_source_options: Callable[[], Mapping[str, str]] | None = None,
+    on_open_source: Callable[[Path], None] | None = None,
 ) -> FigurePageView:
     """Render an offline form whose expensive actions are always explicit."""
 
@@ -1182,7 +1190,7 @@ def render_figures_page(
             "role=heading aria-level=1"
         )
         ui.label(translator.text("figures.subtitle")).classes("lte-page-subtitle")
-        with ui.card().classes("lte-figure-source full-width"):
+        with ui.card().classes("lte-figure-source lte-figure-source-bar full-width"):
             with ui.row().classes("lte-figure-panel-header full-width"):
                 ui.label(translator.text("figures.source")).classes(
                     "lte-section-title"
@@ -1190,24 +1198,70 @@ def render_figures_page(
                 ui.label(translator.text("figures.source_contract")).classes(
                     "lte-figure-section-note"
                 )
+            with ui.row().classes("lte-figure-source-current full-width"):
+                source_current_label = ui.label(
+                    translator.text("figures.no_source")
+                ).classes("lte-figure-source-current__value").mark(
+                    "figure-source-current"
+                )
+                source_current_status = ui.label(
+                    translator.text("status.pending")
+                ).classes("lte-figure-source-current__status").mark(
+                    "figure-source-current-status"
+                )
+                ui.space()
+                source_menu_items: dict[str, Any] = {}
+                render_overflow_menu(
+                    ui,
+                    (
+                        MenuActionSpec(
+                            translator.text("figures.refresh_local"),
+                            "refresh",
+                            lambda: refresh_local(),
+                            marker="figure-refresh-local-menu",
+                        ),
+                        MenuActionSpec(
+                            translator.text("figures.open_source"),
+                            "open_in_new",
+                            lambda: open_source(),
+                            marker="figure-open-source-menu",
+                        ),
+                        MenuActionSpec(
+                            translator.text("figures.current_selection"),
+                            "my_location",
+                            lambda: prepare_current_selection(),
+                            enabled=current_session is not None,
+                            marker="figure-current-selection",
+                        ),
+                    ),
+                    label=translator.text("figures.source_menu"),
+                    marker="figure-source-overflow",
+                    item_sink=source_menu_items,
+                )
+                refresh_local_button = ui.button(
+                    translator.text("figures.refresh_local"),
+                    on_click=lambda: refresh_local(),
+                ).props("flat").mark("figure-refresh-local")
+                open_source_button = ui.button(
+                    translator.text("figures.open_source"),
+                    on_click=lambda: open_source(),
+                ).props("flat").mark("figure-open-source")
             with ui.row().classes("lte-figure-source-actions items-end full-width"):
+                # Keep the source selector as a stable public control/marker. It
+                # is compact in the source bar and remains the authoritative
+                # selection model even when the overflow menu is used.
                 source_input = ui.select(
                     available_source_options,
                     value=initial_source_value,
                     label=translator.text("figures.source_path"),
                     with_input=True,
-                ).props("clearable options-dense").classes("grow").mark(
-                    "figure-source-path"
-                )
+                ).props("clearable options-dense").classes(
+                    "grow lte-figure-source-picker"
+                ).mark("figure-source-path")
                 load_button = ui.button(
                     translator.text("figures.load_source")
-                ).mark("figure-load-source")
-                if current_session is not None:
-                    current_button = ui.button(
-                        translator.text("figures.current_selection")
-                    ).props("outline").mark("figure-current-selection")
-                else:
-                    current_button = None
+                ).props("outline").mark("figure-load-source")
+                current_button = None
             source_status = ui.label("").classes(
                 "lte-figure-source-status"
             ).mark("figure-source-ready")
@@ -1321,7 +1375,11 @@ def render_figures_page(
                         precision=0,
                     ).mark("figure-max-pixels")
 
-        with ui.card().classes("lte-figure-export full-width"):
+        with ui.element("footer").classes(
+            "lte-figure-export lte-figure-export-dock full-width"
+        ).props('role=region aria-label="Figure export actions"').mark(
+            "figure-export-dock"
+        ):
             with ui.row().classes("lte-figure-panel-header full-width"):
                 ui.label(translator.text("figures.final_export")).classes(
                     "lte-section-title"
@@ -1337,9 +1395,6 @@ def render_figures_page(
                             value=token in requested_initial_formats,
                         ).mark(f"figure-format-{token}")
                 ui.space()
-                export_button = ui.button(
-                    translator.text("figures.export")
-                ).mark("figure-export")
             destination_label = ui.label(
                 translator.text(
                     "figures.destination",
@@ -1348,6 +1403,38 @@ def render_figures_page(
             ).classes("lte-figure-path")
             result_label = ui.label("").classes("lte-figure-path")
             error_box = ui.column().classes("lte-figure-errors")
+
+            action_refs = render_action_bar(
+                ui,
+                (
+                    ActionSpec(
+                        "export",
+                        translator.text("figures.export"),
+                        lambda: final_export(),
+                        role="primary",
+                        marker="figure-export",
+                    ),
+                    ActionSpec(
+                        "reset",
+                        translator.text("figures.reset"),
+                        lambda: reset_workspace(),
+                        role="secondary",
+                        marker="figure-reset",
+                    ),
+                    ActionSpec(
+                        "back",
+                        translator.text("figures.back"),
+                        lambda: ui.navigate.to("/history"),
+                        role="tertiary",
+                        marker="figure-back",
+                    ),
+                ),
+                sticky=True,
+                marker="figure-export-action-bar",
+            )
+            export_button = action_refs["export"]
+            reset_button = action_refs["reset"]
+            back_button = action_refs["back"]
 
         technical_refs: dict[str, Any] = {}
 
@@ -1383,6 +1470,8 @@ def render_figures_page(
     confirmed_formats = {
         token: bool(format_boxes[token].value) for token in FIGURE_FORMAT_ORDER
     }
+    initial_workspace_spec = form_spec
+    initial_workspace_formats = dict(confirmed_formats)
     ui_validation_diagnostic: str | None = None
 
     def restore_spec_controls(spec: FigureSpec) -> None:
@@ -1460,6 +1549,48 @@ def render_figures_page(
         )
         render_messages()
 
+    def refresh_local() -> None:
+        """Refresh the locally discovered source list without changing source state."""
+
+        if refresh_source_options is None:
+            ui.notify(translator.text("figures.refresh_local_unavailable"), type="warning")
+            return
+        try:
+            refreshed = _source_options(refresh_source_options(), None)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            set_ui_diagnostic(str(exc))
+            ui.notify(translator.text("figures.refresh_local_failed"), type="warning")
+            return
+        source_input.options = refreshed
+        source_input.update()
+        ui.notify(translator.text("figures.refresh_local_done"), type="positive")
+
+    def open_source() -> None:
+        current = controller.state.source
+        if not isinstance(current, FigureSource) or current.path is None:
+            ui.notify(translator.text("figures.open_source_unavailable"), type="warning")
+            return
+        if on_open_source is not None:
+            on_open_source(current.path)
+            return
+        ui.navigate.to("/history")
+
+    def reset_workspace() -> None:
+        if controller.has_unfinished_job:
+            ui.notify(translator.text("error.job_busy"), type="warning")
+            return
+        restore_spec_controls(initial_workspace_spec)
+        try:
+            controller.update_spec(initial_workspace_spec)
+        except RuntimeError as exc:
+            set_ui_diagnostic(str(exc))
+            return
+        for token, control in format_boxes.items():
+            control.value = initial_workspace_formats[token]
+            confirmed_formats[token] = initial_workspace_formats[token]
+        set_ui_diagnostic(None)
+        sync_controls()
+
     def sync_controls(state: FigurePageState | None = None) -> None:
         current = controller.state if state is None else state
         running = controller.has_unfinished_job
@@ -1472,6 +1603,10 @@ def render_figures_page(
             source_input,
             load_button,
             current_button,
+            reset_button,
+            back_button,
+            refresh_local_button,
+            open_source_button,
             *style_controls,
             *format_boxes.values(),
         ):
@@ -1486,11 +1621,33 @@ def render_figures_page(
                 control.enable()
             else:
                 control.disable()
+        export_button.set_text(
+            translator.text("figures.export_running")
+            if running
+            else translator.text("figures.export")
+        )
         if not running and not source_input.value:
             load_button.disable()
 
         source_status.set_visibility(valid_source)
         source_identity.set_visibility(valid_source)
+        source_current_label.set_text(
+            translator.text("figures.no_source")
+            if not valid_source
+            else (
+                str(current.source.path)
+                if isinstance(current.source, FigureSource)
+                and current.source.path is not None
+                else translator.text("figures.current_selection_loaded")
+            )
+        )
+        source_current_status.set_text(
+            translator.text("status.running")
+            if running
+            else translator.text("status.ready")
+            if valid_source
+            else translator.text("status.pending")
+        )
         dirty_label.set_visibility(current.source_dirty and current.source_error is None)
         source_error_label.set_visibility(current.source_error is not None)
         terrain_label.set_visibility(valid_source and not has_dem)
@@ -1800,7 +1957,6 @@ def render_figures_page(
         )
     )
     refresh_button.on("click", refresh_preview)
-    export_button.on("click", final_export)
     preset.on_value_change(lambda event: apply_preset(event.value))
     for field in (
         dpi,

@@ -1401,6 +1401,46 @@ h3,
   gap: var(--lte-space-4);
 }
 
+.lte-figure-source-bar {
+  position: sticky;
+  z-index: 4;
+  top: var(--lte-space-3);
+  background: var(--lte-surface);
+}
+
+.lte-figure-source-current {
+  align-items: center;
+  min-width: 0;
+  gap: var(--lte-space-2);
+  padding: 8px 10px;
+  color: var(--lte-ink);
+  background: #eef3ef;
+  border: 1px solid var(--lte-border);
+  border-radius: var(--lte-radius-sm);
+}
+
+.lte-figure-source-current__value {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-family: "Cascadia Code", "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+}
+
+.lte-figure-source-current__status {
+  flex: 0 0 auto;
+  color: var(--lte-success);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.lte-figure-source-current .q-btn {
+  min-width: 44px;
+  min-height: 44px;
+}
+
+.lte-figure-source-picker { min-width: min(480px, 100%); }
+
 .lte-figure-preview-card,
 .lte-figure-style {
   width: 100%;
@@ -1559,7 +1599,73 @@ button:disabled,
   .lte-history-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
+.lte-figure-export-dock {
+  position: sticky;
+  z-index: 5;
+  bottom: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  width: 100%;
+  min-width: 0;
+  gap: var(--lte-space-3);
+  padding: var(--lte-space-4) 12px calc(var(--lte-space-3) + env(safe-area-inset-bottom));
+  background: rgb(242 241 235 / 96%);
+  border-top: 1px solid var(--lte-border);
+  backdrop-filter: blur(8px);
+}
+
+.lte-figure-export-dock .lte-action-bar--sticky {
+  flex: 1 1 320px;
+  justify-content: flex-end;
+  min-width: 0;
+  padding: 0;
+  background: transparent;
+}
+
+.lte-figure-export-dock .lte-action-bar--sticky .q-btn {
+  min-width: 44px;
+  min-height: 44px;
+}
+
+.lte-figure-export-dock .lte-figure-format-list,
+.lte-figure-export-dock .lte-figure-path {
+  min-width: 0;
+}
+
 @media (max-width: 760px) {
+  .lte-figure-source-bar,
+  .lte-figure-export-dock {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+  }
+
+  .lte-figure-source-bar { position: static; }
+
+  .lte-figure-source-current {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .lte-figure-source-current .lte-overflow-menu__trigger { margin-left: auto; }
+
+  .lte-figure-export-dock {
+    align-items: stretch;
+    padding-right: max(12px, env(safe-area-inset-right));
+    padding-left: max(12px, env(safe-area-inset-left));
+  }
+
+  .lte-figure-export-dock .lte-figure-format-list,
+  .lte-figure-export-dock .lte-figure-path,
+  .lte-figure-export-dock .lte-action-bar--sticky {
+    width: 100%;
+    flex: 1 1 100%;
+  }
+
+  .lte-figure-export-dock .lte-action-bar--sticky { justify-content: stretch; }
+  .lte-figure-export-dock .lte-action-bar--sticky .q-btn { flex: 1 1 0; }
+
   .lte-generate-workspace,
   .lte-generate-summary,
   .lte-generate-artifacts,
@@ -1803,6 +1909,33 @@ button:disabled,
 }
 
 @media (max-width: 390px) {
+  .lte-figure-source-bar,
+  .lte-figure-source-current,
+  .lte-figure-source-actions,
+  .lte-figure-workspace,
+  .lte-figure-export-dock,
+  .lte-figure-export-dock .lte-action-bar {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    overflow-x: clip;
+  }
+
+  .lte-figure-source-actions { align-items: stretch; }
+  .lte-figure-source-picker,
+  .lte-figure-source-actions .q-btn { width: 100%; min-width: 44px; }
+
+  .lte-figure-export-dock .lte-action-bar--sticky {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .lte-figure-export-dock .lte-action-bar--sticky .q-btn {
+    width: 100%;
+    min-width: 44px;
+    flex: 1 1 100%;
+  }
+
   .lte-generate-stepper,
   .lte-generate-workspace,
   .lte-generate-action-dock,
@@ -2012,6 +2145,10 @@ button:disabled,
   .lte-candidate-page *,
   .lte-candidate-page *::before,
   .lte-candidate-page *::after,
+  .lte-figures-page,
+  .lte-figures-page *,
+  .lte-figures-page *::before,
+  .lte-figures-page *::after,
   .lte-scenario-cover__skeleton {
     scroll-behavior: auto !important;
     transition: none !important;

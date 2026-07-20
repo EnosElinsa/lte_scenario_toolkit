@@ -8983,6 +8983,61 @@ def test_figure_workspace_css_has_bounded_sidebar_and_responsive_stack():
     )
 
 
+def test_figure_workstation_css_has_source_bar_and_safe_export_dock():
+    css = (ROOT / "src/lte_scenario_toolkit/gui/assets/app.css").read_text(
+        encoding="utf-8"
+    )
+
+    for selector in (
+        ".lte-figure-source-bar",
+        ".lte-figure-source-current",
+        ".lte-figure-export-dock",
+    ):
+        assert selector in css
+    assert "env(safe-area-inset-bottom)" in css
+    assert "@media (max-width: 760px)" in css
+    assert "@media (max-width: 390px)" in css
+    assert ".lte-figures-page *" in css[css.index("@media (prefers-reduced-motion: reduce)") :]
+
+
+async def test_figure_workstation_exposes_source_menu_and_export_dock(user, tmp_path):
+    from nicegui import ui
+
+    from lte_scenario_toolkit.gui.i18n import Translator
+    from lte_scenario_toolkit.gui.pages.figures import render_figures_page
+    from lte_scenario_toolkit.jobs import JobCoordinator
+
+    coordinator = JobCoordinator()
+
+    @ui.page("/figure-workstation-composition")
+    def figure_workstation_composition():
+        render_figures_page(
+            ui,
+            Translator("en"),
+            tmp_path,
+            coordinator,
+            source_options={str(tmp_path / "run"): "City / Default"},
+        )
+
+    try:
+        await user.open("/figure-workstation-composition")
+        await user.should_see(marker="figure-source-overflow")
+        await user.should_see(marker="figure-source-current")
+        await user.should_see(marker="figure-export-dock")
+        dock = next(iter(user.find(marker="figure-export-dock").elements))
+        assert dock.tag == "footer"
+        primary = [
+            element
+            for element in dock.descendants()
+            if "lte-action--primary" in getattr(element, "_classes", [])
+        ]
+        assert [element.text for element in primary] == ["Export Figures"]
+        assert user.find(marker="figure-refresh-local").elements
+        assert user.find(marker="figure-open-source").elements
+    finally:
+        coordinator.shutdown()
+
+
 def _task15_figure_source(tmp_path):
     import geopandas as gpd
     import pandas as pd

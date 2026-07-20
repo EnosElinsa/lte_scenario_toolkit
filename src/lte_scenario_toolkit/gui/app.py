@@ -1257,6 +1257,8 @@ def create_app(
             parent_run_path=None if request is None else request.parent_run_path,
             on_published=remember_figure_run,
             preview_url_builder=preview_asset_url,
+            refresh_source_options=available_figure_source_options,
+            on_open_source=open_history_source,
             usage_leases=active_leases,
             run_roots=authoritative_history_roots,
         )
