@@ -2916,6 +2916,7 @@ async def test_configure_workbench_groups_profile_actions_and_run_review(user, t
 
     dock = next(iter(user.find(marker="configure-action-dock").elements))
     assert dock.tag == "footer"
+    assert "lte-configure-action-dock" in dock._classes
     for marker, role in (
         ("profile-discard", "tertiary"),
         ("profile-save", "secondary"),
@@ -3324,12 +3325,14 @@ async def test_committed_refresh_failure_locks_stale_profile_page(user, tmp_path
         "profile-rename",
         "profile-set-default",
         "profile-delete",
+        "profile-validate",
         "profile-save",
         "profile-start-scan",
     ):
         assert all(not element.enabled for element in user.find(marker=marker).elements)
 
     user.find(marker="profile-copy").click()
+    user.find(marker="profile-validate").click()
     user.find(marker="profile-start-scan").click()
     assert len(copy_calls) == 1
     assert preflight_calls == []

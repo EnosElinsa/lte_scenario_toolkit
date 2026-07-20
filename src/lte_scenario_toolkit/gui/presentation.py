@@ -356,15 +356,15 @@ def render_sticky_action_dock(
     *,
     label: str = "Page actions",
     marker: str | None = None,
+    extra_classes: str = "",
 ) -> dict[str, Any]:
     """Render a semantic action region fixed to the current workflow surface."""
 
-    with _mark(
-        ui.element("footer")
-        .classes("lte-action-dock")
-        .props(add=f'role=region aria-label="{label}"'),
-        marker,
-    ):
+    dock = ui.element("footer").classes("lte-action-dock")
+    if extra_classes:
+        dock.classes(extra_classes)
+    dock.props(add=f'role=region aria-label="{label}"')
+    with _mark(dock, marker):
         return render_action_bar(ui, actions, sticky=True)
 
 

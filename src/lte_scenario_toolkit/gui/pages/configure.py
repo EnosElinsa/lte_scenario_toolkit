@@ -1427,6 +1427,7 @@ def render_configure_page(
                 ),
                 label=translator.text("configure.profile_actions"),
                 marker="configure-action-dock",
+                extra_classes="lte-configure-action-dock",
             )
         _discard = workflow_buttons["discard"]
         save = workflow_buttons["save"]
@@ -1437,6 +1438,7 @@ def render_configure_page(
                 rename_button,
                 default_button,
                 delete_button,
+                management_items["profile-validate"],
                 save,
                 start,
             )
