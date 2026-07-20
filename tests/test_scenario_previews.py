@@ -345,3 +345,79 @@ def test_invalid_request_fields_degrade_to_fallback_result(tmp_path):
 
     assert result.kind == "fallback"
     assert result.path.is_file()
+    with Image.open(result.path) as image:
+        assert image.size == PREVIEW_SIZE
+
+
+def test_invalid_allowed_root_degrades_without_raising(tmp_path):
+    boundary = _write_boundary(tmp_path / "boundary.geojson")
+    cache_root = tmp_path / "cache"
+    request = ScenarioPreviewRequest(
+        "scenario",
+        "Scenario",
+        boundary,
+        allowed_root=tmp_path / "missing-root",
+    )
+
+    result = ScenarioPreviewService(cache_root).build(request)
+
+    assert result.kind == "fallback"
+    assert result.path.is_file()
+    with Image.open(result.path) as image:
+        assert image.size == PREVIEW_SIZE
+
+
+def test_batch_error_results_always_have_valid_png_path(tmp_path):
+    cache_root = tmp_path / "cache"
+    request = ScenarioPreviewRequest(
+        "scenario",
+        "Scenario",
+        tmp_path / "missing.geojson",
+        allowed_root=tmp_path / "missing-root",
+    )
+
+    results = build_scenario_previews([request], cache_root)
+
+    assert len(results) == 1
+    assert results[0].path.is_file()
+    with Image.open(results[0].path) as image:
+        assert image.format == "PNG"
+        assert image.size == PREVIEW_SIZE
+
+
+def test_redirected_metadata_is_regenerated_without_reading_target(tmp_path):
+    boundary = _write_boundary(tmp_path / "boundary.geojson")
+    cache_root = tmp_path / ".lte-data" / "cache" / "scenario-previews"
+    service = ScenarioPreviewService(cache_root)
+    first = service.build(_request(tmp_path, boundary_path=boundary))
+    metadata = first.path.with_suffix(".json")
+    outside = tmp_path.parent / "metadata-secret.json"
+    outside.write_text('{"kind":"fallback","diagnostic":"SECRET"}', encoding="utf-8")
+    try:
+        metadata.unlink()
+        metadata.symlink_to(outside)
+    except (OSError, NotImplementedError) as exc:
+        import pytest
+
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    second = service.build(_request(tmp_path, boundary_path=boundary))
+
+    assert second.cache_hit is False
+    assert outside.read_text(encoding="utf-8") == '{"kind":"fallback","diagnostic":"SECRET"}'
+
+
+def test_untrusted_metadata_diagnostic_is_redacted_on_cache_hit(tmp_path):
+    boundary = _write_boundary(tmp_path / "boundary.geojson")
+    cache_root = tmp_path / ".lte-data" / "cache" / "scenario-previews"
+    service = ScenarioPreviewService(cache_root)
+    first = service.build(_request(tmp_path, boundary_path=boundary))
+    first.path.with_suffix(".json").write_text(
+        '{"kind":"boundary","diagnostic":"SECRET_DIAGNOSTIC"}',
+        encoding="utf-8",
+    )
+
+    second = service.build(_request(tmp_path, boundary_path=boundary))
+
+    assert second.cache_hit is True
+    assert second.diagnostic == "Cached preview diagnostic unavailable."
